@@ -1,61 +1,129 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Newspaper, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { db } from "@/lib/db";
+import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { formatDistanceToNow } from "@/lib/format-date";
 
-function SentimentBadge({ score }: { score: number }) {
-  if (score > 0.2) return <Badge className="bg-green-500 hover:bg-green-600"><TrendingUp className="h-3 w-3 mr-1" />Bullish</Badge>;
-  if (score < -0.2) return <Badge className="bg-red-500 hover:bg-red-600"><TrendingDown className="h-3 w-3 mr-1" />Bearish</Badge>;
-  return <Badge variant="secondary"><Minus className="h-3 w-3 mr-1" />Neutral</Badge>;
+function SentimentBadge({ score }: { score?: number }) {
+  if (score === undefined) return null;
+  if (score > 0.2) return <Badge className="bg-green-500 hover:bg-green-600 shrink-0"><TrendingUp className="h-3 w-3 mr-1" />Bullish</Badge>;
+  if (score < -0.2) return <Badge className="bg-red-500 hover:bg-red-600 shrink-0"><TrendingDown className="h-3 w-3 mr-1" />Bearish</Badge>;
+  return <Badge variant="secondary" className="shrink-0"><Minus className="h-3 w-3 mr-1" />Neutral</Badge>;
 }
 
-const placeholderArticles = [
-  { id: 1, headline: "Fed signals potential rate cuts amid cooling inflation data", source: "Reuters", publishedAt: "2h ago", stocks: ["SPY", "QQQ"], sentimentScore: 0.6 },
-  { id: 2, headline: "Apple reports record Q1 earnings, beats analyst estimates", source: "Bloomberg", publishedAt: "4h ago", stocks: ["AAPL"], sentimentScore: 0.8 },
-  { id: 3, headline: "Oil prices drop as OPEC+ considers output increase", source: "FT", publishedAt: "5h ago", stocks: ["XOM", "CVX"], sentimentScore: -0.5 },
-  { id: 4, headline: "Tesla misses delivery targets for second consecutive quarter", source: "WSJ", publishedAt: "6h ago", stocks: ["TSLA"], sentimentScore: -0.7 },
-  { id: 5, headline: "Microsoft Azure growth steady at 28% year-over-year", source: "CNBC", publishedAt: "8h ago", stocks: ["MSFT"], sentimentScore: 0.3 },
-];
+export default async function DashboardPage() {
+  const user = await getOrCreateUser();
 
-export default function DashboardPage() {
+  // Fetch articles linked to stocks the user follows
+  let articles = user
+    ? await db.article.findMany({
+        where: {
+          articleStock: {
+            some: {
+              stock: { userStocks: { some: { userId: user.id } } },
+            },
+          },
+        },
+        include: {
+          articleStock: {
+            include: {
+              stock: {
+                include: { sentiments: { orderBy: { date: "desc" }, take: 1 } },
+              },
+            },
+          },
+        },
+        orderBy: { publishedAt: "desc" },
+        take: 50,
+      })
+    : [];
+
+  // Fall back to latest general articles if user has no followed stocks
+  if (articles.length === 0) {
+    articles = await db.article.findMany({
+      include: {
+        articleStock: {
+          include: {
+            stock: {
+              include: { sentiments: { orderBy: { date: "desc" }, take: 1 } },
+            },
+          },
+        },
+      },
+      orderBy: { publishedAt: "desc" },
+      take: 50,
+    });
+  }
+
+  const hasFollowedStocks = user
+    ? (await db.userStock.count({ where: { userId: user.id } })) > 0
+    : false;
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">News Feed</h1>
-        <p className="text-muted-foreground text-sm mt-1">Latest market news with AI sentiment analysis</p>
+        <p className="text-muted-foreground text-sm mt-1">
+          {hasFollowedStocks
+            ? "Latest news for your watchlist stocks"
+            : "Latest market news — add stocks to your watchlist to personalise this feed"}
+        </p>
       </div>
 
-      <div className="grid gap-3">
-        {placeholderArticles.map((article) => (
-          <Card key={article.id} className="hover:bg-muted/50 transition-colors cursor-pointer">
-            <CardHeader className="pb-2">
-              <div className="flex items-start justify-between gap-4">
-                <CardTitle className="text-base font-medium leading-snug">
-                  {article.headline}
-                </CardTitle>
-                <SentimentBadge score={article.sentimentScore} />
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                <span className="flex items-center gap-1">
-                  <Newspaper className="h-3 w-3" />
-                  {article.source}
-                </span>
-                <span>·</span>
-                <span>{article.publishedAt}</span>
-                <span>·</span>
-                <div className="flex gap-1">
-                  {article.stocks.map((ticker) => (
-                    <Badge key={ticker} variant="outline" className="text-xs px-1.5 py-0">
-                      {ticker}
-                    </Badge>
-                  ))}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+      {articles.length === 0 ? (
+        <Card>
+          <CardContent className="py-10 text-center text-muted-foreground text-sm">
+            No articles yet. Run the news pipeline to fetch the latest market news.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid gap-3">
+          {articles.map((article) => {
+            const tickers = article.articleStock.map((as) => as.stock);
+            const topSentiment = tickers
+              .flatMap((s) => s.sentiments)
+              .sort((a, b) => Math.abs(b.score) - Math.abs(a.score))[0];
+
+            return (
+              <a key={article.id} href={article.url} target="_blank" rel="noopener noreferrer">
+                <Card className="hover:bg-muted/50 transition-colors cursor-pointer">
+                  <CardHeader className="pb-2">
+                    <div className="flex items-start justify-between gap-4">
+                      <CardTitle className="text-base font-medium leading-snug">
+                        {article.headline}
+                      </CardTitle>
+                      <SentimentBadge score={topSentiment?.score} />
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center gap-3 text-sm text-muted-foreground flex-wrap">
+                      <span className="flex items-center gap-1">
+                        <Newspaper className="h-3 w-3" />
+                        {article.source}
+                      </span>
+                      <span>·</span>
+                      <span>{formatDistanceToNow(article.publishedAt)}</span>
+                      {tickers.length > 0 && (
+                        <>
+                          <span>·</span>
+                          <div className="flex gap-1 flex-wrap">
+                            {tickers.slice(0, 4).map((stock) => (
+                              <Badge key={stock.id} variant="outline" className="text-xs px-1.5 py-0">
+                                {stock.ticker}
+                              </Badge>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              </a>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
