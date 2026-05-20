@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id          String        @id @default(cuid())
+  clerkId     String        @unique
+  createdAt   DateTime      @default(now())
+  userStocks  UserStock[]
+  userMarkets UserMarket[]
+}
+
+model Market {
+  id          String       @id @default(cuid())
+  name        String       @unique
+  description String?
+  stocks      Stock[]
+  userMarkets UserMarket[]
+}
+
+model Stock {
+  id           String         @id @default(cuid())
+  ticker       String         @unique
+  name         String
+  market       Market         @relation(fields: [marketId], references: [id])
+  marketId     String
+  articleStock ArticleStock[]
+  sentiments   Sentiment[]
+  userStocks   UserStock[]
+}
+
+model Article {
+  id           String         @id @default(cuid())
+  headline     String
+  summary      String?
+  url          String         @unique
+  source       String
+  publishedAt  DateTime
+  createdAt    DateTime       @default(now())
+  articleStock ArticleStock[]
+}
+
+model ArticleStock {
+  id        String  @id @default(cuid())
+  article   Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  articleId String
+  stock     Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId   String
+
+  @@unique([articleId, stockId])
+}
+
+model Sentiment {
+  id        String   @id @default(cuid())
+  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId   String
+  score     Float
+  summary   String?
+  date      DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([stockId, date])
+}
+
+model UserStock {
+  id      String @id @default(cuid())
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId  String
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
+
+  @@unique([userId, stockId])
+}
+
+model UserMarket {
+  id       String @id @default(cuid())
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId   String
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  marketId String
+
+  @@unique([userId, marketId])
+}
