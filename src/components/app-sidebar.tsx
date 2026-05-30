@@ -12,20 +12,24 @@ import {
   SidebarHeader,
   SidebarFooter,
 } from "@/components/ui/sidebar";
-import { BarChart2, Newspaper, Star, Settings, TrendingUp } from "lucide-react";
+import { BarChart2, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-const navItems = [
-  { label: "News Feed", href: "/dashboard", icon: Newspaper },
+const baseNavItems = [
+  { label: "Overview", href: "/dashboard", icon: LayoutDashboard },
+  { label: "News Feed", href: "/dashboard/news", icon: Newspaper },
   { label: "Markets", href: "/dashboard/markets", icon: TrendingUp },
   { label: "Watchlist", href: "/dashboard/watchlist", icon: Star },
   { label: "Sentiment", href: "/dashboard/sentiment", icon: BarChart2 },
   { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
-export function AppSidebar() {
+const adminNavItem = { label: "Admin", href: "/dashboard/admin", icon: Shield };
+
+export function AppSidebar({ isAdmin = false }: { isAdmin?: boolean }) {
   const pathname = usePathname();
+  const navItems = isAdmin ? [...baseNavItems, adminNavItem] : baseNavItems;
 
   return (
     <Sidebar>
@@ -41,16 +45,22 @@ export function AppSidebar() {
           <SidebarGroupLabel>Navigation</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {navItems.map((item) => (
-                <SidebarMenuItem key={item.href}>
-                  <SidebarMenuButton asChild isActive={pathname === item.href}>
-                    <Link href={item.href}>
-                      <item.icon className="h-4 w-4" />
-                      <span>{item.label}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
+              {navItems.map((item) => {
+                const isActive =
+                  item.href === "/dashboard"
+                    ? pathname === item.href
+                    : pathname === item.href || pathname.startsWith(`${item.href}/`);
+                return (
+                  <SidebarMenuItem key={item.href}>
+                    <SidebarMenuButton asChild isActive={isActive}>
+                      <Link href={item.href}>
+                        <item.icon className="h-4 w-4" />
+                        <span>{item.label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

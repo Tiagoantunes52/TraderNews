@@ -1,18 +1,9 @@
-"use client";
-
-import { useEffect, useState } from "react";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Check } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { db } from "@/lib/db";
+import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { MarketToggleCard } from "./market-toggle-card";
 
-type Market = {
-  id: string;
-  name: string;
-  description: string | null;
-  followed: boolean;
-};
+export const metadata = { title: "Markets — TraderNews" };
 
 const MARKET_META: Record<string, { icon: string; color: string }> = {
   NYSE:   { icon: "🏛️", color: "bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-800" },
@@ -22,32 +13,18 @@ const MARKET_META: Record<string, { icon: string; color: string }> = {
   FOREX:  { icon: "💱", color: "bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800" },
 };
 
-export default function MarketsPage() {
-  const [markets, setMarkets] = useState<Market[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [pending, setPending] = useState<string | null>(null);
+export default async function MarketsPage() {
+  const user = await getOrCreateUser();
+  if (!user) return null;
 
-  useEffect(() => {
-    fetch("/api/markets")
-      .then((r) => r.json())
-      .then((data) => { setMarkets(data); setLoading(false); });
-  }, []);
+  const [markets, followed] = await Promise.all([
+    db.market.findMany({ orderBy: { name: "asc" } }),
+    db.userMarket.findMany({ where: { userId: user.id }, select: { marketId: true } }),
+  ]);
 
-  const toggle = async (market: Market) => {
-    setPending(market.id);
-    const method = market.followed ? "DELETE" : "POST";
-    await fetch("/api/markets", {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ marketId: market.id }),
-    });
-    setMarkets((prev) =>
-      prev.map((m) => m.id === market.id ? { ...m, followed: !m.followed } : m)
-    );
-    setPending(null);
-  };
-
-  const followed = markets.filter((m) => m.followed);
+  const followedIds = new Set(followed.map((f) => f.marketId));
+  const decorated = markets.map((m) => ({ ...m, followed: followedIds.has(m.id) }));
+  const followedMarkets = decorated.filter((m) => m.followed);
 
   return (
     <div className="space-y-6 max-w-2xl">
@@ -58,9 +35,9 @@ export default function MarketsPage() {
         </p>
       </div>
 
-      {followed.length > 0 && (
+      {followedMarkets.length > 0 && (
         <div className="flex flex-wrap gap-2">
-          {followed.map((m) => (
+          {followedMarkets.map((m) => (
             <Badge key={m.id} variant="secondary" className="text-xs gap-1">
               {MARKET_META[m.name]?.icon} {m.name}
             </Badge>
@@ -69,41 +46,20 @@ export default function MarketsPage() {
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {loading
-          ? Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-28 w-full" />)
-          : markets.map((market) => {
-              const meta = MARKET_META[market.name];
-              return (
-                <Card
-                  key={market.id}
-                  onClick={() => !pending && toggle(market)}
-                  className={cn(
-                    "cursor-pointer border-2 transition-all select-none",
-                    market.followed
-                      ? `${meta?.color} border-opacity-100`
-                      : "hover:bg-muted/50 border-transparent",
-                    pending === market.id && "opacity-60 pointer-events-none"
-                  )}
-                >
-                  <CardHeader className="pb-1">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="text-2xl">{meta?.icon}</span>
-                        <CardTitle className="text-base">{market.name}</CardTitle>
-                      </div>
-                      {market.followed && (
-                        <div className="h-5 w-5 rounded-full bg-primary flex items-center justify-center">
-                          <Check className="h-3 w-3 text-primary-foreground" />
-                        </div>
-                      )}
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <CardDescription>{market.description}</CardDescription>
-                  </CardContent>
-                </Card>
-              );
-            })}
+        {decorated.map((market) => {
+          const meta = MARKET_META[market.name] ?? { icon: "📊", color: "" };
+          return (
+            <MarketToggleCard
+              key={market.id}
+              marketId={market.id}
+              name={market.name}
+              description={market.description}
+              followed={market.followed}
+              icon={meta.icon}
+              colorClass={meta.color}
+            />
+          );
+        })}
       </div>
     </div>
   );

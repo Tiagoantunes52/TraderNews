@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
 import { runPipeline } from "@/lib/pipeline";
+import { requireAdmin } from "@/lib/auth";
 
 export async function POST() {
-  const { userId } = await auth();
-  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const guard = await requireAdmin();
+  if (guard instanceof NextResponse) return guard;
 
   try {
     const result = await runPipeline();

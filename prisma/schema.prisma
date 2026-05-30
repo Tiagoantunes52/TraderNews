@@ -7,12 +7,35 @@ datasource db {
   provider = "postgresql"
 }
 
+enum Role {
+  USER
+  ADMIN
+}
+
 model User {
-  id          String        @id @default(cuid())
-  clerkId     String        @unique
-  createdAt   DateTime      @default(now())
-  userStocks  UserStock[]
-  userMarkets UserMarket[]
+  id              String        @id @default(cuid())
+  clerkId         String        @unique
+  email           String?       @unique
+  role            Role          @default(USER)
+  createdAt       DateTime      @default(now())
+  userStocks      UserStock[]
+  userMarkets     UserMarket[]
+  invitationsSent Invitation[]  @relation("InvitedBy")
+  invitationUsed  Invitation?   @relation("AcceptedBy")
+}
+
+model Invitation {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  invitedBy         User      @relation("InvitedBy", fields: [invitedById], references: [id])
+  invitedById       String
+  acceptedAt        DateTime?
+  acceptedBy        User?     @relation("AcceptedBy", fields: [acceptedByUserId], references: [id])
+  acceptedByUserId  String?   @unique
+  clerkInvitationId String?   @unique
+  createdAt         DateTime  @default(now())
+
+  @@index([email])
 }
 
 model Market {

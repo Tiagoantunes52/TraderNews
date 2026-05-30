@@ -2,25 +2,6 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 
-export async function GET() {
-  const user = await getOrCreateUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
-  const userStocks = await db.userStock.findMany({
-    where: { userId: user.id },
-    include: {
-      stock: {
-        include: {
-          market: true,
-          sentiments: { orderBy: { date: "desc" }, take: 1 },
-        },
-      },
-    },
-  });
-
-  return NextResponse.json(userStocks.map((us) => us.stock));
-}
-
 export async function POST(req: Request) {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
