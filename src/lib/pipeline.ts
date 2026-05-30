@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
 import { getMarketNews, getStockNews } from "@/lib/finnhub";
+import { getMarketauxStockNews } from "@/lib/marketaux";
 import { analyzeSentiment } from "@/lib/llm";
 
 export type PipelineResult = {
@@ -50,13 +51,13 @@ export async function runPipeline(): Promise<PipelineResult> {
   // 2. Fetch stock-specific news only for stocks users are watching
   const stocks = await db.stock.findMany({
     select: { id: true, ticker: true },
-    where: {
-      ticker: { not: { endsWith: "-USD" } }, // skip crypto (not supported by Finnhub)
-      userStocks: { some: {} },              // at least one user follows it
-    },
+    where: { userStocks: { some: {} } }, // at least one user follows it
   });
 
-  for (const stock of stocks) {
+  // Finnhub free tier only supports /company-news for US tickers (no dot-exchange suffix, no crypto)
+  const usStocks = stocks.filter((s) => !s.ticker.includes(".") && !s.ticker.endsWith("-USD"));
+
+  for (const stock of usStocks) {
     try {
       const news = await getStockNews(stock.ticker, dateStr(from), dateStr(to));
       result.articles.fetched += news.length;
@@ -96,7 +97,70 @@ export async function runPipeline(): Promise<PipelineResult> {
     }
   }
 
-  // 3. Run sentiment for watched stocks that have tagged articles
+  // 2b. Fetch news for non-US stocks via Marketaux (Finnhub free tier doesn't support these)
+  const nonUsStocks = stocks.filter((s) => s.ticker.includes("."));
+
+  if (nonUsStocks.length > 0) {
+    if (!process.env.MARKETAUX_API_KEY) {
+      result.errors.push("Marketaux skipped: MARKETAUX_API_KEY not set");
+    } else {
+      const BATCH = 5; // keep request count low on free tier (100 req/day)
+      const fromISO = from.toISOString();
+
+      for (let i = 0; i < nonUsStocks.length; i += BATCH) {
+        const batch = nonUsStocks.slice(i, i + BATCH);
+        const symbols = batch.map((s) => s.ticker);
+
+        try {
+          const news = await getMarketauxStockNews(symbols, fromISO);
+          result.articles.fetched += news.length;
+
+          const valid = news.filter((a) => a.url && a.title);
+
+          const { count } = await db.article.createMany({
+            data: valid.map((a) => ({
+              headline: a.title,
+              summary: a.description ?? null,
+              url: a.url,
+              source: a.source,
+              publishedAt: new Date(a.published_at),
+            })),
+            skipDuplicates: true,
+          });
+          result.articles.saved += count;
+
+          // Resolve saved article IDs and link to stocks via entities
+          const urls = valid.map((a) => a.url);
+          const savedArticles = await db.article.findMany({
+            where: { url: { in: urls } },
+            select: { id: true, url: true },
+          });
+          const urlToId = new Map(savedArticles.map((a) => [a.url, a.id]));
+
+          const links: Array<{ articleId: string; stockId: string }> = [];
+          for (const article of valid) {
+            const articleId = urlToId.get(article.url);
+            if (!articleId) continue;
+            for (const entity of article.entities) {
+              const stock = batch.find((s) => s.ticker === entity.symbol);
+              if (stock) links.push({ articleId, stockId: stock.id });
+            }
+          }
+
+          if (links.length > 0) {
+            await db.articleStock.createMany({ data: links, skipDuplicates: true });
+            result.tags += links.length;
+          }
+
+          await sleep(1000);
+        } catch (e) {
+          result.errors.push(`Marketaux news failed for [${symbols.join(",")}]: ${String(e)}`);
+        }
+      }
+    }
+  }
+
+  // 3. Run sentiment for all watched stocks that have tagged articles
   for (const stock of stocks) {
     try {
       const recentArticles = await db.article.findMany({
