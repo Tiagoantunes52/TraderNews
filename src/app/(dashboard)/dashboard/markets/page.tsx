@@ -6,11 +6,12 @@ import { MarketToggleCard } from "./market-toggle-card";
 export const metadata = { title: "Markets — TraderNews" };
 
 const MARKET_META: Record<string, { icon: string; color: string }> = {
-  NYSE:   { icon: "🏛️", color: "bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-800" },
-  NASDAQ: { icon: "💻", color: "bg-purple-50 border-purple-200 dark:bg-purple-950 dark:border-purple-800" },
-  LSE:    { icon: "🇬🇧", color: "bg-red-50 border-red-200 dark:bg-red-950 dark:border-red-800" },
-  CRYPTO: { icon: "₿",  color: "bg-orange-50 border-orange-200 dark:bg-orange-950 dark:border-orange-800" },
-  FOREX:  { icon: "💱", color: "bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800" },
+  NYSE:             { icon: "🏛️", color: "bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-800" },
+  NASDAQ:           { icon: "💻", color: "bg-purple-50 border-purple-200 dark:bg-purple-950 dark:border-purple-800" },
+  LSE:              { icon: "🇬🇧", color: "bg-red-50 border-red-200 dark:bg-red-950 dark:border-red-800" },
+  EURONEXT_LISBON:  { icon: "🇵🇹", color: "bg-emerald-50 border-emerald-200 dark:bg-emerald-950 dark:border-emerald-800" },
+  CRYPTO:           { icon: "₿",  color: "bg-orange-50 border-orange-200 dark:bg-orange-950 dark:border-orange-800" },
+  FOREX:            { icon: "💱", color: "bg-green-50 border-green-200 dark:bg-green-950 dark:border-green-800" },
 };
 
 export default async function MarketsPage() {

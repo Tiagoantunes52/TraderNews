@@ -11,6 +11,7 @@ const markets = [
   { name: "LSE", description: "London Stock Exchange" },
   { name: "CRYPTO", description: "Cryptocurrency" },
   { name: "FOREX", description: "Foreign Exchange" },
+  { name: "EURONEXT_LISBON", description: "Euronext Lisbon (PSI)" },
 ];
 
 const stocks = [
@@ -29,6 +30,12 @@ const stocks = [
   { ticker: "QQQ", name: "Invesco QQQ Trust", market: "NASDAQ" },
   { ticker: "BTC-USD", name: "Bitcoin", market: "CRYPTO" },
   { ticker: "ETH-USD", name: "Ethereum", market: "CRYPTO" },
+  { ticker: "EGL.LS",  name: "Greenvolt — Energias Renováveis",  market: "EURONEXT_LISBON" },
+  { ticker: "BCP.LS",  name: "Millennium BCP",                   market: "EURONEXT_LISBON" },
+  { ticker: "GALP.LS", name: "Galp Energia",                     market: "EURONEXT_LISBON" },
+  { ticker: "EDP.LS",  name: "EDP — Energias de Portugal",       market: "EURONEXT_LISBON" },
+  { ticker: "JMT.LS",  name: "Jerónimo Martins",                 market: "EURONEXT_LISBON" },
+  { ticker: "NOS.LS",  name: "NOS SGPS",                         market: "EURONEXT_LISBON" },
 ];
 
 async function main() {
@@ -45,7 +52,7 @@ async function main() {
     if (!market) continue;
     await prisma.stock.upsert({
       where: { ticker: stock.ticker },
-      update: {},
+      update: { name: stock.name, marketId: market.id },
       create: { ticker: stock.ticker, name: stock.name, marketId: market.id },
     });
   }
