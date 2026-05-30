@@ -9,6 +9,13 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     steps:
+      - name: Check secrets are set
+        run: |
+          if [ -z "${{ secrets.APP_URL }}" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "${{ secrets.PIPELINE_SECRET }}" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+          echo "APP_URL is set (length: ${#APP_URL})"
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
       - name: Trigger pipeline
         run: |
           curl -f -X POST "${{ secrets.APP_URL }}/api/pipeline/run" \
