@@ -12,7 +12,7 @@ export type MarketauxArticle = {
 
 export async function getMarketauxStockNews(
   symbols: string[],
-  publishedAfter: string
+  publishedAfter: Date
 ): Promise<MarketauxArticle[]> {
   const apiKey = process.env.MARKETAUX_API_KEY;
   if (!apiKey) throw new Error("MARKETAUX_API_KEY not set");
@@ -21,12 +21,16 @@ export async function getMarketauxStockNews(
   url.searchParams.set("api_token", apiKey);
   url.searchParams.set("symbols", symbols.join(","));
   url.searchParams.set("filter_entities", "true");
-  url.searchParams.set("published_after", publishedAfter);
+  // Marketaux expects YYYY-MM-DDTHH:mm format (no seconds, no Z)
+  url.searchParams.set("published_after", publishedAfter.toISOString().slice(0, 16));
   url.searchParams.set("language", "en");
   url.searchParams.set("limit", "50");
 
   const res = await fetch(url.toString(), { cache: "no-store" });
-  if (!res.ok) throw new Error(`Marketaux error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Marketaux error: ${res.status} — ${body}`);
+  }
   const data = (await res.json()) as { data: MarketauxArticle[] };
   return data.data ?? [];
 }

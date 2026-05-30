@@ -105,14 +105,13 @@ export async function runPipeline(): Promise<PipelineResult> {
       result.errors.push("Marketaux skipped: MARKETAUX_API_KEY not set");
     } else {
       const BATCH = 5; // keep request count low on free tier (100 req/day)
-      const fromISO = from.toISOString();
 
       for (let i = 0; i < nonUsStocks.length; i += BATCH) {
         const batch = nonUsStocks.slice(i, i + BATCH);
         const symbols = batch.map((s) => s.ticker);
 
         try {
-          const news = await getMarketauxStockNews(symbols, fromISO);
+          const news = await getMarketauxStockNews(symbols, from);
           result.articles.fetched += news.length;
 
           const valid = news.filter((a) => a.url && a.title);
