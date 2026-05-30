@@ -24,7 +24,7 @@ export async function getMarketauxStockNews(
   // Marketaux expects YYYY-MM-DDTHH:mm format (no seconds, no Z)
   url.searchParams.set("published_after", publishedAfter.toISOString().slice(0, 16));
   url.searchParams.set("language", "en");
-  url.searchParams.set("limit", "50");
+  url.searchParams.set("limit", "3"); // free tier cap
 
   const res = await fetch(url.toString(), { cache: "no-store" });
   if (!res.ok) {
