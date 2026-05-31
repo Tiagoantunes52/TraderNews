@@ -2,16 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { searchStocks } from "@/lib/finnhub";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
-
-function marketNamesForTicker(ticker: string): string[] {
-  if (ticker.endsWith(".LS")) return ["EURONEXT_LISBON"];
-  if (ticker.endsWith(".L"))  return ["LSE"];
-  if (ticker.endsWith(".PA")) return ["EURONEXT_PARIS"];
-  if (ticker.endsWith(".DE")) return ["XETRA"];
-  if (ticker.endsWith(".AS")) return ["EURONEXT_AMSTERDAM"];
-  if (ticker.endsWith("-USD")) return ["CRYPTO"];
-  return ["NYSE", "NASDAQ"];
-}
+import { marketNamesForTicker } from "@/lib/market-utils";
 
 async function inferMarket(ticker: string) {
   const names = marketNamesForTicker(ticker);
