@@ -47,14 +47,16 @@ model Market {
 }
 
 model Stock {
-  id           String         @id @default(cuid())
-  ticker       String         @unique
-  name         String
-  market       Market         @relation(fields: [marketId], references: [id])
-  marketId     String
-  articleStock ArticleStock[]
-  sentiments   Sentiment[]
-  userStocks   UserStock[]
+  id             String          @id @default(cuid())
+  ticker         String          @unique
+  name           String
+  market         Market          @relation(fields: [marketId], references: [id])
+  marketId       String
+  articleStock   ArticleStock[]
+  sentiments     Sentiment[]
+  quantAnalyses  QuantAnalysis[]
+  stockEstimates StockEstimate[]
+  userStocks     UserStock[]
 }
 
 model Article {
@@ -79,13 +81,57 @@ model ArticleStock {
 }
 
 model Sentiment {
-  id        String   @id @default(cuid())
-  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId   String
-  score     Float
-  summary   String?
-  date      DateTime @default(now())
-  createdAt DateTime @default(now())
+  id                 String   @id @default(cuid())
+  stock              Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId            String
+  score              Float
+  summary            String?
+  articleCount       Int      @default(0)
+  avgArticleAgeHours Float?
+  date               DateTime @default(now())
+  createdAt          DateTime @default(now())
+
+  @@index([stockId, date])
+}
+
+model QuantAnalysis {
+  id             String   @id @default(cuid())
+  stock          Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId        String
+  price          Float?
+  change1d       Float?
+  change7d       Float?
+  change30d      Float?
+  rsi14          Float?
+  sma20          Float?
+  sma50          Float?
+  volatility30d  Float?
+  volumeRatio10d Float?
+  macdHistogram  Float?
+  priceVs60dHigh Float?
+  priceVs60dLow  Float?
+  relativeStr7d  Float?
+  score          Float
+  date           DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([stockId, date])
+}
+
+model StockEstimate {
+  id                   String   @id @default(cuid())
+  stock                Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId              String
+  sentimentScore       Float
+  quantScore           Float?
+  combinedScore        Float
+  signal               String
+  confidence           Float    @default(0.5)
+  dataWarnings         String[]
+  sentimentDelta       Float?
+  articleVelocityRatio Float?
+  date                 DateTime @default(now())
+  createdAt            DateTime @default(now())
 
   @@index([stockId, date])
 }
