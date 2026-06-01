@@ -19,6 +19,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
     include: {
       market: true,
       sentiments: { orderBy: { date: "desc" }, take: 30 },
+      quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
+      stockEstimates: { orderBy: { date: "desc" }, take: 1 },
       articleStock: {
         include: { article: true },
         orderBy: { article: { publishedAt: "desc" } },
@@ -38,6 +40,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
 
   const latest = stock.sentiments[0] ?? null;
   const m = latest ? mood(latest.score) : null;
+  const quant = stock.quantAnalyses[0] ?? null;
+  const estimate = stock.stockEstimates[0] ?? null;
 
   const history = stock.sentiments
     .slice()
@@ -98,6 +102,98 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
           small
         />
       </div>
+
+      {/* Quantitative analysis */}
+      {(quant || estimate) && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Quantitative Analysis</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {quant?.price != null && (
+              <div className="grid grid-cols-4 gap-3">
+                <QuantStat label="Price" value={quant.price.toFixed(2)} />
+                <QuantStat
+                  label="1d"
+                  value={quant.change1d != null ? `${quant.change1d >= 0 ? "+" : ""}${quant.change1d.toFixed(1)}%` : "—"}
+                  positive={quant.change1d != null ? quant.change1d >= 0 : undefined}
+                />
+                <QuantStat
+                  label="7d"
+                  value={quant.change7d != null ? `${quant.change7d >= 0 ? "+" : ""}${quant.change7d.toFixed(1)}%` : "—"}
+                  positive={quant.change7d != null ? quant.change7d >= 0 : undefined}
+                />
+                <QuantStat
+                  label="30d"
+                  value={quant.change30d != null ? `${quant.change30d >= 0 ? "+" : ""}${quant.change30d.toFixed(1)}%` : "—"}
+                  positive={quant.change30d != null ? quant.change30d >= 0 : undefined}
+                />
+              </div>
+            )}
+
+            {quant?.rsi14 != null && (
+              <div className="flex items-center gap-3 text-sm flex-wrap">
+                <span className="text-muted-foreground">RSI {quant.rsi14.toFixed(0)}</span>
+                {quant.rsi14 < 30 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</span>
+                )}
+                {quant.rsi14 > 70 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</span>
+                )}
+                {quant.sma20 != null && quant.price != null && (
+                  <span className={`text-xs ${quant.price > quant.sma20 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                    {quant.price > quant.sma20 ? "↑ Above" : "↓ Below"} SMA20
+                  </span>
+                )}
+                {quant.sma50 != null && quant.price != null && (
+                  <span className={`text-xs ${quant.price > quant.sma50 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                    {quant.price > quant.sma50 ? "↑ Above" : "↓ Below"} SMA50
+                  </span>
+                )}
+              </div>
+            )}
+
+            {estimate && (
+              <div className="space-y-1.5 pt-1 border-t">
+                <p className="text-xs text-muted-foreground pt-2">Combined estimate</p>
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground w-20 shrink-0">Sentiment</span>
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full rounded-full bg-blue-500" style={{ width: `${Math.round(((estimate.sentimentScore + 1) / 2) * 100)}%` }} />
+                  </div>
+                  <span className={`tabular-nums w-12 text-right font-medium ${estimate.sentimentScore >= 0 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                    {estimate.sentimentScore >= 0 ? "+" : ""}{estimate.sentimentScore.toFixed(2)}
+                  </span>
+                </div>
+                {estimate.quantScore != null && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-muted-foreground w-20 shrink-0">Quant</span>
+                    <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                      <div className="h-full rounded-full bg-violet-500" style={{ width: `${Math.round(((estimate.quantScore + 1) / 2) * 100)}%` }} />
+                    </div>
+                    <span className={`tabular-nums w-12 text-right font-medium ${estimate.quantScore >= 0 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                      {estimate.quantScore >= 0 ? "+" : ""}{estimate.quantScore.toFixed(2)}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground w-20 shrink-0 font-medium">Combined</span>
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full rounded-full" style={{ width: `${Math.round(((estimate.combinedScore + 1) / 2) * 100)}%`, backgroundColor: mood(estimate.combinedScore).chartColor }} />
+                  </div>
+                  <span className={`tabular-nums w-12 text-right font-medium ${estimate.combinedScore >= 0 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                    {estimate.combinedScore >= 0 ? "+" : ""}{estimate.combinedScore.toFixed(2)}
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground pt-1">
+                  Signal: <span className="font-medium text-foreground">{estimate.signal.replace("_", " ")}</span>
+                  {estimate.quantScore == null && " (sentiment only — no price data)"}
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Sentiment summary */}
       {latest?.summary && (
@@ -168,6 +264,33 @@ function ArticleSentimentBadge({ score }: { score?: number }) {
   if (score > 0.2) return <Badge className="bg-green-500 hover:bg-green-600 shrink-0 text-xs"><TrendingUp className="h-3 w-3 mr-1" />Bullish</Badge>;
   if (score < -0.2) return <Badge className="bg-red-500 hover:bg-red-600 shrink-0 text-xs"><TrendingDown className="h-3 w-3 mr-1" />Bearish</Badge>;
   return <Badge variant="secondary" className="shrink-0 text-xs"><Minus className="h-3 w-3 mr-1" />Neutral</Badge>;
+}
+
+function QuantStat({
+  label,
+  value,
+  positive,
+}: {
+  label: string;
+  value: string;
+  positive?: boolean;
+}) {
+  return (
+    <div className="text-center">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p
+        className={`text-sm font-bold tabular-nums mt-0.5 ${
+          positive === true
+            ? "text-green-600 dark:text-green-400"
+            : positive === false
+            ? "text-red-500 dark:text-red-400"
+            : ""
+        }`}
+      >
+        {value}
+      </p>
+    </div>
+  );
 }
 
 function StatCard({

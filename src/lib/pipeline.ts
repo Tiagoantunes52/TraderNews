@@ -6,11 +6,15 @@ import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getPolygonStockNews } from "@/lib/polygon";
 import { analyzeSentiment } from "@/lib/llm";
+import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcQuantScore, scoreToSignal } from "@/lib/indicators";
 
 export type PipelineResult = {
   articles: { fetched: number; saved: number };
   tags: number;
   sentiments: number;
+  quants: number;
+  estimates: number;
   errors: string[];
 };
 
@@ -120,7 +124,7 @@ async function saveArticlesWithDedup(
 }
 
 export async function runPipeline(): Promise<PipelineResult> {
-  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, errors: [] };
+  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, errors: [] };
 
   const to = new Date();
   const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -453,6 +457,74 @@ export async function runPipeline(): Promise<PipelineResult> {
       result.sentiments++;
     } catch (e) {
       result.errors.push(`Sentiment failed for ${stock.ticker}: ${String(e)}`);
+    }
+  }
+
+  // 4. Quantitative analysis — fetch 60 days of price history and compute indicators
+  const from60 = new Date(to.getTime() - 60 * 24 * 60 * 60 * 1000);
+
+  for (const stock of stocks) {
+    try {
+      const prices = await getTiingoDailyPrices(stock.ticker, from60);
+      if (prices.length < 2) continue; // insufficient data — skip gracefully
+
+      const closes = prices.map((p) => p.close);
+      const price = closes[closes.length - 1];
+      const change1d = calcMomentum(closes, 1);
+      const change7d = calcMomentum(closes, 7);
+      const change30d = calcMomentum(closes, 30);
+      const rsi14 = calcRSI(closes);
+      const sma20 = calcSMA(closes, 20);
+      const sma50 = calcSMA(closes, 50);
+      const volatility30d = calcVolatility(closes);
+      const score = calcQuantScore({ rsi14, change7d, sma20, price });
+
+      await db.quantAnalysis.create({
+        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, score },
+      });
+
+      result.quants++;
+      await sleep(500);
+    } catch (e) {
+      result.errors.push(`Quant failed for ${stock.ticker}: ${String(e)}`);
+    }
+  }
+
+  // 5. Combined estimate — blend latest sentiment + quant scores for each stock
+  for (const stock of stocks) {
+    try {
+      const latestSentiment = await db.sentiment.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { score: true },
+      });
+
+      if (!latestSentiment) continue;
+
+      const latestQuant = await db.quantAnalysis.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { score: true },
+      });
+
+      const sentimentScore = latestSentiment.score;
+      const quantScore = latestQuant?.score ?? null;
+      const combinedScore =
+        quantScore != null ? (sentimentScore + quantScore) / 2 : sentimentScore;
+
+      await db.stockEstimate.create({
+        data: {
+          stockId: stock.id,
+          sentimentScore,
+          quantScore,
+          combinedScore,
+          signal: scoreToSignal(combinedScore),
+        },
+      });
+
+      result.estimates++;
+    } catch (e) {
+      result.errors.push(`Estimate failed for ${stock.ticker}: ${String(e)}`);
     }
   }
 
