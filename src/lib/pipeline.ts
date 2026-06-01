@@ -1,5 +1,5 @@
 import { db } from "@/lib/db";
-import { getMarketNews, getStockNews } from "@/lib/finnhub";
+import { getMarketNews, getStockNews, getEarningsCalendar } from "@/lib/finnhub";
 import { getMarketauxStockNews } from "@/lib/marketaux";
 import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
 import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
@@ -7,9 +7,35 @@ import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getPolygonStockNews } from "@/lib/polygon";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+// Sector ETF map for US equities — used to compute sector-relative strength
+const SECTOR_ETF: Record<string, string> = {
+  // Technology
+  AAPL:"XLK", MSFT:"XLK", NVDA:"XLK", AMD:"XLK", INTC:"XLK", ORCL:"XLK", CRM:"XLK", ADBE:"XLK", QCOM:"XLK",
+  // Communication Services (GOOGL appears in both Tech and Comm — last key wins; we use XLC)
+  META:"XLC", NFLX:"XLC", GOOGL:"XLC", GOOG:"XLC", VZ:"XLC", T:"XLC", DIS:"XLC",
+  // Consumer Discretionary
+  AMZN:"XLY", TSLA:"XLY", HD:"XLY", MCD:"XLY", NKE:"XLY", SBUX:"XLY",
+  // Consumer Staples
+  PG:"XLP", KO:"XLP", PEP:"XLP", WMT:"XLP", COST:"XLP", PM:"XLP",
+  // Financials
+  JPM:"XLF", BAC:"XLF", GS:"XLF", MS:"XLF", C:"XLF", WFC:"XLF", BRK_B:"XLF",
+  // Healthcare
+  JNJ:"XLV", UNH:"XLV", PFE:"XLV", ABBV:"XLV", MRK:"XLV", LLY:"XLV",
+  // Industrials
+  BA:"XLI", CAT:"XLI", GE:"XLI", HON:"XLI", UPS:"XLI",
+  // Energy
+  XOM:"XLE", CVX:"XLE", COP:"XLE", SLB:"XLE",
+  // Utilities
+  NEE:"XLU", DUK:"XLU", SO:"XLU",
+  // Real Estate
+  AMT:"XLRE", PLD:"XLRE", EQIX:"XLRE",
+  // Materials
+  LIN:"XLB", APD:"XLB", NEM:"XLB",
+};
 
 export type PipelineResult = {
   articles: { fetched: number; saved: number };
@@ -392,7 +418,8 @@ export async function runPipeline(): Promise<PipelineResult> {
         const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
         result.articles.saved += saved;
 
-        const links: Array<{ articleId: string; stockId: string }> = [];
+        // Collect per-article sentiment scores for upsert into ArticleStock
+        const links: Array<{ articleId: string; stockId: string; sentimentScore: number }> = [];
         for (const article of news.filter((a) => a.url && a.title)) {
           const articleId = urlToId.get(article.url);
           if (!articleId) continue;
@@ -401,22 +428,27 @@ export async function runPipeline(): Promise<PipelineResult> {
             const stock = batch.find((s) => s.ticker === ts.ticker);
             if (!stock) continue;
 
-            links.push({ articleId, stockId: stock.id });
+            const sentimentScore = parseFloat(ts.ticker_sentiment_score);
+            links.push({ articleId, stockId: stock.id, sentimentScore: Number.isNaN(sentimentScore) ? 0 : sentimentScore });
 
-            const score = parseFloat(ts.ticker_sentiment_score);
             const relevance = parseFloat(ts.relevance_score);
-            if (!Number.isNaN(score) && !Number.isNaN(relevance) && relevance > 0) {
+            if (!Number.isNaN(sentimentScore) && !Number.isNaN(relevance) && relevance > 0) {
               const bucket = avSentimentScores.get(stock.id) ?? [];
-              bucket.push({ score, relevance });
+              bucket.push({ score: sentimentScore, relevance });
               avSentimentScores.set(stock.id, bucket);
             }
           }
         }
 
-        if (links.length > 0) {
-          await db.articleStock.createMany({ data: links, skipDuplicates: true });
-          result.tags += links.length;
+        // Upsert individual article-stock links with per-article sentiment score
+        for (const { articleId, stockId, sentimentScore } of links) {
+          await db.articleStock.upsert({
+            where: { articleId_stockId: { articleId, stockId } },
+            create: { articleId, stockId, sentimentScore },
+            update: { sentimentScore },
+          });
         }
+        result.tags += links.length;
 
         await sleep(1000);
       } catch (e) {
@@ -507,8 +539,39 @@ export async function runPipeline(): Promise<PipelineResult> {
     if (spyPrices.length >= 8) spyChange7d = calcMomentum(spyPrices.map(p => p.close), 7);
   } catch { /* benchmark failure doesn't block per-stock analysis */ }
 
+  // Fetch next 30-day earnings calendar (one API call for all stocks)
+  const earningsTo = new Date(to.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const earningsByTicker = new Map<string, Date>();
+  try {
+    const calendar = await getEarningsCalendar(dateStr(to), dateStr(earningsTo));
+    for (const event of calendar) {
+      if (!earningsByTicker.has(event.symbol)) {
+        earningsByTicker.set(event.symbol, new Date(event.date));
+      }
+    }
+  } catch { /* earnings fetch failure doesn't block quant */ }
+
+  // Collect unique sector ETFs needed for the current watchlist (US stocks only)
+  const neededEtfs = new Set<string>();
+  for (const s of usStocks) {
+    const etf = SECTOR_ETF[s.ticker];
+    if (etf) neededEtfs.add(etf);
+  }
+
+  // Fetch sector ETF 7-day returns
+  const sectorChange7d = new Map<string, number>(); // ETF ticker → 7d return
+  for (const etf of neededEtfs) {
+    try {
+      const etfPrices = await getTiingoDailyPrices(etf, from60);
+      if (etfPrices.length >= 8) {
+        const change = calcMomentum(etfPrices.map(p => p.close), 7);
+        if (change != null) sectorChange7d.set(etf, change);
+      }
+    } catch { /* sector ETF failure doesn't block */ }
+  }
+
   // Per-stock quant metadata for step 5 blending
-  const stockQuantMeta = new Map<string, { quantScore: number; volatility30d: number | null }>();
+  const stockQuantMeta = new Map<string, { quantScore: number; volatility30d: number | null; daysToEarnings: number | null }>();
 
   for (const stock of stocks) {
     try {
@@ -524,6 +587,8 @@ export async function runPipeline(): Promise<PipelineResult> {
 
       const closes = prices.map((p) => p.close);
       const volumes = prices.map((p) => p.volume);
+      const highs = prices.map((p) => p.high);
+      const lows = prices.map((p) => p.low);
       const isCrypto = stock.ticker.endsWith("-USD");
 
       const price = closes[closes.length - 1];
@@ -544,13 +609,35 @@ export async function runPipeline(): Promise<PipelineResult> {
       const priceVs60dLow = price != null ? ((price - low60d) / low60d) * 100 : null;
       const relativeStr7d = change7d != null && spyChange7d != null ? change7d - spyChange7d : null;
 
-      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d });
+      // Bollinger Bands
+      const bollingerResult = calcBollingerBands(closes);
+      const bollingerWidth = bollingerResult?.width ?? null;
+      const bollingerPctB = bollingerResult?.percentB ?? null;
+
+      // ATR(14)
+      const atr14 = calcATR(highs, lows, closes);
+      const atrPct = atr14 != null && price != null ? (atr14 / price) * 100 : null;
+
+      // Earnings date proximity (skip crypto — Finnhub only covers equities)
+      const nextEarningsDate = !isCrypto ? (earningsByTicker.get(stock.ticker) ?? null) : null;
+      const daysToEarnings = nextEarningsDate
+        ? Math.ceil((nextEarningsDate.getTime() - to.getTime()) / (24 * 60 * 60 * 1000))
+        : null;
+
+      // Sector-relative strength (US equities only)
+      const sectorEtf = SECTOR_ETF[stock.ticker];
+      const sectorReturn = sectorEtf ? sectorChange7d.get(sectorEtf) ?? null : null;
+      const relativeStrSector7d = change7d != null && sectorReturn != null
+        ? change7d - sectorReturn
+        : null;
+
+      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d, bollingerPctB });
 
       await db.quantAnalysis.create({
-        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, score },
+        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
       });
 
-      stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null });
+      stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null, daysToEarnings });
 
       result.quants++;
       await sleep(500);
@@ -590,6 +677,7 @@ export async function runPipeline(): Promise<PipelineResult> {
       const meta = stockSentimentMeta.get(stock.id);
       const articleCount = meta?.articleCount ?? 0;
       const vol = stockQuantMeta.get(stock.id)?.volatility30d ?? null;
+      const daysToEarnings = stockQuantMeta.get(stock.id)?.daysToEarnings ?? null;
 
       const sentWeight = Math.min(0.30 + (articleCount / 15) * 0.30, 0.60);
       const quantWeight = 1 - sentWeight;
@@ -610,6 +698,10 @@ export async function runPipeline(): Promise<PipelineResult> {
       if (quantScore != null && sentimentScore * quantScore < 0) {
         confidence -= 0.15;
         warnings.push("Signal disagreement between sentiment and quant");
+      }
+      if (daysToEarnings != null && daysToEarnings <= 5) {
+        confidence -= 0.10;
+        warnings.push(`Earnings in ${daysToEarnings} day(s) — signals may be unreliable`);
       }
       confidence = Math.max(0.1, Math.min(1.0, confidence + (articleCount >= 10 ? 0.15 : 0)));
 

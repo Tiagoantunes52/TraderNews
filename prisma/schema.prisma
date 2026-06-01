@@ -71,11 +71,12 @@ model Article {
 }
 
 model ArticleStock {
-  id        String  @id @default(cuid())
-  article   Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
-  articleId String
-  stock     Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId   String
+  id             String  @id @default(cuid())
+  article        Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  articleId      String
+  stock          Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId        String
+  sentimentScore Float?
 
   @@unique([articleId, stockId])
 }
@@ -110,10 +111,17 @@ model QuantAnalysis {
   macdHistogram  Float?
   priceVs60dHigh Float?
   priceVs60dLow  Float?
-  relativeStr7d  Float?
-  score          Float
-  date           DateTime @default(now())
-  createdAt      DateTime @default(now())
+  relativeStr7d       Float?
+  bollingerWidth      Float?
+  bollingerPctB       Float?
+  atr14               Float?
+  atrPct              Float?
+  nextEarningsDate    DateTime?
+  daysToEarnings      Int?
+  relativeStrSector7d Float?
+  score               Float
+  date                DateTime @default(now())
+  createdAt           DateTime @default(now())
 
   @@index([stockId, date])
 }

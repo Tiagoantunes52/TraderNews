@@ -52,7 +52,11 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       summary: s.summary,
     }));
 
-  const articles = stock.articleStock.map((as) => as.article);
+  // Map articleStock join records to articles with per-article sentimentScore
+  const articles = stock.articleStock.map((as) => ({
+    ...as.article,
+    sentimentScore: as.sentimentScore,
+  }));
 
   return (
     <div className="space-y-6">
@@ -150,12 +154,40 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                     {quant.price > quant.sma50 ? "↑ Above" : "↓ Below"} SMA50
                   </span>
                 )}
+                {quant.bollingerPctB != null && (
+                  <span className="text-xs text-muted-foreground">
+                    %B {(quant.bollingerPctB * 100).toFixed(0)}
+                  </span>
+                )}
+                {quant.bollingerWidth != null && quant.bollingerWidth < 0.05 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
+                    BB squeeze
+                  </span>
+                )}
+                {quant.atrPct != null && (
+                  <span className="text-xs text-muted-foreground">
+                    ATR {quant.atrPct.toFixed(1)}%
+                  </span>
+                )}
+                {quant.daysToEarnings != null && quant.daysToEarnings <= 7 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                    Earnings in {quant.daysToEarnings}d
+                  </span>
+                )}
               </div>
             )}
 
             {estimate && (
               <div className="space-y-1.5 pt-1 border-t">
                 <p className="text-xs text-muted-foreground pt-2">Combined estimate</p>
+                {/* Data warnings (includes earnings proximity warning from pipeline) */}
+                {estimate.dataWarnings.length > 0 && (
+                  <div className="rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 px-3 py-2 space-y-0.5">
+                    {estimate.dataWarnings.map((w) => (
+                      <p key={w} className="text-xs text-amber-700 dark:text-amber-400">⚠ {w}</p>
+                    ))}
+                  </div>
+                )}
                 <div className="flex items-center gap-2 text-xs">
                   <span className="text-muted-foreground w-20 shrink-0">Sentiment</span>
                   <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
@@ -241,7 +273,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                       {article.headline}
                     </a>
                     <div className="self-start">
-                      <ArticleSentimentBadge score={latest?.score} />
+                      {/* Use per-article sentimentScore when available, fall back to stock-level score */}
+                      <ArticleSentimentBadge score={article.sentimentScore ?? latest?.score} />
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
@@ -259,8 +292,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
 
 export const dynamic = "force-dynamic";
 
-function ArticleSentimentBadge({ score }: { score?: number }) {
-  if (score === undefined) return null;
+function ArticleSentimentBadge({ score }: { score?: number | null }) {
+  if (score == null) return null;
   if (score > 0.2) return <Badge className="bg-green-500 hover:bg-green-600 shrink-0 text-xs"><TrendingUp className="h-3 w-3 mr-1" />Bullish</Badge>;
   if (score < -0.2) return <Badge className="bg-red-500 hover:bg-red-600 shrink-0 text-xs"><TrendingDown className="h-3 w-3 mr-1" />Bearish</Badge>;
   return <Badge variant="secondary" className="shrink-0 text-xs"><Minus className="h-3 w-3 mr-1" />Neutral</Badge>;
