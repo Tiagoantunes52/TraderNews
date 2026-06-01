@@ -19,7 +19,7 @@ export type AlphaVantageArticle = {
 // "20240601T120000" → Date
 export function parseAlphaVantageDate(s: string): Date {
   return new Date(
-    `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(9, 11)}:${s.slice(11, 13)}:${s.slice(13, 15)}`
+    `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(9, 11)}:${s.slice(11, 13)}:${s.slice(13, 15)}Z`
   );
 }
 
