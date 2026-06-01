@@ -7,7 +7,9 @@ import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getPolygonStockNews } from "@/lib/polygon";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, scoreToSignal } from "@/lib/indicators";
+
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 export type PipelineResult = {
   articles: { fetched: number; saved: number };
@@ -423,10 +425,20 @@ export async function runPipeline(): Promise<PipelineResult> {
     }
   }
 
+  // Per-stock sentiment metadata for step 5 blending
+  const stockSentimentMeta = new Map<string, { articleCount: number; velocityRatio: number | null }>();
+
   // 3. LLM sentiment for all watched stocks, blended with Alpha Vantage scores where available.
   // Fetch extra headlines to account for duplicates after dedup.
   for (const stock of stocks) {
     try {
+      // Per-day dedup guard: skip if we already have a sentiment entry for today
+      const todayUTC = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()));
+      if (await db.sentiment.count({ where: { stockId: stock.id, date: { gte: todayUTC } } }) > 0) {
+        result.sentiments++;
+        continue;
+      }
+
       const recentArticles = await db.article.findMany({
         where: {
           articleStock: { some: { stockId: stock.id } },
@@ -434,7 +446,7 @@ export async function runPipeline(): Promise<PipelineResult> {
         },
         orderBy: { publishedAt: "desc" },
         take: 20,
-        select: { headline: true, publishedAt: true },
+        select: { headline: true, publishedAt: true, source: true },
       });
 
       if (recentArticles.length === 0) continue;
@@ -445,6 +457,20 @@ export async function runPipeline(): Promise<PipelineResult> {
           recentArticles.map((a) => [normalizeHeadline(a.headline), a])
         ).values(),
       ].slice(0, 10);
+
+      const articleCount = uniqueArticles.length;
+      const avgArticleAgeHours = articleCount > 0
+        ? uniqueArticles.reduce((s, a) => s + (Date.now() - a.publishedAt.getTime()) / 3_600_000, 0) / articleCount
+        : null;
+
+      // Article velocity: last-24h count vs daily average over the 7-day window
+      const yesterday = new Date(to.getTime() - 86_400_000);
+      const last24hCount = await db.article.count({
+        where: { articleStock: { some: { stockId: stock.id } }, publishedAt: { gte: yesterday } },
+      });
+      const articleVelocityRatio = articleCount > 0 ? last24hCount / (articleCount / 7) : null;
+
+      stockSentimentMeta.set(stock.id, { articleCount, velocityRatio: articleVelocityRatio });
 
       const sentiment = await analyzeSentiment(stock.ticker, uniqueArticles);
 
@@ -462,7 +488,7 @@ export async function runPipeline(): Promise<PipelineResult> {
         : sentiment.score;
 
       await db.sentiment.create({
-        data: { stockId: stock.id, score, summary: sentiment.summary },
+        data: { stockId: stock.id, score, summary: sentiment.summary, articleCount, avgArticleAgeHours },
       });
 
       result.sentiments++;
@@ -474,8 +500,25 @@ export async function runPipeline(): Promise<PipelineResult> {
   // 4. Quantitative analysis — fetch 60 days of price history and compute indicators
   const from60 = new Date(to.getTime() - 60 * 24 * 60 * 60 * 1000);
 
+  // Fetch SPY as benchmark for relative strength
+  let spyChange7d: number | null = null;
+  try {
+    const spyPrices = await getTiingoDailyPrices("SPY", from60);
+    if (spyPrices.length >= 8) spyChange7d = calcMomentum(spyPrices.map(p => p.close), 7);
+  } catch { /* benchmark failure doesn't block per-stock analysis */ }
+
+  // Per-stock quant metadata for step 5 blending
+  const stockQuantMeta = new Map<string, { quantScore: number; volatility30d: number | null }>();
+
   for (const stock of stocks) {
     try {
+      // Per-day dedup guard
+      const todayUTC = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()));
+      if (await db.quantAnalysis.count({ where: { stockId: stock.id, date: { gte: todayUTC } } }) > 0) {
+        result.quants++;
+        continue;
+      }
+
       const prices = await getTiingoDailyPrices(stock.ticker, from60);
       if (prices.length < 2) continue; // insufficient data — skip gracefully
 
@@ -492,11 +535,22 @@ export async function runPipeline(): Promise<PipelineResult> {
       const sma50 = calcSMA(closes, 50);
       const volatility30d = calcVolatility(closes);
       const volumeRatio10d = calcVolumeRatio(volumes);
-      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto });
+
+      const macdResult = calcMACD(closes);
+      const macdHistogram = macdResult?.histogram ?? null;
+      const high60d = Math.max(...closes);
+      const low60d = Math.min(...closes);
+      const priceVs60dHigh = price != null ? ((price - high60d) / high60d) * 100 : null;
+      const priceVs60dLow = price != null ? ((price - low60d) / low60d) * 100 : null;
+      const relativeStr7d = change7d != null && spyChange7d != null ? change7d - spyChange7d : null;
+
+      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d });
 
       await db.quantAnalysis.create({
-        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, score },
+        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, score },
       });
+
+      stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null });
 
       result.quants++;
       await sleep(500);
@@ -508,6 +562,13 @@ export async function runPipeline(): Promise<PipelineResult> {
   // 5. Combined estimate — blend latest sentiment + quant scores for each stock
   for (const stock of stocks) {
     try {
+      // Per-day dedup guard
+      const todayUTC = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()));
+      if (await db.stockEstimate.count({ where: { stockId: stock.id, date: { gte: todayUTC } } }) > 0) {
+        result.estimates++;
+        continue;
+      }
+
       const latestSentiment = await db.sentiment.findFirst({
         where: { stockId: stock.id },
         orderBy: { date: "desc" },
@@ -524,8 +585,44 @@ export async function runPipeline(): Promise<PipelineResult> {
 
       const sentimentScore = latestSentiment.score;
       const quantScore = latestQuant?.score ?? null;
-      const combinedScore =
-        quantScore != null ? (sentimentScore + quantScore) / 2 : sentimentScore;
+
+      // Dynamic blending based on article count and volatility
+      const meta = stockSentimentMeta.get(stock.id);
+      const articleCount = meta?.articleCount ?? 0;
+      const vol = stockQuantMeta.get(stock.id)?.volatility30d ?? null;
+
+      const sentWeight = Math.min(0.30 + (articleCount / 15) * 0.30, 0.60);
+      const quantWeight = 1 - sentWeight;
+      const volPenalty = vol != null ? Math.min(Math.max((vol - 0.35) / 0.40, 0), 0.20) : 0;
+      const adjQuantWeight = Math.max(quantWeight - volPenalty, 0.10);
+      const adjSentWeight = 1 - adjQuantWeight;
+
+      const combinedScore = quantScore != null
+        ? clamp(sentimentScore * adjSentWeight + quantScore * adjQuantWeight, -1, 1)
+        : sentimentScore;
+
+      // Confidence and warnings
+      let confidence = 0.5;
+      const warnings: string[] = [];
+      if (articleCount < 3) { confidence -= 0.2; warnings.push(`Low article count (${articleCount})`); }
+      if (quantScore == null) { confidence -= 0.15; warnings.push("No price data — sentiment only"); }
+      if (vol != null && vol > 0.60) { confidence -= 0.10; warnings.push("High volatility — quant signals dampened"); }
+      if (quantScore != null && sentimentScore * quantScore < 0) {
+        confidence -= 0.15;
+        warnings.push("Signal disagreement between sentiment and quant");
+      }
+      confidence = Math.max(0.1, Math.min(1.0, confidence + (articleCount >= 10 ? 0.15 : 0)));
+
+      // Sentiment delta vs 7 days ago
+      const sevenDaysAgo = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+      const oldEstimate = await db.stockEstimate.findFirst({
+        where: { stockId: stock.id, date: { lte: sevenDaysAgo } },
+        orderBy: { date: "desc" },
+        select: { combinedScore: true },
+      });
+      const sentimentDelta = oldEstimate ? combinedScore - oldEstimate.combinedScore : null;
+
+      const articleVelocityRatio = meta?.velocityRatio ?? null;
 
       await db.stockEstimate.create({
         data: {
@@ -534,6 +631,10 @@ export async function runPipeline(): Promise<PipelineResult> {
           quantScore,
           combinedScore,
           signal: scoreToSignal(combinedScore),
+          confidence,
+          dataWarnings: warnings,
+          sentimentDelta,
+          articleVelocityRatio,
         },
       });
 

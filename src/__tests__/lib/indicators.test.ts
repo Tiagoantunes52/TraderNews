@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, scoreToSignal } from "@/lib/indicators";
 
 // ── calcSMA ──────────────────────────────────────────────────────────────────
 
@@ -113,6 +113,70 @@ describe("calcVolumeRatio()", () => {
   });
 });
 
+// ── calcEMA ───────────────────────────────────────────────────────────────────
+
+describe("calcEMA()", () => {
+  it("returns [] when closes is shorter than period", () => {
+    expect(calcEMA([100, 200], 5)).toEqual([]);
+    expect(calcEMA([], 1)).toEqual([]);
+  });
+
+  it("returns array of length closes.length - period + 1", () => {
+    const closes = Array.from({ length: 20 }, (_, i) => 100 + i);
+    const ema = calcEMA(closes, 5);
+    expect(ema.length).toBe(20 - 5 + 1);
+  });
+
+  it("first value equals SMA of first period values", () => {
+    // first 5 values: [10, 20, 30, 40, 50] → SMA = 30
+    const closes = [10, 20, 30, 40, 50, 60, 70];
+    const ema = calcEMA(closes, 5);
+    expect(ema[0]).toBeCloseTo(30);
+  });
+
+  it("values trend toward recent prices (last EMA closer to last price than SMA seed)", () => {
+    // Rising series: EMA should be pulled up by recent prices vs pure SMA seed
+    const closes = Array.from({ length: 20 }, (_, i) => 100 + i * 5); // 100, 105, ..., 195
+    const ema = calcEMA(closes, 5);
+    const lastPrice = closes[closes.length - 1];
+    const firstEma = ema[0]; // seed SMA = avg of first 5
+    const lastEma = ema[ema.length - 1];
+    // lastEma should be closer to lastPrice than firstEma
+    expect(Math.abs(lastEma - lastPrice)).toBeLessThan(Math.abs(firstEma - lastPrice));
+  });
+});
+
+// ── calcMACD ──────────────────────────────────────────────────────────────────
+
+describe("calcMACD()", () => {
+  it("returns null when fewer than slow + signal closes", () => {
+    // default: slow=26, signal=9 → need at least 35 values
+    expect(calcMACD(Array(34).fill(100))).toBeNull();
+  });
+
+  it("returns an object with macd, signal, histogram fields", () => {
+    const closes = Array.from({ length: 40 }, (_, i) => 100 + i);
+    const result = calcMACD(closes);
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("macd");
+    expect(result).toHaveProperty("signal");
+    expect(result).toHaveProperty("histogram");
+  });
+
+  it("histogram equals macd minus signal", () => {
+    const closes = Array.from({ length: 40 }, (_, i) => 100 + i);
+    const result = calcMACD(closes)!;
+    expect(result.histogram).toBeCloseTo(result.macd - result.signal);
+  });
+
+  it("for a monotonically increasing series, MACD should be positive", () => {
+    // In an uptrend, fast EMA > slow EMA → positive MACD
+    const closes = Array.from({ length: 40 }, (_, i) => 100 + i * 2);
+    const result = calcMACD(closes)!;
+    expect(result.macd).toBeGreaterThan(0);
+  });
+});
+
 // ── calcQuantScore ───────────────────────────────────────────────────────────
 
 describe("calcQuantScore()", () => {
@@ -183,6 +247,18 @@ describe("calcQuantScore()", () => {
     // Low volume contributes 0 — the score may differ slightly due to weight rescaling
     // but should not reverse direction
     expect(Math.sign(withLowVol)).toBe(Math.sign(withoutVol));
+  });
+
+  it("relativeStr7d replaces change7d in momentum component when provided", () => {
+    // relativeStr7d=10 should give a positive score; relativeStr7d=-10 negative
+    expect(calcQuantScore({ relativeStr7d: 10 })).toBeGreaterThan(0);
+    expect(calcQuantScore({ relativeStr7d: -10 })).toBeLessThan(0);
+  });
+
+  it("positive MACD histogram adds a positive contribution", () => {
+    const withoutMacd = calcQuantScore({ rsi14: 50, price: 100 });
+    const withPosMacd = calcQuantScore({ rsi14: 50, price: 100, macdHistogram: 1.0 });
+    expect(withPosMacd).toBeGreaterThan(withoutMacd);
   });
 });
 
