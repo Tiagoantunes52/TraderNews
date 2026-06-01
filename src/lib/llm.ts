@@ -7,16 +7,35 @@ export type SentimentResult = {
   summary: string; // one sentence rationale
 };
 
+export type SentimentArticle = {
+  headline: string;
+  publishedAt: Date;
+};
+
+function ageLabel(publishedAt: Date): string {
+  const diffMs = Date.now() - publishedAt.getTime();
+  const diffH = Math.floor(diffMs / (1000 * 60 * 60));
+  if (diffH < 1) return "just now";
+  if (diffH < 24) return `${diffH}h ago`;
+  return `${Math.floor(diffH / 24)}d ago`;
+}
+
 export async function analyzeSentiment(
   ticker: string,
-  headlines: string[]
+  articles: SentimentArticle[]
 ): Promise<SentimentResult> {
-  const prompt = `You are a financial sentiment analyst. Given the following news headlines about the stock ${ticker}, return a JSON object with:
+  const lines = articles
+    .map((a, i) => `${i + 1}. [${ageLabel(a.publishedAt)}] ${a.headline}`)
+    .join("\n");
+
+  const prompt = `You are a financial sentiment analyst. Given the following news headlines about ${ticker}, return a JSON object with:
 - "score": a float from -1.0 (very bearish) to 1.0 (very bullish), 0 being neutral
 - "summary": one sentence explaining the overall sentiment
 
+Weight more recent headlines more heavily. Headlines older than 3 days should have reduced influence unless they describe a major unresolved event. Consider materiality: regulatory actions and earnings surprises outweigh minor product announcements.
+
 Headlines:
-${headlines.map((h, i) => `${i + 1}. ${h}`).join("\n")}
+${lines}
 
 Respond with only valid JSON, no markdown.`;
 

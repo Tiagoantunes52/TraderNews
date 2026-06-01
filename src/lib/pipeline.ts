@@ -5,9 +5,9 @@ import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
 import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getPolygonStockNews } from "@/lib/polygon";
-import { analyzeSentiment } from "@/lib/llm";
+import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcQuantScore, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, scoreToSignal } from "@/lib/indicators";
 
 export type PipelineResult = {
   articles: { fetched: number; saved: number };
@@ -361,7 +361,8 @@ export async function runPipeline(): Promise<PipelineResult> {
   }
 
   // 2f. Alpha Vantage for all stocks — also collects per-article sentiment scores
-  const avSentimentScores = new Map<string, number[]>(); // stockId → [score, ...]
+  // stockId → [{score, relevance}] — collected to compute relevance-weighted mean
+  const avSentimentScores = new Map<string, { score: number; relevance: number }[]>();
 
   if (!process.env.ALPHAVANTAGE_API_KEY) {
     result.errors.push("Alpha Vantage skipped: ALPHAVANTAGE_API_KEY not set");
@@ -401,9 +402,10 @@ export async function runPipeline(): Promise<PipelineResult> {
             links.push({ articleId, stockId: stock.id });
 
             const score = parseFloat(ts.ticker_sentiment_score);
-            if (!Number.isNaN(score)) {
+            const relevance = parseFloat(ts.relevance_score);
+            if (!Number.isNaN(score) && !Number.isNaN(relevance) && relevance > 0) {
               const bucket = avSentimentScores.get(stock.id) ?? [];
-              bucket.push(score);
+              bucket.push({ score, relevance });
               avSentimentScores.set(stock.id, bucket);
             }
           }
@@ -432,23 +434,32 @@ export async function runPipeline(): Promise<PipelineResult> {
         },
         orderBy: { publishedAt: "desc" },
         take: 20,
-        select: { headline: true },
+        select: { headline: true, publishedAt: true },
       });
 
       if (recentArticles.length === 0) continue;
 
-      // Deduplicate headlines before analysis — same story from multiple sources counts once
-      const uniqueHeadlines = [
-        ...new Map(recentArticles.map((a) => [normalizeHeadline(a.headline), a.headline])).values(),
+      // Deduplicate by normalised headline; keep the most recent occurrence
+      const uniqueArticles: SentimentArticle[] = [
+        ...new Map(
+          recentArticles.map((a) => [normalizeHeadline(a.headline), a])
+        ).values(),
       ].slice(0, 10);
 
-      const sentiment = await analyzeSentiment(stock.ticker, uniqueHeadlines);
+      const sentiment = await analyzeSentiment(stock.ticker, uniqueArticles);
 
-      const avScores = avSentimentScores.get(stock.id);
-      const score =
-        avScores && avScores.length > 0
-          ? (sentiment.score + avScores.reduce((a, b) => a + b, 0) / avScores.length) / 2
-          : sentiment.score;
+      const avEntries = avSentimentScores.get(stock.id);
+      let avWeightedScore: number | null = null;
+      if (avEntries && avEntries.length > 0) {
+        const totalWeight = avEntries.reduce((s, e) => s + e.relevance, 0);
+        avWeightedScore = totalWeight > 0
+          ? avEntries.reduce((s, e) => s + e.score * e.relevance, 0) / totalWeight
+          : avEntries.reduce((s, e) => s + e.score, 0) / avEntries.length;
+      }
+
+      const score = avWeightedScore != null
+        ? (sentiment.score + avWeightedScore) / 2
+        : sentiment.score;
 
       await db.sentiment.create({
         data: { stockId: stock.id, score, summary: sentiment.summary },
@@ -469,6 +480,9 @@ export async function runPipeline(): Promise<PipelineResult> {
       if (prices.length < 2) continue; // insufficient data — skip gracefully
 
       const closes = prices.map((p) => p.close);
+      const volumes = prices.map((p) => p.volume);
+      const isCrypto = stock.ticker.endsWith("-USD");
+
       const price = closes[closes.length - 1];
       const change1d = calcMomentum(closes, 1);
       const change7d = calcMomentum(closes, 7);
@@ -477,10 +491,11 @@ export async function runPipeline(): Promise<PipelineResult> {
       const sma20 = calcSMA(closes, 20);
       const sma50 = calcSMA(closes, 50);
       const volatility30d = calcVolatility(closes);
-      const score = calcQuantScore({ rsi14, change7d, sma20, price });
+      const volumeRatio10d = calcVolumeRatio(volumes);
+      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto });
 
       await db.quantAnalysis.create({
-        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, score },
+        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, score },
       });
 
       result.quants++;

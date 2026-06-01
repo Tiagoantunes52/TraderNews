@@ -3,6 +3,7 @@ const BASE_URL = "https://api.tiingo.com";
 export type DailyPrice = {
   date: string;
   close: number;
+  volume: number;
 };
 
 export async function getTiingoDailyPrices(
@@ -39,8 +40,8 @@ async function getStockPrices(
     throw new Error(`Tiingo prices error: ${res.status} — ${body}`);
   }
 
-  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number }>;
-  return data.map((d) => ({ date: d.date, close: d.adjClose ?? d.close }));
+  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number; adjVolume?: number; volume: number }>;
+  return data.map((d) => ({ date: d.date, close: d.adjClose ?? d.close, volume: d.adjVolume ?? d.volume ?? 0 }));
 }
 
 async function getCryptoPrices(
@@ -68,7 +69,7 @@ async function getCryptoPrices(
   }
 
   const data = (await res.json()) as Array<{
-    priceData: Array<{ date: string; close: number }>;
+    priceData: Array<{ date: string; close: number; volume?: number }>;
   }>;
-  return (data[0]?.priceData ?? []).map((d) => ({ date: d.date, close: d.close }));
+  return (data[0]?.priceData ?? []).map((d) => ({ date: d.date, close: d.close, volume: d.volume ?? 0 }));
 }

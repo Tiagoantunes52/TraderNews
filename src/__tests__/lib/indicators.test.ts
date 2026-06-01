@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcQuantScore, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, scoreToSignal } from "@/lib/indicators";
 
 // ── calcSMA ──────────────────────────────────────────────────────────────────
 
@@ -85,6 +85,34 @@ describe("calcMomentum()", () => {
   });
 });
 
+// ── calcVolumeRatio ───────────────────────────────────────────────────────────
+
+describe("calcVolumeRatio()", () => {
+  it("returns null when fewer than period+1 volumes", () => {
+    expect(calcVolumeRatio(Array(10).fill(1000))).toBeNull(); // exactly 10 — needs 11
+  });
+
+  it("returns 1.0 when today's volume equals the 10-day average", () => {
+    const volumes = Array(11).fill(1000);
+    expect(calcVolumeRatio(volumes)).toBeCloseTo(1.0);
+  });
+
+  it("returns > 1 when today's volume is elevated", () => {
+    const volumes = [...Array(10).fill(1000), 3000];
+    expect(calcVolumeRatio(volumes)!).toBeGreaterThan(1);
+  });
+
+  it("returns < 1 when today's volume is below average", () => {
+    const volumes = [...Array(10).fill(1000), 200];
+    expect(calcVolumeRatio(volumes)!).toBeLessThan(1);
+  });
+
+  it("returns null when prior average volume is zero", () => {
+    const volumes = [...Array(10).fill(0), 500];
+    expect(calcVolumeRatio(volumes)).toBeNull();
+  });
+});
+
 // ── calcQuantScore ───────────────────────────────────────────────────────────
 
 describe("calcQuantScore()", () => {
@@ -120,6 +148,41 @@ describe("calcQuantScore()", () => {
   it("rescales correctly when only one component is available", () => {
     // RSI=50 → rsi signal = 0; rescaled result should still be 0
     expect(calcQuantScore({ rsi14: 50 })).toBeCloseTo(0);
+  });
+
+  it("uses ÷40 normalisation for crypto 7d momentum instead of ÷20", () => {
+    // For equities: change7d=20 → clamp(20/20)=1 → strong signal
+    // For crypto:   change7d=20 → clamp(20/40)=0.5 → moderate signal
+    const equityScore = calcQuantScore({ change7d: 20 });
+    const cryptoScore = calcQuantScore({ change7d: 20, isCrypto: true });
+    expect(cryptoScore).toBeLessThan(equityScore);
+  });
+
+  it("applies volatility dampener — high vol reduces score magnitude", () => {
+    const base = calcQuantScore({ rsi14: 20 }); // strongly oversold
+    const dampened = calcQuantScore({ rsi14: 20, volatility30d: 0.80 }); // very high vol
+    expect(Math.abs(dampened)).toBeLessThan(Math.abs(base));
+  });
+
+  it("low volatility does not reduce score below full magnitude", () => {
+    const base = calcQuantScore({ rsi14: 20 });
+    const lowVol = calcQuantScore({ rsi14: 20, volatility30d: 0.10 });
+    expect(Math.abs(lowVol)).toBeCloseTo(Math.abs(base));
+  });
+
+  it("elevated volume above SMA adds a positive contribution", () => {
+    // price=105 is moderately above sma20=100 — SMA component is 0.5, not clamped
+    const withoutVol = calcQuantScore({ sma20: 100, price: 105 });
+    const withHighVol = calcQuantScore({ sma20: 100, price: 105, volumeRatio10d: 3.0 });
+    expect(withHighVol).toBeGreaterThan(withoutVol);
+  });
+
+  it("below-average volume does not change the score direction", () => {
+    const withoutVol = calcQuantScore({ sma20: 100, price: 110 });
+    const withLowVol = calcQuantScore({ sma20: 100, price: 110, volumeRatio10d: 0.5 });
+    // Low volume contributes 0 — the score may differ slightly due to weight rescaling
+    // but should not reverse direction
+    expect(Math.sign(withLowVol)).toBe(Math.sign(withoutVol));
   });
 });
 
