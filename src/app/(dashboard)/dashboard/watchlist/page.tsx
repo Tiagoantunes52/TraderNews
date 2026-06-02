@@ -4,10 +4,25 @@ import { Badge } from "@/components/ui/badge";
 import { TrendingUp, TrendingDown, Minus } from "lucide-react";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { isEtf } from "@/lib/etf";
 import { AddStockSearch } from "./add-stock-search";
 import { WatchlistRow } from "./watchlist-row";
 
 export const metadata = { title: "Watchlist — TraderNews" };
+
+type Category = "Stocks" | "ETFs" | "Crypto";
+
+function categorize(ticker: string, marketName: string): Category {
+  if (ticker.endsWith("-USD") || marketName === "CRYPTO") return "Crypto";
+  if (isEtf(ticker)) return "ETFs";
+  return "Stocks";
+}
+
+const GROUP_ORDER: { category: Category; emoji: string }[] = [
+  { category: "Stocks", emoji: "🏢" },
+  { category: "ETFs", emoji: "📊" },
+  { category: "Crypto", emoji: "₿" },
+];
 
 function SentimentIndicator({ score }: { score?: number }) {
   if (score === undefined) return <Badge variant="outline" className="text-xs">No data</Badge>;
@@ -36,39 +51,60 @@ export default async function WatchlistPage() {
   const watchlist = userStocks.map((us) => us.stock);
   const watchlistIds = watchlist.map((s) => s.id);
 
+  const groups = GROUP_ORDER.map(({ category, emoji }) => ({
+    category,
+    emoji,
+    items: watchlist.filter((s) => categorize(s.ticker, s.market.name) === category),
+  })).filter((g) => g.items.length > 0);
+
   return (
-    <div className="space-y-6 max-w-2xl">
+    <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">Watchlist</h1>
         <p className="text-muted-foreground text-sm mt-1">Track stocks and see their sentiment</p>
       </div>
 
-      <AddStockSearch existingIds={watchlistIds} />
-
-      <div className="space-y-2">
-        {watchlist.length === 0 ? (
-          <Card>
-            <CardContent className="py-10 text-center text-muted-foreground text-sm">
-              No stocks in your watchlist yet. Search above to add some.
-            </CardContent>
-          </Card>
-        ) : (
-          watchlist.map((stock) => (
-            <WatchlistRow key={stock.id} stockId={stock.id} ticker={stock.ticker}>
-              <div className="flex items-center gap-3">
-                <Link
-                  href={`/dashboard/stocks/${stock.ticker}`}
-                  className="-mx-1 px-1 py-0.5 rounded hover:bg-muted transition-colors"
-                >
-                  <CardTitle className="text-base">{stock.ticker}</CardTitle>
-                  <p className="text-xs text-muted-foreground">{stock.name} · {stock.market.name}</p>
-                </Link>
-                <SentimentIndicator score={stock.sentiments[0]?.score} />
-              </div>
-            </WatchlistRow>
-          ))
-        )}
+      <div className="max-w-xl">
+        <AddStockSearch existingIds={watchlistIds} />
       </div>
+
+      {watchlist.length === 0 ? (
+        <Card className="max-w-xl">
+          <CardContent className="py-10 text-center text-muted-foreground text-sm">
+            No stocks in your watchlist yet. Search above to add some.
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-6">
+          {groups.map((group) => (
+            <div key={group.category} className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span aria-hidden>{group.emoji}</span>
+                <h2 className="text-sm font-semibold text-muted-foreground">
+                  {group.category}
+                </h2>
+                <Badge variant="outline" className="text-xs">{group.items.length}</Badge>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {group.items.map((stock) => (
+                  <WatchlistRow key={stock.id} stockId={stock.id} ticker={stock.ticker}>
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Link
+                        href={`/dashboard/stocks/${stock.ticker}`}
+                        className="-mx-1 px-1 py-0.5 rounded hover:bg-muted transition-colors min-w-0"
+                      >
+                        <CardTitle className="text-base">{stock.ticker}</CardTitle>
+                        <p className="text-xs text-muted-foreground truncate">{stock.name} · {stock.market.name}</p>
+                      </Link>
+                      <SentimentIndicator score={stock.sentiments[0]?.score} />
+                    </div>
+                  </WatchlistRow>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
