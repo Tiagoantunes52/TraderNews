@@ -8,34 +8,11 @@ import { getPolygonStockNews } from "@/lib/polygon";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
+import { SECTOR_ETF } from "@/lib/sectors";
+import { detectSignalChange, detectVelocitySpike, detectRsiCross, type AlertDraft } from "@/lib/alerts";
+import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-
-// Sector ETF map for US equities — used to compute sector-relative strength
-const SECTOR_ETF: Record<string, string> = {
-  // Technology
-  AAPL:"XLK", MSFT:"XLK", NVDA:"XLK", AMD:"XLK", INTC:"XLK", ORCL:"XLK", CRM:"XLK", ADBE:"XLK", QCOM:"XLK",
-  // Communication Services (GOOGL appears in both Tech and Comm — last key wins; we use XLC)
-  META:"XLC", NFLX:"XLC", GOOGL:"XLC", GOOG:"XLC", VZ:"XLC", T:"XLC", DIS:"XLC",
-  // Consumer Discretionary
-  AMZN:"XLY", TSLA:"XLY", HD:"XLY", MCD:"XLY", NKE:"XLY", SBUX:"XLY",
-  // Consumer Staples
-  PG:"XLP", KO:"XLP", PEP:"XLP", WMT:"XLP", COST:"XLP", PM:"XLP",
-  // Financials
-  JPM:"XLF", BAC:"XLF", GS:"XLF", MS:"XLF", C:"XLF", WFC:"XLF", BRK_B:"XLF",
-  // Healthcare
-  JNJ:"XLV", UNH:"XLV", PFE:"XLV", ABBV:"XLV", MRK:"XLV", LLY:"XLV",
-  // Industrials
-  BA:"XLI", CAT:"XLI", GE:"XLI", HON:"XLI", UPS:"XLI",
-  // Energy
-  XOM:"XLE", CVX:"XLE", COP:"XLE", SLB:"XLE",
-  // Utilities
-  NEE:"XLU", DUK:"XLU", SO:"XLU",
-  // Real Estate
-  AMT:"XLRE", PLD:"XLRE", EQIX:"XLRE",
-  // Materials
-  LIN:"XLB", APD:"XLB", NEM:"XLB",
-};
 
 export type PipelineResult = {
   articles: { fetched: number; saved: number };
@@ -43,8 +20,56 @@ export type PipelineResult = {
   sentiments: number;
   quants: number;
   estimates: number;
+  alerts: number;
   errors: string[];
 };
+
+type PendingAlert = { stockId: string; ticker: string; draft: AlertDraft };
+
+/**
+ * Persist new alert events and email watchers (one digest per recipient).
+ * Only users with alertEmails enabled and an email on file are notified.
+ */
+async function processAlerts(pending: PendingAlert[], result: PipelineResult): Promise<void> {
+  if (pending.length === 0) return;
+
+  await db.alert.createMany({
+    data: pending.map((p) => ({
+      stockId: p.stockId,
+      type: p.draft.type,
+      title: p.draft.title,
+      message: p.draft.message,
+      value: p.draft.value,
+    })),
+  });
+  result.alerts += pending.length;
+
+  if (!isEmailConfigured()) return;
+
+  const stockIds = [...new Set(pending.map((p) => p.stockId))];
+  const watchers = await db.userStock.findMany({
+    where: { stockId: { in: stockIds }, user: { alertEmails: true, email: { not: null } } },
+    select: { stockId: true, user: { select: { id: true, email: true } } },
+  });
+
+  // Group alerts per recipient so each user gets a single digest.
+  const byUser = new Map<string, { email: string; drafts: AlertDraft[] }>();
+  for (const w of watchers) {
+    if (!w.user.email) continue;
+    const entry = byUser.get(w.user.id) ?? { email: w.user.email, drafts: [] };
+    for (const p of pending) {
+      if (p.stockId === w.stockId) entry.drafts.push(p.draft);
+    }
+    byUser.set(w.user.id, entry);
+  }
+
+  for (const { email, drafts } of byUser.values()) {
+    if (drafts.length === 0) continue;
+    const { subject, html, text } = buildAlertEmail(drafts);
+    const res = await sendEmail({ to: email, subject, html, text });
+    if (!res.ok) result.errors.push(`Alert email to ${email} failed: ${res.error}`);
+  }
+}
 
 function dateStr(date: Date): string {
   return date.toISOString().split("T")[0];
@@ -152,7 +177,10 @@ async function saveArticlesWithDedup(
 }
 
 export async function runPipeline(): Promise<PipelineResult> {
-  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, errors: [] };
+  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, alerts: 0, errors: [] };
+
+  // Alert events detected during quant/estimate steps, processed after the loops.
+  const pendingAlerts: PendingAlert[] = [];
 
   const to = new Date();
   const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -582,6 +610,13 @@ export async function runPipeline(): Promise<PipelineResult> {
         continue;
       }
 
+      // Previous RSI (before we insert today's) for crossing detection
+      const prevQuant = await db.quantAnalysis.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { rsi14: true },
+      });
+
       const prices = await getTiingoDailyPrices(stock.ticker, from60);
       if (prices.length < 2) continue; // insufficient data — skip gracefully
 
@@ -638,6 +673,9 @@ export async function runPipeline(): Promise<PipelineResult> {
       });
 
       stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null, daysToEarnings });
+
+      const rsiAlert = detectRsiCross(stock.ticker, prevQuant?.rsi14 ?? null, rsi14);
+      if (rsiAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: rsiAlert });
 
       result.quants++;
       await sleep(500);
@@ -716,13 +754,22 @@ export async function runPipeline(): Promise<PipelineResult> {
 
       const articleVelocityRatio = meta?.velocityRatio ?? null;
 
+      // Previous signal (before inserting today's) for signal-change detection
+      const prevEstimate = await db.stockEstimate.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { signal: true },
+      });
+
+      const signal = scoreToSignal(combinedScore);
+
       await db.stockEstimate.create({
         data: {
           stockId: stock.id,
           sentimentScore,
           quantScore,
           combinedScore,
-          signal: scoreToSignal(combinedScore),
+          signal,
           confidence,
           dataWarnings: warnings,
           sentimentDelta,
@@ -730,10 +777,23 @@ export async function runPipeline(): Promise<PipelineResult> {
         },
       });
 
+      const signalAlert = detectSignalChange(stock.ticker, prevEstimate?.signal, signal);
+      if (signalAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: signalAlert });
+
+      const velocityAlert = detectVelocitySpike(stock.ticker, articleVelocityRatio);
+      if (velocityAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: velocityAlert });
+
       result.estimates++;
     } catch (e) {
       result.errors.push(`Estimate failed for ${stock.ticker}: ${String(e)}`);
     }
+  }
+
+  // 6. Alerts — persist detected events and notify watchers by email
+  try {
+    await processAlerts(pendingAlerts, result);
+  } catch (e) {
+    result.errors.push(`Alert processing failed: ${String(e)}`);
   }
 
   return result;

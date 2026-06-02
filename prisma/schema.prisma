@@ -17,6 +17,7 @@ model User {
   clerkId         String        @unique
   email           String?       @unique
   role            Role          @default(USER)
+  alertEmails     Boolean       @default(true)
   createdAt       DateTime      @default(now())
   userStocks      UserStock[]
   userMarkets     UserMarket[]
@@ -56,6 +57,7 @@ model Stock {
   sentiments     Sentiment[]
   quantAnalyses  QuantAnalysis[]
   stockEstimates StockEstimate[]
+  alerts         Alert[]
   userStocks     UserStock[]
 }
 
@@ -142,6 +144,19 @@ model StockEstimate {
   createdAt            DateTime @default(now())
 
   @@index([stockId, date])
+}
+
+model Alert {
+  id        String   @id @default(cuid())
+  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId   String
+  type      String // SIGNAL_CHANGE | VELOCITY_SPIKE | RSI_EXTREME
+  title     String
+  message   String
+  value     Float?
+  createdAt DateTime @default(now())
+
+  @@index([stockId, createdAt])
 }
 
 model UserStock {

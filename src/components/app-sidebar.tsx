@@ -12,7 +12,7 @@ import {
   SidebarHeader,
   SidebarFooter,
 } from "@/components/ui/sidebar";
-import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield } from "lucide-react";
+import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Briefcase } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -23,6 +23,7 @@ const baseNavItems = [
   { label: "Watchlist", href: "/dashboard/watchlist", icon: Star },
   { label: "Sentiment", href: "/dashboard/sentiment", icon: BarChart2 },
   { label: "Analysis", href: "/dashboard/analysis", icon: Calculator },
+  { label: "Portfolio", href: "/dashboard/portfolio", icon: Briefcase },
   { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 

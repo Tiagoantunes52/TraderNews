@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { RefreshCw, LogOut, CheckCircle, XCircle, Loader2, ShieldCheck } from "lucide-react";
+import { RefreshCw, LogOut, CheckCircle, XCircle, Loader2, ShieldCheck, Bell, BellOff } from "lucide-react";
 
 type PipelineStatus = "idle" | "running" | "success" | "error";
 type PipelineResult = {
@@ -18,11 +18,35 @@ type PipelineResult = {
   errors: string[];
 };
 
-export function SettingsClient({ isAdmin }: { isAdmin: boolean }) {
+export function SettingsClient({ isAdmin, alertEmails }: { isAdmin: boolean; alertEmails: boolean }) {
   const { user } = useUser();
   const [pipelineStatus, setPipelineStatus] = useState<PipelineStatus>("idle");
   const [pipelineResult, setPipelineResult] = useState<PipelineResult | null>(null);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [alertsOn, setAlertsOn] = useState(alertEmails);
+  const [alertsSaving, setAlertsSaving] = useState(false);
+
+  const toggleAlerts = async () => {
+    const next = !alertsOn;
+    setAlertsSaving(true);
+    setAlertsOn(next); // optimistic
+    try {
+      const res = await fetch("/api/settings/alerts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error ?? "Failed to update");
+      toast.success(next ? "Alert emails on" : "Alert emails off");
+    } catch (err) {
+      setAlertsOn(!next); // revert
+      toast.error("Couldn't update alerts", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setAlertsSaving(false);
+    }
+  };
 
   const runPipeline = async () => {
     setPipelineStatus("running");
@@ -150,6 +174,31 @@ export function SettingsClient({ isAdmin }: { isAdmin: boolean }) {
           </CardContent>
         </Card>
       )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Notifications</CardTitle>
+          <CardDescription>
+            Email me when a watchlist stock changes signal, has a news spike, or hits an RSI extreme.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2 text-sm">
+              {alertsOn ? (
+                <Bell className="h-4 w-4 text-primary" />
+              ) : (
+                <BellOff className="h-4 w-4 text-muted-foreground" />
+              )}
+              <span className="font-medium">Alert emails</span>
+              <span className="text-muted-foreground">{alertsOn ? "On" : "Off"}</span>
+            </div>
+            <Button variant={alertsOn ? "outline" : "default"} size="sm" onClick={toggleAlerts} disabled={alertsSaving}>
+              {alertsSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : alertsOn ? "Turn off" : "Turn on"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardContent className="py-4">

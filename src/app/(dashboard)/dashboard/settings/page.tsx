@@ -4,5 +4,5 @@ import { SettingsClient } from "./settings-client";
 
 export default async function SettingsPage() {
   const user = await getOrCreateUser();
-  return <SettingsClient isAdmin={isAdmin(user)} />;
+  return <SettingsClient isAdmin={isAdmin(user)} alertEmails={user?.alertEmails ?? true} />;
 }
