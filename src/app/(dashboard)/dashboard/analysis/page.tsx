@@ -163,7 +163,7 @@ export default async function AnalysisPage() {
                     </div>
                   )}
 
-                  {/* RSI + SMA row */}
+                  {/* RSI + SMA + new signals row */}
                   {q?.rsi14 != null && (
                     <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
                       <span>RSI {q.rsi14.toFixed(0)}</span>
@@ -177,6 +177,19 @@ export default async function AnalysisPage() {
                           }
                         >
                           {q.price > q.sma20 ? "↑" : "↓"} SMA20
+                        </span>
+                      )}
+                      {q.bollingerWidth != null && q.bollingerWidth < 0.05 && (
+                        <span className="px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
+                          BB squeeze
+                        </span>
+                      )}
+                      {q.atrPct != null && (
+                        <span>{q.atrPct.toFixed(1)}% ATR</span>
+                      )}
+                      {q.daysToEarnings != null && q.daysToEarnings <= 7 && (
+                        <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                          Earnings in {q.daysToEarnings}d
                         </span>
                       )}
                     </div>

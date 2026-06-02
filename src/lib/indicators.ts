@@ -85,6 +85,60 @@ export function calcEMA(closes: number[], period: number): number[] {
   return ema;
 }
 
+export type BollingerResult = {
+  upper: number;
+  lower: number;
+  middle: number;  // SMA
+  width: number;   // (upper - lower) / middle — squeeze when low
+  percentB: number; // (price - lower) / (upper - lower); 0.5 = at SMA
+};
+
+export function calcBollingerBands(closes: number[], period = 20, stdDevs = 2): BollingerResult | null {
+  if (closes.length < period) return null;
+
+  const slice = closes.slice(-period);
+  const sma = slice.reduce((a, b) => a + b, 0) / period;
+
+  // Population std dev (divide by N)
+  const variance = slice.reduce((a, b) => a + (b - sma) ** 2, 0) / period;
+  const std = Math.sqrt(variance);
+
+  if (std === 0) {
+    return { upper: sma, lower: sma, middle: sma, width: 0, percentB: 0.5 };
+  }
+
+  const upper = sma + stdDevs * std;
+  const lower = sma - stdDevs * std;
+  const width = sma !== 0 ? (upper - lower) / sma : 0;
+  const price = closes[closes.length - 1];
+  const percentB = (upper - lower) !== 0 ? (price - lower) / (upper - lower) : 0.5;
+
+  return { upper, lower, middle: sma, width, percentB };
+}
+
+// Wilder-smoothed Average True Range
+export function calcATR(highs: number[], lows: number[], closes: number[], period = 14): number | null {
+  if (highs.length < period + 1 || lows.length < period + 1 || closes.length < period + 1) return null;
+
+  const trueRanges: number[] = [];
+  for (let i = 1; i < closes.length; i++) {
+    const hl = highs[i] - lows[i];
+    const hc = Math.abs(highs[i] - closes[i - 1]);
+    const lc = Math.abs(lows[i] - closes[i - 1]);
+    trueRanges.push(Math.max(hl, hc, lc));
+  }
+
+  // Seed: simple average of first `period` true ranges
+  let atr = trueRanges.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  // Smooth remaining with Wilder's method
+  for (let i = period; i < trueRanges.length; i++) {
+    atr = (atr * (period - 1) + trueRanges[i]) / period;
+  }
+
+  return atr;
+}
+
 export type MACDResult = { macd: number; signal: number; histogram: number };
 
 // MACD calculation.
@@ -119,11 +173,11 @@ export function calcMACD(closes: number[], fast = 12, slow = 26, signal = 9): MA
 // Missing components are excluded and remaining weights are rescaled.
 //
 // Components and their weights when all 5 are present:
-//   RSI(14)         30% — oversold → positive, overbought → negative
-//   7d momentum     30% — uses relativeStr7d if available; crypto-aware normalisation
-//   SMA(20) position 10% — continuous distance from moving average
-//   Volume ratio     10% — elevated volume confirms the trend direction
-//   MACD histogram   20% — momentum confirmation
+//   RSI(14)              30% — oversold → positive, overbought → negative
+//   7d momentum          30% — uses relativeStr7d if available; crypto-aware normalisation
+//   SMA(20)/Bollinger %B 10% — when bollingerPctB provided, replaces SMA position component
+//   Volume ratio         10% — elevated volume confirms the trend direction
+//   MACD histogram       20% — momentum confirmation
 //
 // After scoring, a volatility dampener reduces the magnitude in high-vol regimes.
 export function calcQuantScore({
@@ -136,6 +190,7 @@ export function calcQuantScore({
   isCrypto = false,
   macdHistogram,
   relativeStr7d,
+  bollingerPctB,
 }: {
   rsi14?: number | null;
   change7d?: number | null;
@@ -146,6 +201,7 @@ export function calcQuantScore({
   isCrypto?: boolean;
   macdHistogram?: number | null;
   relativeStr7d?: number | null;
+  bollingerPctB?: number | null;
 }): number {
   const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -167,16 +223,24 @@ export function calcQuantScore({
     totalWeight += 0.30;
   }
 
-  if (sma20 != null && price != null) {
+  // SMA position / Bollinger %B: bollingerPctB takes priority when provided
+  if (bollingerPctB != null) {
+    // %B of 0.5 = at SMA (neutral), >0.5 = above (bullish), <0.5 = below (bearish)
+    score += clamp((bollingerPctB - 0.5) * 2, -1, 1) * 0.10;
+    totalWeight += 0.10;
+  } else if (sma20 != null && price != null) {
     // Continuous distance from SMA: 10% deviation = ±1 for equities, 20% for crypto
     const devFactor = isCrypto ? 20 : 10;
     score += clamp((price - sma20) / sma20 * devFactor, -1, 1) * 0.10;
     totalWeight += 0.10;
   }
 
-  if (volumeRatio10d != null && sma20 != null && price != null) {
+  if (volumeRatio10d != null && (bollingerPctB != null || (sma20 != null && price != null))) {
     // Volume above average confirms the trend direction; below average adds nothing
-    const direction = price > sma20 ? 1 : -1;
+    // Use bollingerPctB to determine direction when available, else price vs sma20
+    const direction = bollingerPctB != null
+      ? (bollingerPctB > 0.5 ? 1 : -1)
+      : (price! > sma20! ? 1 : -1);
     const volSignal = clamp((volumeRatio10d - 1) / 2, 0, 1) * direction;
     score += volSignal * 0.10;
     totalWeight += 0.10;

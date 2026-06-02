@@ -17,6 +17,7 @@ model User {
   clerkId         String        @unique
   email           String?       @unique
   role            Role          @default(USER)
+  alertEmails     Boolean       @default(true)
   createdAt       DateTime      @default(now())
   userStocks      UserStock[]
   userMarkets     UserMarket[]
@@ -56,6 +57,8 @@ model Stock {
   sentiments     Sentiment[]
   quantAnalyses  QuantAnalysis[]
   stockEstimates StockEstimate[]
+  alerts         Alert[]
+  etfProfile     EtfProfile?
   userStocks     UserStock[]
 }
 
@@ -71,11 +74,12 @@ model Article {
 }
 
 model ArticleStock {
-  id        String  @id @default(cuid())
-  article   Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
-  articleId String
-  stock     Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId   String
+  id             String  @id @default(cuid())
+  article        Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  articleId      String
+  stock          Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId        String
+  sentimentScore Float?
 
   @@unique([articleId, stockId])
 }
@@ -110,10 +114,17 @@ model QuantAnalysis {
   macdHistogram  Float?
   priceVs60dHigh Float?
   priceVs60dLow  Float?
-  relativeStr7d  Float?
-  score          Float
-  date           DateTime @default(now())
-  createdAt      DateTime @default(now())
+  relativeStr7d       Float?
+  bollingerWidth      Float?
+  bollingerPctB       Float?
+  atr14               Float?
+  atrPct              Float?
+  nextEarningsDate    DateTime?
+  daysToEarnings      Int?
+  relativeStrSector7d Float?
+  score               Float
+  date                DateTime @default(now())
+  createdAt           DateTime @default(now())
 
   @@index([stockId, date])
 }
@@ -134,6 +145,33 @@ model StockEstimate {
   createdAt            DateTime @default(now())
 
   @@index([stockId, date])
+}
+
+model Alert {
+  id        String   @id @default(cuid())
+  stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId   String
+  type      String // SIGNAL_CHANGE | VELOCITY_SPIKE | RSI_EXTREME
+  title     String
+  message   String
+  value     Float?
+  createdAt DateTime @default(now())
+
+  @@index([stockId, createdAt])
+}
+
+model EtfProfile {
+  id            String    @id @default(cuid())
+  stock         Stock     @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId       String    @unique
+  netAssets     Float?
+  expenseRatio  Float?
+  dividendYield Float?
+  inceptionDate DateTime?
+  sectors       Json? // [{ sector, weight }]
+  holdings      Json? // [{ symbol, description, weight }]
+  updatedAt     DateTime  @updatedAt
+  createdAt     DateTime  @default(now())
 }
 
 model UserStock {

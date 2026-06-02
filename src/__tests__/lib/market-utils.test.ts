@@ -23,6 +23,16 @@ describe("marketNamesForTicker()", () => {
     expect(marketNamesForTicker("ASML.AS")).toEqual(["EURONEXT_AMSTERDAM"]);
   });
 
+  it("maps Bolsa de Madrid suffix", () => {
+    expect(marketNamesForTicker("ITX.MC")).toEqual(["BME"]);
+    expect(marketNamesForTicker("SAN.MC")).toEqual(["BME"]);
+  });
+
+  it("maps Borsa Italiana suffix", () => {
+    expect(marketNamesForTicker("ENEL.MI")).toEqual(["BORSA_ITALIANA"]);
+    expect(marketNamesForTicker("RACE.MI")).toEqual(["BORSA_ITALIANA"]);
+  });
+
   it("maps crypto suffix", () => {
     expect(marketNamesForTicker("BTC-USD")).toEqual(["CRYPTO"]);
     expect(marketNamesForTicker("ETH-USD")).toEqual(["CRYPTO"]);

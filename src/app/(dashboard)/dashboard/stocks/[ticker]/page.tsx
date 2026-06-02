@@ -21,6 +21,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       sentiments: { orderBy: { date: "desc" }, take: 30 },
       quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
       stockEstimates: { orderBy: { date: "desc" }, take: 1 },
+      etfProfile: true,
       articleStock: {
         include: { article: true },
         orderBy: { article: { publishedAt: "desc" } },
@@ -43,6 +44,10 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
   const quant = stock.quantAnalyses[0] ?? null;
   const estimate = stock.stockEstimates[0] ?? null;
 
+  const etf = stock.etfProfile;
+  const etfSectors = (etf?.sectors as { sector: string; weight: number }[] | null) ?? [];
+  const etfHoldings = (etf?.holdings as { symbol: string; description: string; weight: number }[] | null) ?? [];
+
   const history = stock.sentiments
     .slice()
     .reverse()
@@ -52,7 +57,11 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       summary: s.summary,
     }));
 
-  const articles = stock.articleStock.map((as) => as.article);
+  // Map articleStock join records to articles with per-article sentimentScore
+  const articles = stock.articleStock.map((as) => ({
+    ...as.article,
+    sentimentScore: as.sentimentScore,
+  }));
 
   return (
     <div className="space-y-6">
@@ -150,12 +159,40 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                     {quant.price > quant.sma50 ? "↑ Above" : "↓ Below"} SMA50
                   </span>
                 )}
+                {quant.bollingerPctB != null && (
+                  <span className="text-xs text-muted-foreground">
+                    %B {(quant.bollingerPctB * 100).toFixed(0)}
+                  </span>
+                )}
+                {quant.bollingerWidth != null && quant.bollingerWidth < 0.05 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
+                    BB squeeze
+                  </span>
+                )}
+                {quant.atrPct != null && (
+                  <span className="text-xs text-muted-foreground">
+                    ATR {quant.atrPct.toFixed(1)}%
+                  </span>
+                )}
+                {quant.daysToEarnings != null && quant.daysToEarnings <= 7 && (
+                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                    Earnings in {quant.daysToEarnings}d
+                  </span>
+                )}
               </div>
             )}
 
             {estimate && (
               <div className="space-y-1.5 pt-1 border-t">
                 <p className="text-xs text-muted-foreground pt-2">Combined estimate</p>
+                {/* Data warnings (includes earnings proximity warning from pipeline) */}
+                {estimate.dataWarnings.length > 0 && (
+                  <div className="rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 px-3 py-2 space-y-0.5">
+                    {estimate.dataWarnings.map((w) => (
+                      <p key={w} className="text-xs text-amber-700 dark:text-amber-400">⚠ {w}</p>
+                    ))}
+                  </div>
+                )}
                 <div className="flex items-center gap-2 text-xs">
                   <span className="text-muted-foreground w-20 shrink-0">Sentiment</span>
                   <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
@@ -189,6 +226,65 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   Signal: <span className="font-medium text-foreground">{estimate.signal.replace("_", " ")}</span>
                   {estimate.quantScore == null && " (sentiment only — no price data)"}
                 </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ETF profile */}
+      {etf && (etfHoldings.length > 0 || etfSectors.length > 0) && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">ETF Profile</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
+              {etf.expenseRatio != null && (
+                <EtfStat label="Expense ratio" value={`${asPct(etf.expenseRatio).toFixed(2)}%`} />
+              )}
+              {etf.dividendYield != null && (
+                <EtfStat label="Dividend yield" value={`${asPct(etf.dividendYield).toFixed(2)}%`} />
+              )}
+              {etf.netAssets != null && (
+                <EtfStat label="Net assets" value={formatLargeUsd(etf.netAssets)} />
+              )}
+            </div>
+
+            {etfHoldings.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Top holdings</p>
+                <div className="space-y-1.5">
+                  {etfHoldings.slice(0, 10).map((h) => (
+                    <div key={h.symbol} className="flex items-center gap-2 text-xs">
+                      <span className="w-16 shrink-0 font-semibold">{h.symbol}</span>
+                      <span className="flex-1 truncate text-muted-foreground" title={h.description}>
+                        {h.description}
+                      </span>
+                      <div className="w-24 h-1.5 bg-muted rounded-full overflow-hidden shrink-0">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(asPct(h.weight), 100)}%` }} />
+                      </div>
+                      <span className="w-12 text-right tabular-nums shrink-0">{asPct(h.weight).toFixed(1)}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {etfSectors.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Sector weights</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {etfSectors
+                    .slice()
+                    .sort((a, b) => b.weight - a.weight)
+                    .slice(0, 6)
+                    .map((s) => (
+                      <Badge key={s.sector} variant="outline" className="text-xs font-normal">
+                        {s.sector} <span className="ml-1 tabular-nums text-muted-foreground">{asPct(s.weight).toFixed(0)}%</span>
+                      </Badge>
+                    ))}
+                </div>
               </div>
             )}
           </CardContent>
@@ -241,7 +337,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                       {article.headline}
                     </a>
                     <div className="self-start">
-                      <ArticleSentimentBadge score={latest?.score} />
+                      {/* Use per-article sentimentScore when available, fall back to stock-level score */}
+                      <ArticleSentimentBadge score={article.sentimentScore ?? latest?.score} />
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
@@ -259,8 +356,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
 
 export const dynamic = "force-dynamic";
 
-function ArticleSentimentBadge({ score }: { score?: number }) {
-  if (score === undefined) return null;
+function ArticleSentimentBadge({ score }: { score?: number | null }) {
+  if (score == null) return null;
   if (score > 0.2) return <Badge className="bg-green-500 hover:bg-green-600 shrink-0 text-xs"><TrendingUp className="h-3 w-3 mr-1" />Bullish</Badge>;
   if (score < -0.2) return <Badge className="bg-red-500 hover:bg-red-600 shrink-0 text-xs"><TrendingDown className="h-3 w-3 mr-1" />Bearish</Badge>;
   return <Badge variant="secondary" className="shrink-0 text-xs"><Minus className="h-3 w-3 mr-1" />Neutral</Badge>;
@@ -314,5 +411,27 @@ function StatCard({
         <p className={`${small ? "text-lg" : "text-2xl"} font-bold mt-1 tabular-nums`}>{value}</p>
       </CardContent>
     </Card>
+  );
+}
+
+// Alpha Vantage returns weights/ratios as fractions (0–1); some fields arrive
+// already as percentages. Normalize defensively to a percentage number.
+function asPct(value: number): number {
+  return value <= 1 ? value * 100 : value;
+}
+
+function formatLargeUsd(value: number): string {
+  if (value >= 1e12) return `$${(value / 1e12).toFixed(2)}T`;
+  if (value >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+  if (value >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
+  return `$${value.toLocaleString()}`;
+}
+
+function EtfStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="font-semibold tabular-nums">{value}</p>
+    </div>
   );
 }

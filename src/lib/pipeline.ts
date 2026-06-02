@@ -1,13 +1,16 @@
 import { db } from "@/lib/db";
-import { getMarketNews, getStockNews } from "@/lib/finnhub";
-import { getMarketauxStockNews } from "@/lib/marketaux";
-import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
-import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
-import { getYahooRssNews } from "@/lib/yahoo-rss";
-import { getPolygonStockNews } from "@/lib/polygon";
+import { getMarketNews, getEarningsCalendar } from "@/lib/finnhub";
+import { getEtfProfile } from "@/lib/alphavantage";
+import { getCryptoFearGreed } from "@/lib/crypto-fng";
+import { isEtf } from "@/lib/etf";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
-import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, scoreToSignal } from "@/lib/indicators";
+import { getDailyPrices } from "@/lib/price-sources";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
+import { SECTOR_ETF } from "@/lib/sectors";
+import { normalizeUrl, normalizeHeadline } from "@/lib/normalize";
+import { aggregateNews } from "@/lib/news-sources";
+import { detectSignalChange, detectVelocitySpike, detectRsiCross, type AlertDraft } from "@/lib/alerts";
+import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -17,8 +20,56 @@ export type PipelineResult = {
   sentiments: number;
   quants: number;
   estimates: number;
+  alerts: number;
   errors: string[];
 };
+
+type PendingAlert = { stockId: string; ticker: string; draft: AlertDraft };
+
+/**
+ * Persist new alert events and email watchers (one digest per recipient).
+ * Only users with alertEmails enabled and an email on file are notified.
+ */
+async function processAlerts(pending: PendingAlert[], result: PipelineResult): Promise<void> {
+  if (pending.length === 0) return;
+
+  await db.alert.createMany({
+    data: pending.map((p) => ({
+      stockId: p.stockId,
+      type: p.draft.type,
+      title: p.draft.title,
+      message: p.draft.message,
+      value: p.draft.value,
+    })),
+  });
+  result.alerts += pending.length;
+
+  if (!isEmailConfigured()) return;
+
+  const stockIds = [...new Set(pending.map((p) => p.stockId))];
+  const watchers = await db.userStock.findMany({
+    where: { stockId: { in: stockIds }, user: { alertEmails: true, email: { not: null } } },
+    select: { stockId: true, user: { select: { id: true, email: true } } },
+  });
+
+  // Group alerts per recipient so each user gets a single digest.
+  const byUser = new Map<string, { email: string; drafts: AlertDraft[] }>();
+  for (const w of watchers) {
+    if (!w.user.email) continue;
+    const entry = byUser.get(w.user.id) ?? { email: w.user.email, drafts: [] };
+    for (const p of pending) {
+      if (p.stockId === w.stockId) entry.drafts.push(p.draft);
+    }
+    byUser.set(w.user.id, entry);
+  }
+
+  for (const { email, drafts } of byUser.values()) {
+    if (drafts.length === 0) continue;
+    const { subject, html, text } = buildAlertEmail(drafts);
+    const res = await sendEmail({ to: email, subject, html, text });
+    if (!res.ok) result.errors.push(`Alert email to ${email} failed: ${res.error}`);
+  }
+}
 
 function dateStr(date: Date): string {
   return date.toISOString().split("T")[0];
@@ -28,19 +79,8 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export function normalizeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    // Strip query params, fragments, and trailing slashes — canonical form
-    return `${u.origin}${u.pathname}`.replace(/\/+$/, "");
-  } catch {
-    return url;
-  }
-}
-
-export function normalizeHeadline(headline: string): string {
-  return headline.toLowerCase().replace(/\s+/g, " ").trim();
-}
+// Re-exported so existing imports from "@/lib/pipeline" keep working.
+export { normalizeUrl, normalizeHeadline };
 
 type ArticleData = {
   headline: string;
@@ -126,7 +166,10 @@ async function saveArticlesWithDedup(
 }
 
 export async function runPipeline(): Promise<PipelineResult> {
-  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, errors: [] };
+  const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, alerts: 0, errors: [] };
+
+  // Alert events detected during quant/estimate steps, processed after the loops.
+  const pendingAlerts: PendingAlert[] = [];
 
   const to = new Date();
   const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -158,275 +201,79 @@ export async function runPipeline(): Promise<PipelineResult> {
     where: { userStocks: { some: {} } },
   });
 
-  // Finnhub free tier only supports /company-news for US tickers (no dot-exchange suffix, no crypto)
+  // US tickers (no dot-exchange suffix, no crypto) — used later by the quant step.
   const usStocks = stocks.filter((s) => !s.ticker.includes(".") && !s.ticker.endsWith("-USD"));
 
-  for (const stock of usStocks) {
-    try {
-      const news = await getStockNews(stock.ticker, dateStr(from), dateStr(to));
-      result.articles.fetched += news.length;
+  // Stock-specific news — one centralised pass across every configured source.
+  // Sources fall back independently (one failing never blocks the others) and
+  // supplement each other; results are merged by URL before a single dedupe-save.
+  const tickerToStock = new Map(stocks.map((s) => [s.ticker, s]));
 
-      const articles = news
-        .filter((a) => a.url && a.headline)
-        .map((a) => ({
-          headline: a.headline,
-          summary: a.summary ?? null,
-          url: a.url,
-          source: a.source,
-          publishedAt: new Date(a.datetime * 1000),
-        }));
-
-      const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-      result.articles.saved += saved;
-
-      await db.articleStock.createMany({
-        data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-        skipDuplicates: true,
-      });
-      result.tags += urlToId.size;
-
-      // Respect Finnhub free tier rate limit (60 req/min)
-      await sleep(1100);
-    } catch (e) {
-      result.errors.push(`Stock news failed for ${stock.ticker}: ${String(e)}`);
-    }
-  }
-
-  // 2b. Marketaux for non-US stocks (Finnhub free tier doesn't support these)
-  const nonUsStocks = stocks.filter((s) => s.ticker.includes("."));
-
-  if (nonUsStocks.length > 0) {
-    if (!process.env.MARKETAUX_API_KEY) {
-      result.errors.push("Marketaux skipped: MARKETAUX_API_KEY not set");
-    } else {
-      const BATCH = 5;
-
-      for (let i = 0; i < nonUsStocks.length; i += BATCH) {
-        const batch = nonUsStocks.slice(i, i + BATCH);
-        const symbols = batch.map((s) => s.ticker);
-
-        try {
-          const news = await getMarketauxStockNews(symbols, from);
-          result.articles.fetched += news.length;
-
-          const articles = news
-            .filter((a) => a.url && a.title)
-            .map((a) => ({
-              headline: a.title,
-              summary: a.description ?? null,
-              url: a.url,
-              source: a.source,
-              publishedAt: new Date(a.published_at),
-            }));
-
-          const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-          result.articles.saved += saved;
-
-          const links: Array<{ articleId: string; stockId: string }> = [];
-          for (const article of news.filter((a) => a.url && a.title)) {
-            const articleId = urlToId.get(article.url);
-            if (!articleId) continue;
-            for (const entity of article.entities) {
-              const stock = batch.find((s) => s.ticker === entity.symbol);
-              if (stock) links.push({ articleId, stockId: stock.id });
-            }
-          }
-
-          if (links.length > 0) {
-            await db.articleStock.createMany({ data: links, skipDuplicates: true });
-            result.tags += links.length;
-          }
-
-          await sleep(1000);
-        } catch (e) {
-          result.errors.push(`Marketaux news failed for [${symbols.join(",")}]: ${String(e)}`);
-        }
-      }
-    }
-  }
-
-  // 2c. Tiingo for all stocks (US + international, no per-article cap)
-  if (!process.env.TIINGO_API_KEY) {
-    result.errors.push("Tiingo skipped: TIINGO_API_KEY not set");
-  } else {
-    const TIINGO_BATCH = 5;
-
-    for (let i = 0; i < stocks.length; i += TIINGO_BATCH) {
-      const batch = stocks.slice(i, i + TIINGO_BATCH);
-      const tickerMap = new Map(batch.map((s) => [toTiingoTicker(s.ticker).toLowerCase(), s]));
-      const tickers = [...tickerMap.keys()];
-
-      try {
-        const news = await getTiingoNews(tickers, from);
-        result.articles.fetched += news.length;
-
-        const articles = news
-          .filter((a) => a.url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.url,
-            source: a.source,
-            publishedAt: new Date(a.publishedDate),
-          }));
-
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        const links: Array<{ articleId: string; stockId: string }> = [];
-        for (const article of news.filter((a) => a.url && a.title)) {
-          const articleId = urlToId.get(article.url);
-          if (!articleId) continue;
-          for (const ticker of article.tickers) {
-            const stock = tickerMap.get(ticker.toLowerCase());
-            if (stock) links.push({ articleId, stockId: stock.id });
-          }
-        }
-
-        if (links.length > 0) {
-          await db.articleStock.createMany({ data: links, skipDuplicates: true });
-          result.tags += links.length;
-        }
-
-        await sleep(1000);
-      } catch (e) {
-        result.errors.push(`Tiingo failed for [${tickers.join(",")}]: ${String(e)}`);
-      }
-    }
-  }
-
-  // 2d. Yahoo Finance RSS for all stocks — free, no key, any ticker globally
-  for (const stock of stocks) {
-    try {
-      const news = await getYahooRssNews(stock.ticker);
-      result.articles.fetched += news.length;
-
-      const articles = news
-        .filter((a) => a.url && a.title)
-        .map((a) => ({
-          headline: a.title,
-          summary: a.description,
-          url: a.url,
-          source: "Yahoo Finance",
-          publishedAt: a.publishedAt,
-        }));
-
-      const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-      result.articles.saved += saved;
-
-      await db.articleStock.createMany({
-        data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-        skipDuplicates: true,
-      });
-      result.tags += urlToId.size;
-
-      await sleep(300);
-    } catch (e) {
-      result.errors.push(`Yahoo RSS failed for ${stock.ticker}: ${String(e)}`);
-    }
-  }
-
-  // 2e. Polygon.io for US stocks — free tier, 5 req/min
-  if (!process.env.POLYGON_API_KEY) {
-    result.errors.push("Polygon skipped: POLYGON_API_KEY not set");
-  } else {
-    for (const stock of usStocks) {
-      try {
-        const news = await getPolygonStockNews(stock.ticker, from);
-        result.articles.fetched += news.length;
-
-        const articles = news
-          .filter((a) => a.article_url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.article_url,
-            source: a.publisher.name,
-            publishedAt: new Date(a.published_utc),
-          }));
-
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        await db.articleStock.createMany({
-          data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-          skipDuplicates: true,
-        });
-        result.tags += urlToId.size;
-
-        // Polygon free tier: 5 req/min
-        await sleep(12_000);
-      } catch (e) {
-        result.errors.push(`Polygon failed for ${stock.ticker}: ${String(e)}`);
-      }
-    }
-  }
-
-  // 2f. Alpha Vantage for all stocks — also collects per-article sentiment scores
-  // stockId → [{score, relevance}] — collected to compute relevance-weighted mean
+  // stockId → [{score, relevance}] from Alpha Vantage, for relevance-weighted blending
   const avSentimentScores = new Map<string, { score: number; relevance: number }[]>();
 
-  if (!process.env.ALPHAVANTAGE_API_KEY) {
-    result.errors.push("Alpha Vantage skipped: ALPHAVANTAGE_API_KEY not set");
-  } else {
-    const AV_BATCH = 5;
+  if (stocks.length > 0) {
+    const agg = await aggregateNews(stocks, from);
+    result.articles.fetched += agg.fetched;
+    result.errors.push(...agg.errors);
 
-    for (let i = 0; i < stocks.length; i += AV_BATCH) {
-      const batch = stocks.slice(i, i + AV_BATCH);
-      const tickers = batch.map((s) => s.ticker);
+    const { saved, urlToId } = await saveArticlesWithDedup(agg.articles, from);
+    result.articles.saved += saved;
 
-      try {
-        const news = await getAlphaVantageNews(tickers, from);
-        result.articles.fetched += news.length;
+    const plainLinks: Array<{ articleId: string; stockId: string }> = [];
+    const sentimentLinks: Array<{ articleId: string; stockId: string; sentimentScore: number }> = [];
 
-        const articles = news
-          .filter((a) => a.url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.summary || null,
-            url: a.url,
-            source: a.source,
-            publishedAt: parseAlphaVantageDate(a.time_published),
-          }));
+    for (const art of agg.articles) {
+      const articleId = urlToId.get(art.url);
+      if (!articleId) continue;
 
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        const links: Array<{ articleId: string; stockId: string }> = [];
-        for (const article of news.filter((a) => a.url && a.title)) {
-          const articleId = urlToId.get(article.url);
-          if (!articleId) continue;
-
-          for (const ts of article.ticker_sentiment) {
-            const stock = batch.find((s) => s.ticker === ts.ticker);
-            if (!stock) continue;
-
-            links.push({ articleId, stockId: stock.id });
-
-            const score = parseFloat(ts.ticker_sentiment_score);
-            const relevance = parseFloat(ts.relevance_score);
-            if (!Number.isNaN(score) && !Number.isNaN(relevance) && relevance > 0) {
-              const bucket = avSentimentScores.get(stock.id) ?? [];
-              bucket.push({ score, relevance });
-              avSentimentScores.set(stock.id, bucket);
-            }
-          }
+      // Links carrying a precomputed per-article sentiment score (Alpha Vantage)
+      const scored = new Set<string>();
+      for (const s of art.sentiment) {
+        const stock = tickerToStock.get(s.ticker);
+        if (!stock) continue;
+        sentimentLinks.push({ articleId, stockId: stock.id, sentimentScore: s.score });
+        scored.add(s.ticker);
+        if (s.relevance > 0) {
+          const bucket = avSentimentScores.get(stock.id) ?? [];
+          bucket.push({ score: s.score, relevance: s.relevance });
+          avSentimentScores.set(stock.id, bucket);
         }
+      }
 
-        if (links.length > 0) {
-          await db.articleStock.createMany({ data: links, skipDuplicates: true });
-          result.tags += links.length;
-        }
-
-        await sleep(1000);
-      } catch (e) {
-        result.errors.push(`Alpha Vantage news failed for [${tickers.join(",")}]: ${String(e)}`);
+      // Plain links for the remaining linked tickers
+      for (const ticker of art.stockTickers) {
+        if (scored.has(ticker)) continue;
+        const stock = tickerToStock.get(ticker);
+        if (stock) plainLinks.push({ articleId, stockId: stock.id });
       }
     }
+
+    if (plainLinks.length > 0) {
+      await db.articleStock.createMany({ data: plainLinks, skipDuplicates: true });
+      result.tags += plainLinks.length;
+    }
+    for (const { articleId, stockId, sentimentScore } of sentimentLinks) {
+      await db.articleStock.upsert({
+        where: { articleId_stockId: { articleId, stockId } },
+        create: { articleId, stockId, sentimentScore },
+        update: { sentimentScore },
+      });
+    }
+    result.tags += sentimentLinks.length;
   }
 
   // Per-stock sentiment metadata for step 5 blending
   const stockSentimentMeta = new Map<string, { articleCount: number; velocityRatio: number | null }>();
+
+  // Market-wide crypto Fear & Greed — fetched once, blended into crypto sentiment.
+  let cryptoFngScore: number | null = null;
+  try {
+    const fng = await getCryptoFearGreed();
+    cryptoFngScore = fng?.score ?? null;
+  } catch (e) {
+    result.errors.push(`Crypto Fear & Greed failed: ${String(e)}`);
+  }
 
   // 3. LLM sentiment for all watched stocks, blended with Alpha Vantage scores where available.
   // Fetch extra headlines to account for duplicates after dedup.
@@ -483,9 +330,13 @@ export async function runPipeline(): Promise<PipelineResult> {
           : avEntries.reduce((s, e) => s + e.score, 0) / avEntries.length;
       }
 
-      const score = avWeightedScore != null
-        ? (sentiment.score + avWeightedScore) / 2
-        : sentiment.score;
+      // Blend the LLM score with any available external signals: Alpha Vantage
+      // per-article sentiment (equities) and crypto Fear & Greed (crypto).
+      const isCrypto = stock.ticker.endsWith("-USD");
+      const signals = [sentiment.score];
+      if (avWeightedScore != null) signals.push(avWeightedScore);
+      if (isCrypto && cryptoFngScore != null) signals.push(cryptoFngScore);
+      const score = signals.reduce((a, b) => a + b, 0) / signals.length;
 
       await db.sentiment.create({
         data: { stockId: stock.id, score, summary: sentiment.summary, articleCount, avgArticleAgeHours },
@@ -503,12 +354,43 @@ export async function runPipeline(): Promise<PipelineResult> {
   // Fetch SPY as benchmark for relative strength
   let spyChange7d: number | null = null;
   try {
-    const spyPrices = await getTiingoDailyPrices("SPY", from60);
+    const { prices: spyPrices } = await getDailyPrices("SPY", from60);
     if (spyPrices.length >= 8) spyChange7d = calcMomentum(spyPrices.map(p => p.close), 7);
   } catch { /* benchmark failure doesn't block per-stock analysis */ }
 
+  // Fetch next 30-day earnings calendar (one API call for all stocks)
+  const earningsTo = new Date(to.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const earningsByTicker = new Map<string, Date>();
+  try {
+    const calendar = await getEarningsCalendar(dateStr(to), dateStr(earningsTo));
+    for (const event of calendar) {
+      if (!earningsByTicker.has(event.symbol)) {
+        earningsByTicker.set(event.symbol, new Date(event.date));
+      }
+    }
+  } catch { /* earnings fetch failure doesn't block quant */ }
+
+  // Collect unique sector ETFs needed for the current watchlist (US stocks only)
+  const neededEtfs = new Set<string>();
+  for (const s of usStocks) {
+    const etf = SECTOR_ETF[s.ticker];
+    if (etf) neededEtfs.add(etf);
+  }
+
+  // Fetch sector ETF 7-day returns
+  const sectorChange7d = new Map<string, number>(); // ETF ticker → 7d return
+  for (const etf of neededEtfs) {
+    try {
+      const { prices: etfPrices } = await getDailyPrices(etf, from60);
+      if (etfPrices.length >= 8) {
+        const change = calcMomentum(etfPrices.map(p => p.close), 7);
+        if (change != null) sectorChange7d.set(etf, change);
+      }
+    } catch { /* sector ETF failure doesn't block */ }
+  }
+
   // Per-stock quant metadata for step 5 blending
-  const stockQuantMeta = new Map<string, { quantScore: number; volatility30d: number | null }>();
+  const stockQuantMeta = new Map<string, { quantScore: number; volatility30d: number | null; daysToEarnings: number | null }>();
 
   for (const stock of stocks) {
     try {
@@ -519,11 +401,21 @@ export async function runPipeline(): Promise<PipelineResult> {
         continue;
       }
 
-      const prices = await getTiingoDailyPrices(stock.ticker, from60);
+      // Previous RSI (before we insert today's) for crossing detection
+      const prevQuant = await db.quantAnalysis.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { rsi14: true },
+      });
+
+      const { prices, errors: priceErrors } = await getDailyPrices(stock.ticker, from60);
+      result.errors.push(...priceErrors);
       if (prices.length < 2) continue; // insufficient data — skip gracefully
 
       const closes = prices.map((p) => p.close);
       const volumes = prices.map((p) => p.volume);
+      const highs = prices.map((p) => p.high);
+      const lows = prices.map((p) => p.low);
       const isCrypto = stock.ticker.endsWith("-USD");
 
       const price = closes[closes.length - 1];
@@ -544,18 +436,79 @@ export async function runPipeline(): Promise<PipelineResult> {
       const priceVs60dLow = price != null ? ((price - low60d) / low60d) * 100 : null;
       const relativeStr7d = change7d != null && spyChange7d != null ? change7d - spyChange7d : null;
 
-      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d });
+      // Bollinger Bands
+      const bollingerResult = calcBollingerBands(closes);
+      const bollingerWidth = bollingerResult?.width ?? null;
+      const bollingerPctB = bollingerResult?.percentB ?? null;
+
+      // ATR(14)
+      const atr14 = calcATR(highs, lows, closes);
+      const atrPct = atr14 != null && price != null ? (atr14 / price) * 100 : null;
+
+      // Earnings date proximity (skip crypto — Finnhub only covers equities)
+      const nextEarningsDate = !isCrypto ? (earningsByTicker.get(stock.ticker) ?? null) : null;
+      const daysToEarnings = nextEarningsDate
+        ? Math.ceil((nextEarningsDate.getTime() - to.getTime()) / (24 * 60 * 60 * 1000))
+        : null;
+
+      // Sector-relative strength (US equities only)
+      const sectorEtf = SECTOR_ETF[stock.ticker];
+      const sectorReturn = sectorEtf ? sectorChange7d.get(sectorEtf) ?? null : null;
+      const relativeStrSector7d = change7d != null && sectorReturn != null
+        ? change7d - sectorReturn
+        : null;
+
+      const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d, bollingerPctB });
 
       await db.quantAnalysis.create({
-        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, score },
+        data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
       });
 
-      stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null });
+      stockQuantMeta.set(stock.id, { quantScore: score, volatility30d: volatility30d ?? null, daysToEarnings });
+
+      const rsiAlert = detectRsiCross(stock.ticker, prevQuant?.rsi14 ?? null, rsi14);
+      if (rsiAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: rsiAlert });
 
       result.quants++;
       await sleep(500);
     } catch (e) {
       result.errors.push(`Quant failed for ${stock.ticker}: ${String(e)}`);
+    }
+  }
+
+  // 4b. ETF profiles — holdings, sector weights, expense ratio (Alpha Vantage).
+  // Refreshed at most weekly to respect AV's tight free-tier request budget.
+  if (process.env.ALPHAVANTAGE_API_KEY) {
+    const staleBefore = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+    for (const stock of stocks.filter((s) => isEtf(s.ticker))) {
+      try {
+        const existing = await db.etfProfile.findUnique({
+          where: { stockId: stock.id },
+          select: { updatedAt: true },
+        });
+        if (existing && existing.updatedAt > staleBefore) continue; // still fresh
+
+        const profile = await getEtfProfile(stock.ticker);
+        if (!profile) continue;
+
+        const data = {
+          netAssets: profile.netAssets,
+          expenseRatio: profile.expenseRatio,
+          dividendYield: profile.dividendYield,
+          inceptionDate: profile.inceptionDate ? new Date(profile.inceptionDate) : null,
+          sectors: profile.sectors,
+          holdings: profile.holdings,
+        };
+        await db.etfProfile.upsert({
+          where: { stockId: stock.id },
+          create: { stockId: stock.id, ...data },
+          update: data,
+        });
+
+        await sleep(1000);
+      } catch (e) {
+        result.errors.push(`ETF profile failed for ${stock.ticker}: ${String(e)}`);
+      }
     }
   }
 
@@ -590,6 +543,7 @@ export async function runPipeline(): Promise<PipelineResult> {
       const meta = stockSentimentMeta.get(stock.id);
       const articleCount = meta?.articleCount ?? 0;
       const vol = stockQuantMeta.get(stock.id)?.volatility30d ?? null;
+      const daysToEarnings = stockQuantMeta.get(stock.id)?.daysToEarnings ?? null;
 
       const sentWeight = Math.min(0.30 + (articleCount / 15) * 0.30, 0.60);
       const quantWeight = 1 - sentWeight;
@@ -611,6 +565,10 @@ export async function runPipeline(): Promise<PipelineResult> {
         confidence -= 0.15;
         warnings.push("Signal disagreement between sentiment and quant");
       }
+      if (daysToEarnings != null && daysToEarnings <= 5) {
+        confidence -= 0.10;
+        warnings.push(`Earnings in ${daysToEarnings} day(s) — signals may be unreliable`);
+      }
       confidence = Math.max(0.1, Math.min(1.0, confidence + (articleCount >= 10 ? 0.15 : 0)));
 
       // Sentiment delta vs 7 days ago
@@ -624,13 +582,22 @@ export async function runPipeline(): Promise<PipelineResult> {
 
       const articleVelocityRatio = meta?.velocityRatio ?? null;
 
+      // Previous signal (before inserting today's) for signal-change detection
+      const prevEstimate = await db.stockEstimate.findFirst({
+        where: { stockId: stock.id },
+        orderBy: { date: "desc" },
+        select: { signal: true },
+      });
+
+      const signal = scoreToSignal(combinedScore);
+
       await db.stockEstimate.create({
         data: {
           stockId: stock.id,
           sentimentScore,
           quantScore,
           combinedScore,
-          signal: scoreToSignal(combinedScore),
+          signal,
           confidence,
           dataWarnings: warnings,
           sentimentDelta,
@@ -638,10 +605,23 @@ export async function runPipeline(): Promise<PipelineResult> {
         },
       });
 
+      const signalAlert = detectSignalChange(stock.ticker, prevEstimate?.signal, signal);
+      if (signalAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: signalAlert });
+
+      const velocityAlert = detectVelocitySpike(stock.ticker, articleVelocityRatio);
+      if (velocityAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: velocityAlert });
+
       result.estimates++;
     } catch (e) {
       result.errors.push(`Estimate failed for ${stock.ticker}: ${String(e)}`);
     }
+  }
+
+  // 6. Alerts — persist detected events and notify watchers by email
+  try {
+    await processAlerts(pendingAlerts, result);
+  } catch (e) {
+    result.errors.push(`Alert processing failed: ${String(e)}`);
   }
 
   return result;

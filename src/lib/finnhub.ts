@@ -37,3 +37,13 @@ export function searchStocks(query: string) {
     { q: query }
   );
 }
+
+export type EarningsEvent = { symbol: string; date: string };
+
+export async function getEarningsCalendar(from: string, to: string): Promise<EarningsEvent[]> {
+  // GET /calendar/earnings?from=YYYY-MM-DD&to=YYYY-MM-DD (no symbol = all stocks)
+  const data = await get<{ earningsCalendar: Array<{ symbol: string; date: string }> }>(
+    "/calendar/earnings", { from, to }
+  );
+  return data.earningsCalendar ?? [];
+}

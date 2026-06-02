@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
 
 // ── calcSMA ──────────────────────────────────────────────────────────────────
 
@@ -259,6 +259,79 @@ describe("calcQuantScore()", () => {
     const withoutMacd = calcQuantScore({ rsi14: 50, price: 100 });
     const withPosMacd = calcQuantScore({ rsi14: 50, price: 100, macdHistogram: 1.0 });
     expect(withPosMacd).toBeGreaterThan(withoutMacd);
+  });
+});
+
+// ── calcBollingerBands ────────────────────────────────────────────────────────
+
+describe("calcBollingerBands()", () => {
+  it("returns null when fewer than period closes", () => {
+    expect(calcBollingerBands(Array(19).fill(100), 20)).toBeNull();
+    expect(calcBollingerBands([], 20)).toBeNull();
+  });
+
+  it("returns correct middle (SMA) for a known series", () => {
+    // 20 values all equal to 50 → SMA = 50
+    const closes = Array(20).fill(50);
+    const result = calcBollingerBands(closes, 20);
+    expect(result).not.toBeNull();
+    expect(result!.middle).toBeCloseTo(50);
+  });
+
+  it("percentB is 0.5 when price equals SMA (flat series)", () => {
+    const closes = Array(20).fill(100);
+    const result = calcBollingerBands(closes, 20)!;
+    expect(result.percentB).toBeCloseTo(0.5);
+  });
+
+  it("percentB > 0.5 when price is above middle", () => {
+    // Flat series for first 19 values, then price jumps above SMA
+    const closes = [...Array(19).fill(100), 110];
+    const result = calcBollingerBands(closes, 20)!;
+    expect(result.percentB).toBeGreaterThan(0.5);
+  });
+
+  it("width is 0 for a flat series", () => {
+    const closes = Array(20).fill(100);
+    const result = calcBollingerBands(closes, 20)!;
+    expect(result.width).toBeCloseTo(0);
+  });
+
+  it("upper > middle > lower for a varying series", () => {
+    const closes = Array.from({ length: 20 }, (_, i) => 100 + (i % 5) * 2);
+    const result = calcBollingerBands(closes, 20)!;
+    expect(result.upper).toBeGreaterThan(result.middle);
+    expect(result.middle).toBeGreaterThan(result.lower);
+  });
+});
+
+// ── calcATR ───────────────────────────────────────────────────────────────────
+
+describe("calcATR()", () => {
+  it("returns null when fewer than period+1 closes", () => {
+    const h = Array(14).fill(105);
+    const l = Array(14).fill(95);
+    const c = Array(14).fill(100);
+    expect(calcATR(h, l, c, 14)).toBeNull();
+  });
+
+  it("returns a positive number for a typical series (highs > lows)", () => {
+    const n = 20;
+    const closes = Array.from({ length: n }, (_, i) => 100 + i);
+    const highs = closes.map((c) => c + 2);
+    const lows = closes.map((c) => c - 2);
+    const result = calcATR(highs, lows, closes, 14);
+    expect(result).not.toBeNull();
+    expect(result!).toBeGreaterThan(0);
+  });
+
+  it("result is >= 0", () => {
+    const n = 20;
+    const closes = Array.from({ length: n }, (_, i) => 100 + i * 0.5);
+    const highs = closes.map((c) => c + 1);
+    const lows = closes.map((c) => c - 1);
+    const result = calcATR(highs, lows, closes, 14);
+    expect(result!).toBeGreaterThanOrEqual(0);
   });
 });
 

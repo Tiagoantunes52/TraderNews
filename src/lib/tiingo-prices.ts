@@ -4,6 +4,8 @@ export type DailyPrice = {
   date: string;
   close: number;
   volume: number;
+  high: number;
+  low: number;
 };
 
 export async function getTiingoDailyPrices(
@@ -40,8 +42,8 @@ async function getStockPrices(
     throw new Error(`Tiingo prices error: ${res.status} — ${body}`);
   }
 
-  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number; adjVolume?: number; volume: number }>;
-  return data.map((d) => ({ date: d.date, close: d.adjClose ?? d.close, volume: d.adjVolume ?? d.volume ?? 0 }));
+  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number; adjVolume?: number; volume: number; adjHigh?: number; high?: number; adjLow?: number; low?: number }>;
+  return data.map((d) => ({ date: d.date, close: d.adjClose ?? d.close, volume: d.adjVolume ?? d.volume ?? 0, high: d.adjHigh ?? d.high ?? 0, low: d.adjLow ?? d.low ?? 0 }));
 }
 
 async function getCryptoPrices(
@@ -69,7 +71,7 @@ async function getCryptoPrices(
   }
 
   const data = (await res.json()) as Array<{
-    priceData: Array<{ date: string; close: number; volume?: number }>;
+    priceData: Array<{ date: string; close: number; volume?: number; high?: number; low?: number }>;
   }>;
-  return (data[0]?.priceData ?? []).map((d) => ({ date: d.date, close: d.close, volume: d.volume ?? 0 }));
+  return (data[0]?.priceData ?? []).map((d) => ({ date: d.date, close: d.close, volume: d.volume ?? 0, high: d.high ?? d.close, low: d.low ?? d.close }));
 }
