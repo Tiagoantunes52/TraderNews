@@ -12,6 +12,8 @@ async function inferMarket(ticker: string) {
   );
 }
 
+type SearchStock = { id: string; ticker: string; name: string };
+
 export async function GET(req: Request) {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -20,27 +22,46 @@ export async function GET(req: Request) {
   const q = searchParams.get("q");
   if (!q || q.length < 1) return NextResponse.json([]);
 
-  const result = await searchStocks(q);
+  // 1. Local DB first — covers everything we've seeded (crypto, ETFs, and the
+  //    international listings Finnhub's symbol search filters out).
+  const local = await db.stock.findMany({
+    where: {
+      OR: [
+        { ticker: { contains: q, mode: "insensitive" } },
+        { name: { contains: q, mode: "insensitive" } },
+      ],
+    },
+    select: { id: true, ticker: true, name: true },
+    orderBy: { ticker: "asc" },
+    take: 10,
+  });
 
-  // Deduplicate by symbol before upserting
-  const seen = new Set<string>();
-  const stocks = result.result
-    .filter((s) => s.type === "Common Stock" && s.symbol && !seen.has(s.symbol) && seen.add(s.symbol))
-    .slice(0, 10);
+  // 2. Finnhub for discovering US tickers not yet in the DB. Don't let a Finnhub
+  //    failure block the local results.
+  const byTicker = new Map<string, SearchStock>(local.map((s) => [s.ticker, s]));
+  try {
+    const result = await searchStocks(q);
+    const seen = new Set<string>();
+    const candidates = result.result
+      .filter((s) => s.type === "Common Stock" && s.symbol && !seen.has(s.symbol) && seen.add(s.symbol))
+      .filter((s) => !byTicker.has(s.symbol))
+      .slice(0, 10);
 
-  const saved = await Promise.all(
-    stocks.map(async (s) => {
+    for (const s of candidates) {
       const market = await inferMarket(s.symbol);
-      if (!market) return null;
-      return db.stock.upsert({
+      if (!market) continue;
+      const stock = await db.stock.upsert({
         where: { ticker: s.symbol },
         update: { name: s.description, marketId: market.id },
         create: { ticker: s.symbol, name: s.description, marketId: market.id },
       });
-    })
-  ).then((results) => results.filter(Boolean) as Awaited<ReturnType<typeof db.stock.upsert>>[]);
+      if (!byTicker.has(stock.ticker)) {
+        byTicker.set(stock.ticker, { id: stock.id, ticker: stock.ticker, name: stock.name });
+      }
+    }
+  } catch {
+    // Finnhub unavailable — local results still stand.
+  }
 
-  // Deduplicate by ID before returning (defensive)
-  const unique = [...new Map(saved.map((s) => [s.id, s])).values()];
-  return NextResponse.json(unique);
+  return NextResponse.json([...byTicker.values()].slice(0, 15));
 }
