@@ -1,14 +1,11 @@
 import { db } from "@/lib/db";
-import { getMarketNews, getStockNews, getEarningsCalendar } from "@/lib/finnhub";
-import { getMarketauxStockNews } from "@/lib/marketaux";
-import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
-import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
-import { getYahooRssNews } from "@/lib/yahoo-rss";
-import { getPolygonStockNews } from "@/lib/polygon";
+import { getMarketNews, getEarningsCalendar } from "@/lib/finnhub";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
-import { getTiingoDailyPrices } from "@/lib/tiingo-prices";
+import { getDailyPrices } from "@/lib/price-sources";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
 import { SECTOR_ETF } from "@/lib/sectors";
+import { normalizeUrl, normalizeHeadline } from "@/lib/normalize";
+import { aggregateNews } from "@/lib/news-sources";
 import { detectSignalChange, detectVelocitySpike, detectRsiCross, type AlertDraft } from "@/lib/alerts";
 import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 
@@ -79,19 +76,8 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export function normalizeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    // Strip query params, fragments, and trailing slashes — canonical form
-    return `${u.origin}${u.pathname}`.replace(/\/+$/, "");
-  } catch {
-    return url;
-  }
-}
-
-export function normalizeHeadline(headline: string): string {
-  return headline.toLowerCase().replace(/\s+/g, " ").trim();
-}
+// Re-exported so existing imports from "@/lib/pipeline" keep working.
+export { normalizeUrl, normalizeHeadline };
 
 type ArticleData = {
   headline: string;
@@ -212,277 +198,66 @@ export async function runPipeline(): Promise<PipelineResult> {
     where: { userStocks: { some: {} } },
   });
 
-  // Finnhub free tier only supports /company-news for US tickers (no dot-exchange suffix, no crypto)
+  // US tickers (no dot-exchange suffix, no crypto) — used later by the quant step.
   const usStocks = stocks.filter((s) => !s.ticker.includes(".") && !s.ticker.endsWith("-USD"));
 
-  for (const stock of usStocks) {
-    try {
-      const news = await getStockNews(stock.ticker, dateStr(from), dateStr(to));
-      result.articles.fetched += news.length;
+  // Stock-specific news — one centralised pass across every configured source.
+  // Sources fall back independently (one failing never blocks the others) and
+  // supplement each other; results are merged by URL before a single dedupe-save.
+  const tickerToStock = new Map(stocks.map((s) => [s.ticker, s]));
 
-      const articles = news
-        .filter((a) => a.url && a.headline)
-        .map((a) => ({
-          headline: a.headline,
-          summary: a.summary ?? null,
-          url: a.url,
-          source: a.source,
-          publishedAt: new Date(a.datetime * 1000),
-        }));
-
-      const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-      result.articles.saved += saved;
-
-      await db.articleStock.createMany({
-        data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-        skipDuplicates: true,
-      });
-      result.tags += urlToId.size;
-
-      // Respect Finnhub free tier rate limit (60 req/min)
-      await sleep(1100);
-    } catch (e) {
-      result.errors.push(`Stock news failed for ${stock.ticker}: ${String(e)}`);
-    }
-  }
-
-  // 2b. Marketaux for non-US stocks (Finnhub free tier doesn't support these)
-  const nonUsStocks = stocks.filter((s) => s.ticker.includes("."));
-
-  if (nonUsStocks.length > 0) {
-    if (!process.env.MARKETAUX_API_KEY) {
-      result.errors.push("Marketaux skipped: MARKETAUX_API_KEY not set");
-    } else {
-      const BATCH = 5;
-
-      for (let i = 0; i < nonUsStocks.length; i += BATCH) {
-        const batch = nonUsStocks.slice(i, i + BATCH);
-        const symbols = batch.map((s) => s.ticker);
-
-        try {
-          const news = await getMarketauxStockNews(symbols, from);
-          result.articles.fetched += news.length;
-
-          const articles = news
-            .filter((a) => a.url && a.title)
-            .map((a) => ({
-              headline: a.title,
-              summary: a.description ?? null,
-              url: a.url,
-              source: a.source,
-              publishedAt: new Date(a.published_at),
-            }));
-
-          const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-          result.articles.saved += saved;
-
-          const links: Array<{ articleId: string; stockId: string }> = [];
-          for (const article of news.filter((a) => a.url && a.title)) {
-            const articleId = urlToId.get(article.url);
-            if (!articleId) continue;
-            for (const entity of article.entities) {
-              const stock = batch.find((s) => s.ticker === entity.symbol);
-              if (stock) links.push({ articleId, stockId: stock.id });
-            }
-          }
-
-          if (links.length > 0) {
-            await db.articleStock.createMany({ data: links, skipDuplicates: true });
-            result.tags += links.length;
-          }
-
-          await sleep(1000);
-        } catch (e) {
-          result.errors.push(`Marketaux news failed for [${symbols.join(",")}]: ${String(e)}`);
-        }
-      }
-    }
-  }
-
-  // 2c. Tiingo for all stocks (US + international, no per-article cap)
-  if (!process.env.TIINGO_API_KEY) {
-    result.errors.push("Tiingo skipped: TIINGO_API_KEY not set");
-  } else {
-    const TIINGO_BATCH = 5;
-
-    for (let i = 0; i < stocks.length; i += TIINGO_BATCH) {
-      const batch = stocks.slice(i, i + TIINGO_BATCH);
-      const tickerMap = new Map(batch.map((s) => [toTiingoTicker(s.ticker).toLowerCase(), s]));
-      const tickers = [...tickerMap.keys()];
-
-      try {
-        const news = await getTiingoNews(tickers, from);
-        result.articles.fetched += news.length;
-
-        const articles = news
-          .filter((a) => a.url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.url,
-            source: a.source,
-            publishedAt: new Date(a.publishedDate),
-          }));
-
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        const links: Array<{ articleId: string; stockId: string }> = [];
-        for (const article of news.filter((a) => a.url && a.title)) {
-          const articleId = urlToId.get(article.url);
-          if (!articleId) continue;
-          for (const ticker of article.tickers) {
-            const stock = tickerMap.get(ticker.toLowerCase());
-            if (stock) links.push({ articleId, stockId: stock.id });
-          }
-        }
-
-        if (links.length > 0) {
-          await db.articleStock.createMany({ data: links, skipDuplicates: true });
-          result.tags += links.length;
-        }
-
-        await sleep(1000);
-      } catch (e) {
-        result.errors.push(`Tiingo failed for [${tickers.join(",")}]: ${String(e)}`);
-      }
-    }
-  }
-
-  // 2d. Yahoo Finance RSS for all stocks — free, no key, any ticker globally
-  for (const stock of stocks) {
-    try {
-      const news = await getYahooRssNews(stock.ticker);
-      result.articles.fetched += news.length;
-
-      const articles = news
-        .filter((a) => a.url && a.title)
-        .map((a) => ({
-          headline: a.title,
-          summary: a.description,
-          url: a.url,
-          source: "Yahoo Finance",
-          publishedAt: a.publishedAt,
-        }));
-
-      const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-      result.articles.saved += saved;
-
-      await db.articleStock.createMany({
-        data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-        skipDuplicates: true,
-      });
-      result.tags += urlToId.size;
-
-      await sleep(300);
-    } catch (e) {
-      result.errors.push(`Yahoo RSS failed for ${stock.ticker}: ${String(e)}`);
-    }
-  }
-
-  // 2e. Polygon.io for US stocks — free tier, 5 req/min
-  if (!process.env.POLYGON_API_KEY) {
-    result.errors.push("Polygon skipped: POLYGON_API_KEY not set");
-  } else {
-    for (const stock of usStocks) {
-      try {
-        const news = await getPolygonStockNews(stock.ticker, from);
-        result.articles.fetched += news.length;
-
-        const articles = news
-          .filter((a) => a.article_url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.article_url,
-            source: a.publisher.name,
-            publishedAt: new Date(a.published_utc),
-          }));
-
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        await db.articleStock.createMany({
-          data: [...urlToId.values()].map((articleId) => ({ articleId, stockId: stock.id })),
-          skipDuplicates: true,
-        });
-        result.tags += urlToId.size;
-
-        // Polygon free tier: 5 req/min
-        await sleep(12_000);
-      } catch (e) {
-        result.errors.push(`Polygon failed for ${stock.ticker}: ${String(e)}`);
-      }
-    }
-  }
-
-  // 2f. Alpha Vantage for all stocks — also collects per-article sentiment scores
-  // stockId → [{score, relevance}] — collected to compute relevance-weighted mean
+  // stockId → [{score, relevance}] from Alpha Vantage, for relevance-weighted blending
   const avSentimentScores = new Map<string, { score: number; relevance: number }[]>();
 
-  if (!process.env.ALPHAVANTAGE_API_KEY) {
-    result.errors.push("Alpha Vantage skipped: ALPHAVANTAGE_API_KEY not set");
-  } else {
-    const AV_BATCH = 5;
+  if (stocks.length > 0) {
+    const agg = await aggregateNews(stocks, from);
+    result.articles.fetched += agg.fetched;
+    result.errors.push(...agg.errors);
 
-    for (let i = 0; i < stocks.length; i += AV_BATCH) {
-      const batch = stocks.slice(i, i + AV_BATCH);
-      const tickers = batch.map((s) => s.ticker);
+    const { saved, urlToId } = await saveArticlesWithDedup(agg.articles, from);
+    result.articles.saved += saved;
 
-      try {
-        const news = await getAlphaVantageNews(tickers, from);
-        result.articles.fetched += news.length;
+    const plainLinks: Array<{ articleId: string; stockId: string }> = [];
+    const sentimentLinks: Array<{ articleId: string; stockId: string; sentimentScore: number }> = [];
 
-        const articles = news
-          .filter((a) => a.url && a.title)
-          .map((a) => ({
-            headline: a.title,
-            summary: a.summary || null,
-            url: a.url,
-            source: a.source,
-            publishedAt: parseAlphaVantageDate(a.time_published),
-          }));
+    for (const art of agg.articles) {
+      const articleId = urlToId.get(art.url);
+      if (!articleId) continue;
 
-        const { saved, urlToId } = await saveArticlesWithDedup(articles, from);
-        result.articles.saved += saved;
-
-        // Collect per-article sentiment scores for upsert into ArticleStock
-        const links: Array<{ articleId: string; stockId: string; sentimentScore: number }> = [];
-        for (const article of news.filter((a) => a.url && a.title)) {
-          const articleId = urlToId.get(article.url);
-          if (!articleId) continue;
-
-          for (const ts of article.ticker_sentiment) {
-            const stock = batch.find((s) => s.ticker === ts.ticker);
-            if (!stock) continue;
-
-            const sentimentScore = parseFloat(ts.ticker_sentiment_score);
-            links.push({ articleId, stockId: stock.id, sentimentScore: Number.isNaN(sentimentScore) ? 0 : sentimentScore });
-
-            const relevance = parseFloat(ts.relevance_score);
-            if (!Number.isNaN(sentimentScore) && !Number.isNaN(relevance) && relevance > 0) {
-              const bucket = avSentimentScores.get(stock.id) ?? [];
-              bucket.push({ score: sentimentScore, relevance });
-              avSentimentScores.set(stock.id, bucket);
-            }
-          }
+      // Links carrying a precomputed per-article sentiment score (Alpha Vantage)
+      const scored = new Set<string>();
+      for (const s of art.sentiment) {
+        const stock = tickerToStock.get(s.ticker);
+        if (!stock) continue;
+        sentimentLinks.push({ articleId, stockId: stock.id, sentimentScore: s.score });
+        scored.add(s.ticker);
+        if (s.relevance > 0) {
+          const bucket = avSentimentScores.get(stock.id) ?? [];
+          bucket.push({ score: s.score, relevance: s.relevance });
+          avSentimentScores.set(stock.id, bucket);
         }
+      }
 
-        // Upsert individual article-stock links with per-article sentiment score
-        for (const { articleId, stockId, sentimentScore } of links) {
-          await db.articleStock.upsert({
-            where: { articleId_stockId: { articleId, stockId } },
-            create: { articleId, stockId, sentimentScore },
-            update: { sentimentScore },
-          });
-        }
-        result.tags += links.length;
-
-        await sleep(1000);
-      } catch (e) {
-        result.errors.push(`Alpha Vantage news failed for [${tickers.join(",")}]: ${String(e)}`);
+      // Plain links for the remaining linked tickers
+      for (const ticker of art.stockTickers) {
+        if (scored.has(ticker)) continue;
+        const stock = tickerToStock.get(ticker);
+        if (stock) plainLinks.push({ articleId, stockId: stock.id });
       }
     }
+
+    if (plainLinks.length > 0) {
+      await db.articleStock.createMany({ data: plainLinks, skipDuplicates: true });
+      result.tags += plainLinks.length;
+    }
+    for (const { articleId, stockId, sentimentScore } of sentimentLinks) {
+      await db.articleStock.upsert({
+        where: { articleId_stockId: { articleId, stockId } },
+        create: { articleId, stockId, sentimentScore },
+        update: { sentimentScore },
+      });
+    }
+    result.tags += sentimentLinks.length;
   }
 
   // Per-stock sentiment metadata for step 5 blending
@@ -563,7 +338,7 @@ export async function runPipeline(): Promise<PipelineResult> {
   // Fetch SPY as benchmark for relative strength
   let spyChange7d: number | null = null;
   try {
-    const spyPrices = await getTiingoDailyPrices("SPY", from60);
+    const { prices: spyPrices } = await getDailyPrices("SPY", from60);
     if (spyPrices.length >= 8) spyChange7d = calcMomentum(spyPrices.map(p => p.close), 7);
   } catch { /* benchmark failure doesn't block per-stock analysis */ }
 
@@ -590,7 +365,7 @@ export async function runPipeline(): Promise<PipelineResult> {
   const sectorChange7d = new Map<string, number>(); // ETF ticker → 7d return
   for (const etf of neededEtfs) {
     try {
-      const etfPrices = await getTiingoDailyPrices(etf, from60);
+      const { prices: etfPrices } = await getDailyPrices(etf, from60);
       if (etfPrices.length >= 8) {
         const change = calcMomentum(etfPrices.map(p => p.close), 7);
         if (change != null) sectorChange7d.set(etf, change);
@@ -617,7 +392,8 @@ export async function runPipeline(): Promise<PipelineResult> {
         select: { rsi14: true },
       });
 
-      const prices = await getTiingoDailyPrices(stock.ticker, from60);
+      const { prices, errors: priceErrors } = await getDailyPrices(stock.ticker, from60);
+      result.errors.push(...priceErrors);
       if (prices.length < 2) continue; // insufficient data — skip gracefully
 
       const closes = prices.map((p) => p.close);
