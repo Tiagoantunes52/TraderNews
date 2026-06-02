@@ -58,6 +58,7 @@ model Stock {
   quantAnalyses  QuantAnalysis[]
   stockEstimates StockEstimate[]
   alerts         Alert[]
+  etfProfile     EtfProfile?
   userStocks     UserStock[]
 }
 
@@ -157,6 +158,20 @@ model Alert {
   createdAt DateTime @default(now())
 
   @@index([stockId, createdAt])
+}
+
+model EtfProfile {
+  id            String    @id @default(cuid())
+  stock         Stock     @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId       String    @unique
+  netAssets     Float?
+  expenseRatio  Float?
+  dividendYield Float?
+  inceptionDate DateTime?
+  sectors       Json? // [{ sector, weight }]
+  holdings      Json? // [{ symbol, description, weight }]
+  updatedAt     DateTime  @updatedAt
+  createdAt     DateTime  @default(now())
 }
 
 model UserStock {

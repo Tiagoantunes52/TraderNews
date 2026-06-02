@@ -1,5 +1,8 @@
 import { db } from "@/lib/db";
 import { getMarketNews, getEarningsCalendar } from "@/lib/finnhub";
+import { getEtfProfile } from "@/lib/alphavantage";
+import { getCryptoFearGreed } from "@/lib/crypto-fng";
+import { isEtf } from "@/lib/etf";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { getDailyPrices } from "@/lib/price-sources";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
@@ -263,6 +266,15 @@ export async function runPipeline(): Promise<PipelineResult> {
   // Per-stock sentiment metadata for step 5 blending
   const stockSentimentMeta = new Map<string, { articleCount: number; velocityRatio: number | null }>();
 
+  // Market-wide crypto Fear & Greed — fetched once, blended into crypto sentiment.
+  let cryptoFngScore: number | null = null;
+  try {
+    const fng = await getCryptoFearGreed();
+    cryptoFngScore = fng?.score ?? null;
+  } catch (e) {
+    result.errors.push(`Crypto Fear & Greed failed: ${String(e)}`);
+  }
+
   // 3. LLM sentiment for all watched stocks, blended with Alpha Vantage scores where available.
   // Fetch extra headlines to account for duplicates after dedup.
   for (const stock of stocks) {
@@ -318,9 +330,13 @@ export async function runPipeline(): Promise<PipelineResult> {
           : avEntries.reduce((s, e) => s + e.score, 0) / avEntries.length;
       }
 
-      const score = avWeightedScore != null
-        ? (sentiment.score + avWeightedScore) / 2
-        : sentiment.score;
+      // Blend the LLM score with any available external signals: Alpha Vantage
+      // per-article sentiment (equities) and crypto Fear & Greed (crypto).
+      const isCrypto = stock.ticker.endsWith("-USD");
+      const signals = [sentiment.score];
+      if (avWeightedScore != null) signals.push(avWeightedScore);
+      if (isCrypto && cryptoFngScore != null) signals.push(cryptoFngScore);
+      const score = signals.reduce((a, b) => a + b, 0) / signals.length;
 
       await db.sentiment.create({
         data: { stockId: stock.id, score, summary: sentiment.summary, articleCount, avgArticleAgeHours },
@@ -457,6 +473,42 @@ export async function runPipeline(): Promise<PipelineResult> {
       await sleep(500);
     } catch (e) {
       result.errors.push(`Quant failed for ${stock.ticker}: ${String(e)}`);
+    }
+  }
+
+  // 4b. ETF profiles — holdings, sector weights, expense ratio (Alpha Vantage).
+  // Refreshed at most weekly to respect AV's tight free-tier request budget.
+  if (process.env.ALPHAVANTAGE_API_KEY) {
+    const staleBefore = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+    for (const stock of stocks.filter((s) => isEtf(s.ticker))) {
+      try {
+        const existing = await db.etfProfile.findUnique({
+          where: { stockId: stock.id },
+          select: { updatedAt: true },
+        });
+        if (existing && existing.updatedAt > staleBefore) continue; // still fresh
+
+        const profile = await getEtfProfile(stock.ticker);
+        if (!profile) continue;
+
+        const data = {
+          netAssets: profile.netAssets,
+          expenseRatio: profile.expenseRatio,
+          dividendYield: profile.dividendYield,
+          inceptionDate: profile.inceptionDate ? new Date(profile.inceptionDate) : null,
+          sectors: profile.sectors,
+          holdings: profile.holdings,
+        };
+        await db.etfProfile.upsert({
+          where: { stockId: stock.id },
+          create: { stockId: stock.id, ...data },
+          update: data,
+        });
+
+        await sleep(1000);
+      } catch (e) {
+        result.errors.push(`ETF profile failed for ${stock.ticker}: ${String(e)}`);
+      }
     }
   }
 

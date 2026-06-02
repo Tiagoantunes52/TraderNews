@@ -21,7 +21,7 @@ const markets = [
 
 type SeedStock = { ticker: string; name: string; market: string };
 
-const usAndCrypto: SeedStock[] = [
+const usEquities: SeedStock[] = [
   { ticker: "AAPL", name: "Apple Inc.", market: "NASDAQ" },
   { ticker: "MSFT", name: "Microsoft Corporation", market: "NASDAQ" },
   { ticker: "GOOGL", name: "Alphabet Inc.", market: "NASDAQ" },
@@ -35,8 +35,24 @@ const usAndCrypto: SeedStock[] = [
   { ticker: "XOM", name: "Exxon Mobil Corporation", market: "NYSE" },
   { ticker: "SPY", name: "SPDR S&P 500 ETF", market: "NYSE" },
   { ticker: "QQQ", name: "Invesco QQQ Trust", market: "NASDAQ" },
+];
+
+// Crypto — coins covered by our price sources (Binance USDT pairs + CoinGecko ids).
+const crypto: SeedStock[] = [
   { ticker: "BTC-USD", name: "Bitcoin", market: "CRYPTO" },
   { ticker: "ETH-USD", name: "Ethereum", market: "CRYPTO" },
+  { ticker: "SOL-USD", name: "Solana", market: "CRYPTO" },
+  { ticker: "XRP-USD", name: "XRP", market: "CRYPTO" },
+  { ticker: "ADA-USD", name: "Cardano", market: "CRYPTO" },
+  { ticker: "DOGE-USD", name: "Dogecoin", market: "CRYPTO" },
+  { ticker: "AVAX-USD", name: "Avalanche", market: "CRYPTO" },
+  { ticker: "DOT-USD", name: "Polkadot", market: "CRYPTO" },
+  { ticker: "LTC-USD", name: "Litecoin", market: "CRYPTO" },
+  { ticker: "LINK-USD", name: "Chainlink", market: "CRYPTO" },
+  { ticker: "BCH-USD", name: "Bitcoin Cash", market: "CRYPTO" },
+  { ticker: "TRX-USD", name: "TRON", market: "CRYPTO" },
+  { ticker: "XLM-USD", name: "Stellar", market: "CRYPTO" },
+  { ticker: "ATOM-USD", name: "Cosmos", market: "CRYPTO" },
 ];
 
 // Portugal — Euronext Lisbon (PSI). The PSI has ~16 constituents.
@@ -204,7 +220,8 @@ const uk: SeedStock[] = [
 ];
 
 const stocks: SeedStock[] = [
-  ...usAndCrypto,
+  ...usEquities,
+  ...crypto,
   ...portugal,
   ...spain,
   ...france,

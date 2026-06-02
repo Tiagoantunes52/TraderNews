@@ -21,6 +21,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       sentiments: { orderBy: { date: "desc" }, take: 30 },
       quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
       stockEstimates: { orderBy: { date: "desc" }, take: 1 },
+      etfProfile: true,
       articleStock: {
         include: { article: true },
         orderBy: { article: { publishedAt: "desc" } },
@@ -42,6 +43,10 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
   const m = latest ? mood(latest.score) : null;
   const quant = stock.quantAnalyses[0] ?? null;
   const estimate = stock.stockEstimates[0] ?? null;
+
+  const etf = stock.etfProfile;
+  const etfSectors = (etf?.sectors as { sector: string; weight: number }[] | null) ?? [];
+  const etfHoldings = (etf?.holdings as { symbol: string; description: string; weight: number }[] | null) ?? [];
 
   const history = stock.sentiments
     .slice()
@@ -227,6 +232,65 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
         </Card>
       )}
 
+      {/* ETF profile */}
+      {etf && (etfHoldings.length > 0 || etfSectors.length > 0) && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">ETF Profile</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
+              {etf.expenseRatio != null && (
+                <EtfStat label="Expense ratio" value={`${asPct(etf.expenseRatio).toFixed(2)}%`} />
+              )}
+              {etf.dividendYield != null && (
+                <EtfStat label="Dividend yield" value={`${asPct(etf.dividendYield).toFixed(2)}%`} />
+              )}
+              {etf.netAssets != null && (
+                <EtfStat label="Net assets" value={formatLargeUsd(etf.netAssets)} />
+              )}
+            </div>
+
+            {etfHoldings.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Top holdings</p>
+                <div className="space-y-1.5">
+                  {etfHoldings.slice(0, 10).map((h) => (
+                    <div key={h.symbol} className="flex items-center gap-2 text-xs">
+                      <span className="w-16 shrink-0 font-semibold">{h.symbol}</span>
+                      <span className="flex-1 truncate text-muted-foreground" title={h.description}>
+                        {h.description}
+                      </span>
+                      <div className="w-24 h-1.5 bg-muted rounded-full overflow-hidden shrink-0">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(asPct(h.weight), 100)}%` }} />
+                      </div>
+                      <span className="w-12 text-right tabular-nums shrink-0">{asPct(h.weight).toFixed(1)}%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {etfSectors.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Sector weights</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {etfSectors
+                    .slice()
+                    .sort((a, b) => b.weight - a.weight)
+                    .slice(0, 6)
+                    .map((s) => (
+                      <Badge key={s.sector} variant="outline" className="text-xs font-normal">
+                        {s.sector} <span className="ml-1 tabular-nums text-muted-foreground">{asPct(s.weight).toFixed(0)}%</span>
+                      </Badge>
+                    ))}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Sentiment summary */}
       {latest?.summary && (
         <Card>
@@ -347,5 +411,27 @@ function StatCard({
         <p className={`${small ? "text-lg" : "text-2xl"} font-bold mt-1 tabular-nums`}>{value}</p>
       </CardContent>
     </Card>
+  );
+}
+
+// Alpha Vantage returns weights/ratios as fractions (0–1); some fields arrive
+// already as percentages. Normalize defensively to a percentage number.
+function asPct(value: number): number {
+  return value <= 1 ? value * 100 : value;
+}
+
+function formatLargeUsd(value: number): string {
+  if (value >= 1e12) return `$${(value / 1e12).toFixed(2)}T`;
+  if (value >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
+  if (value >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
+  return `$${value.toLocaleString()}`;
+}
+
+function EtfStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="font-semibold tabular-nums">{value}</p>
+    </div>
   );
 }

@@ -9,6 +9,8 @@
 
 import { getTiingoDailyPrices, type DailyPrice } from "@/lib/tiingo-prices";
 import { getYahooDailyPrices } from "@/lib/yahoo-prices";
+import { getBinanceDailyPrices, toBinanceSymbol } from "@/lib/binance-prices";
+import { getCoinGeckoDailyPrices, toCoinGeckoId } from "@/lib/coingecko-prices";
 
 const MIN_POINTS = 2; // fewer than this is unusable for indicators
 
@@ -25,12 +27,28 @@ export type PriceResult = {
   errors: string[]; // non-fatal per-source failures
 };
 
+/** Binance — crypto only (`-USD` → USDT pair). Full daily OHLCV; keyless. */
+export const binancePriceSource: PriceSource = {
+  name: "Binance",
+  configured: () => true,
+  supports: (ticker) => toBinanceSymbol(ticker) !== null,
+  fetch: (ticker, since) => getBinanceDailyPrices(ticker, since),
+};
+
 /** Tiingo — US equities + crypto (`-USD`). Skips dot-exchange listings it can't serve. */
 export const tiingoPriceSource: PriceSource = {
   name: "Tiingo",
   configured: () => !!process.env.TIINGO_API_KEY,
   supports: (ticker) => !ticker.includes("."),
   fetch: (ticker, since) => getTiingoDailyPrices(ticker, since),
+};
+
+/** CoinGecko — crypto only, broad coin coverage. Crypto fallback behind Binance/Tiingo. */
+export const coinGeckoPriceSource: PriceSource = {
+  name: "CoinGecko",
+  configured: () => true,
+  supports: (ticker) => toCoinGeckoId(ticker) !== null,
+  fetch: (ticker, since) => getCoinGeckoDailyPrices(ticker, since),
 };
 
 /** Yahoo chart API — free, keyless, universal (US, crypto, international). */
@@ -41,7 +59,15 @@ export const yahooPriceSource: PriceSource = {
   fetch: (ticker, since) => getYahooDailyPrices(ticker, since),
 };
 
-export const DEFAULT_PRICE_SOURCES: PriceSource[] = [tiingoPriceSource, yahooPriceSource];
+// Order matters: crypto-specialised sources first (Binance best OHLCV), then
+// Tiingo (US equities + crypto), then CoinGecko (crypto fallback), then Yahoo
+// (universal catch-all, incl. international equities).
+export const DEFAULT_PRICE_SOURCES: PriceSource[] = [
+  binancePriceSource,
+  tiingoPriceSource,
+  coinGeckoPriceSource,
+  yahooPriceSource,
+];
 
 /**
  * Fetch daily prices for a ticker, trying each applicable source in order and
