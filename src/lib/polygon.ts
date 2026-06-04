@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 const BASE_URL = "https://api.polygon.io/v2/reference/news";
 
 export type PolygonArticle = {
@@ -24,7 +26,7 @@ export async function getPolygonStockNews(
   url.searchParams.set("order", "desc");
   url.searchParams.set("apiKey", apiKey);
 
-  const res = await fetch(url.toString(), { cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { cache: "no-store" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Polygon error: ${res.status} — ${body}`);

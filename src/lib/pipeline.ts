@@ -4,6 +4,7 @@ import { getEtfProfile } from "@/lib/alphavantage";
 import { getCryptoFearGreed } from "@/lib/crypto-fng";
 import { isEtf } from "@/lib/etf";
 import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
+import { blendSentiment } from "@/lib/sentiment-blend";
 import { getDailyPrices } from "@/lib/price-sources";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
 import { SECTOR_ETF } from "@/lib/sectors";
@@ -305,7 +306,7 @@ export async function runPipeline(): Promise<PipelineResult> {
         },
         orderBy: { publishedAt: "desc" },
         take: 20,
-        select: { headline: true, publishedAt: true, source: true },
+        select: { headline: true, summary: true, publishedAt: true, source: true },
       });
 
       if (recentArticles.length === 0) continue;
@@ -335,23 +336,39 @@ export async function runPipeline(): Promise<PipelineResult> {
 
       const avEntries = avSentimentScores.get(stock.id);
       let avWeightedScore: number | null = null;
+      let avRelevanceTotal = 0;
       if (avEntries && avEntries.length > 0) {
-        const totalWeight = avEntries.reduce((s, e) => s + e.relevance, 0);
-        avWeightedScore = totalWeight > 0
-          ? avEntries.reduce((s, e) => s + e.score * e.relevance, 0) / totalWeight
+        avRelevanceTotal = avEntries.reduce((s, e) => s + e.relevance, 0);
+        avWeightedScore = avRelevanceTotal > 0
+          ? avEntries.reduce((s, e) => s + e.score * e.relevance, 0) / avRelevanceTotal
           : avEntries.reduce((s, e) => s + e.score, 0) / avEntries.length;
       }
 
-      // Blend the LLM score with any available external signals: Alpha Vantage
-      // per-article sentiment (equities) and crypto Fear & Greed (crypto).
+      // Evidence-weighted blend: the LLM signal is weighted by its own confidence
+      // and how many headlines it read; Alpha Vantage by reported relevance; and
+      // crypto Fear & Greed enters only as a small market-wide prior.
       const isCrypto = stock.ticker.endsWith("-USD");
-      const signals = [sentiment.score];
-      if (avWeightedScore != null) signals.push(avWeightedScore);
-      if (isCrypto && cryptoFngScore != null) signals.push(cryptoFngScore);
-      const score = signals.reduce((a, b) => a + b, 0) / signals.length;
+      const score = blendSentiment({
+        llmScore: sentiment.score,
+        llmConfidence: sentiment.confidence,
+        articleCount,
+        avScore: avWeightedScore,
+        avRelevanceTotal,
+        avCount: avEntries?.length ?? 0,
+        fngScore: isCrypto ? cryptoFngScore : null,
+      });
 
       await db.sentiment.create({
-        data: { stockId: stock.id, score, summary: sentiment.summary, articleCount, avgArticleAgeHours },
+        data: {
+          stockId: stock.id,
+          score,
+          summary: sentiment.summary,
+          confidence: sentiment.confidence,
+          keyDriver: sentiment.keyDriver,
+          aspects: sentiment.aspects,
+          articleCount,
+          avgArticleAgeHours,
+        },
       });
 
       result.sentiments++;
@@ -537,7 +554,7 @@ export async function runPipeline(): Promise<PipelineResult> {
       const latestSentiment = await db.sentiment.findFirst({
         where: { stockId: stock.id },
         orderBy: { date: "desc" },
-        select: { score: true },
+        select: { score: true, confidence: true },
       });
 
       if (!latestSentiment) continue;
@@ -567,8 +584,10 @@ export async function runPipeline(): Promise<PipelineResult> {
         ? clamp(sentimentScore * adjSentWeight + quantScore * adjQuantWeight, -1, 1)
         : sentimentScore;
 
-      // Confidence and warnings
-      let confidence = 0.5;
+      // Confidence and warnings. Start from the model's own confidence in its
+      // sentiment read (falling back to a neutral 0.5 for older rows that predate
+      // structured output), then apply structural penalties below.
+      let confidence = latestSentiment.confidence ?? 0.5;
       const warnings: string[] = [];
       if (articleCount < 3) { confidence -= 0.2; warnings.push(`Low article count (${articleCount})`); }
       if (quantScore == null) { confidence -= 0.15; warnings.push("No price data — sentiment only"); }

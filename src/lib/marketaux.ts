@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 const BASE_URL = "https://api.marketaux.com/v1";
 
 export type MarketauxArticle = {
@@ -26,7 +28,7 @@ export async function getMarketauxStockNews(
   url.searchParams.set("language", "en");
   url.searchParams.set("limit", "3"); // free tier cap
 
-  const res = await fetch(url.toString(), { cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { cache: "no-store" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Marketaux error: ${res.status} — ${body}`);

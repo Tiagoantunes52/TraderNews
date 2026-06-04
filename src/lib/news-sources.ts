@@ -55,6 +55,18 @@ function article(partial: Omit<AggregatedArticle, "sentiment"> & { sentiment?: A
   return { sentiment: [], ...partial };
 }
 
+// Per-iteration isolation: adapters fetch per ticker/batch, so one unit failing
+// (after fetchWithRetry's own retries) shouldn't discard the whole provider's
+// coverage for the run. Return whatever was collected; only re-throw when every
+// unit failed and nothing came back, so a genuine outage still surfaces as a
+// provider-level error in aggregateNews.
+export function partialOrThrow(out: AggregatedArticle[], failures: number, lastError: unknown): AggregatedArticle[] {
+  if (out.length === 0 && failures > 0) {
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+  return out;
+}
+
 // ── Adapters ────────────────────────────────────────────────────────────────
 
 /** Finnhub /company-news — US tickers only, ~60 req/min. */
@@ -64,25 +76,32 @@ export const finnhubSource: NewsSource = {
   async fetch(stocks, since) {
     const out: AggregatedArticle[] = [];
     const to = new Date();
+    let failures = 0;
+    let lastError: unknown;
     for (const stock of stocks.filter((s) => isUsTicker(s.ticker))) {
-      const news = await getStockNews(stock.ticker, dateStr(since), dateStr(to));
-      for (const a of news) {
-        if (!a.url || !a.headline) continue;
-        out.push(
-          article({
-            headline: a.headline,
-            summary: a.summary ?? null,
-            url: a.url,
-            source: a.source,
-            publishedAt: new Date(a.datetime * 1000),
-            provider: "Finnhub",
-            stockTickers: [stock.ticker],
-          })
-        );
+      try {
+        const news = await getStockNews(stock.ticker, dateStr(since), dateStr(to));
+        for (const a of news) {
+          if (!a.url || !a.headline) continue;
+          out.push(
+            article({
+              headline: a.headline,
+              summary: a.summary ?? null,
+              url: a.url,
+              source: a.source,
+              publishedAt: new Date(a.datetime * 1000),
+              provider: "Finnhub",
+              stockTickers: [stock.ticker],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(1100);
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 
@@ -94,63 +113,83 @@ export const marketauxSource: NewsSource = {
     const out: AggregatedArticle[] = [];
     const nonUs = stocks.filter((s) => isNonUsTicker(s.ticker));
     const BATCH = 5;
+    let failures = 0;
+    let lastError: unknown;
     for (let i = 0; i < nonUs.length; i += BATCH) {
       const batch = nonUs.slice(i, i + BATCH);
-      const news = await getMarketauxStockNews(batch.map((s) => s.ticker), since);
-      for (const a of news) {
-        if (!a.url || !a.title) continue;
-        const tickers = a.entities
-          .map((e) => batch.find((s) => s.ticker === e.symbol)?.ticker)
-          .filter((t): t is string => !!t);
-        out.push(
-          article({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.url,
-            source: a.source,
-            publishedAt: new Date(a.published_at),
-            provider: "Marketaux",
-            stockTickers: [...new Set(tickers)],
-          })
-        );
+      try {
+        const news = await getMarketauxStockNews(batch.map((s) => s.ticker), since);
+        for (const a of news) {
+          if (!a.url || !a.title) continue;
+          const tickers = a.entities
+            .map((e) => batch.find((s) => s.ticker === e.symbol)?.ticker)
+            .filter((t): t is string => !!t);
+          out.push(
+            article({
+              headline: a.title,
+              summary: a.description ?? null,
+              url: a.url,
+              source: a.source,
+              publishedAt: new Date(a.published_at),
+              provider: "Marketaux",
+              stockTickers: [...new Set(tickers)],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(1000);
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 
-/** Tiingo news — all tickers, batched. */
+/**
+ * Tiingo news — all tickers, batched.
+ * The News API is a separate paid Tiingo add-on (the free/price tier returns 403
+ * "You do not have permission to access the News API"), so it stays OFF unless
+ * TIINGO_NEWS=1 is set — otherwise it 403s every run and clutters the error log.
+ * Tiingo *price* access (a different module) is unaffected by this flag.
+ */
 export const tiingoSource: NewsSource = {
   name: "Tiingo",
-  configured: () => !!process.env.TIINGO_API_KEY,
+  configured: () => !!process.env.TIINGO_API_KEY && process.env.TIINGO_NEWS === "1",
   async fetch(stocks, since) {
     const out: AggregatedArticle[] = [];
     const BATCH = 5;
+    let failures = 0;
+    let lastError: unknown;
     for (let i = 0; i < stocks.length; i += BATCH) {
       const batch = stocks.slice(i, i + BATCH);
       const tickerMap = new Map(batch.map((s) => [toTiingoTicker(s.ticker).toLowerCase(), s]));
-      const news = await getTiingoNews([...tickerMap.keys()], since);
-      for (const a of news) {
-        if (!a.url || !a.title) continue;
-        const tickers = a.tickers
-          .map((t) => tickerMap.get(t.toLowerCase())?.ticker)
-          .filter((t): t is string => !!t);
-        out.push(
-          article({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.url,
-            source: a.source,
-            publishedAt: new Date(a.publishedDate),
-            provider: "Tiingo",
-            stockTickers: [...new Set(tickers)],
-          })
-        );
+      try {
+        const news = await getTiingoNews([...tickerMap.keys()], since);
+        for (const a of news) {
+          if (!a.url || !a.title) continue;
+          const tickers = a.tickers
+            .map((t) => tickerMap.get(t.toLowerCase())?.ticker)
+            .filter((t): t is string => !!t);
+          out.push(
+            article({
+              headline: a.title,
+              summary: a.description ?? null,
+              url: a.url,
+              source: a.source,
+              publishedAt: new Date(a.publishedDate),
+              provider: "Tiingo",
+              stockTickers: [...new Set(tickers)],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(1000);
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 
@@ -160,25 +199,32 @@ export const yahooRssSource: NewsSource = {
   configured: () => true,
   async fetch(stocks) {
     const out: AggregatedArticle[] = [];
+    let failures = 0;
+    let lastError: unknown;
     for (const stock of stocks) {
-      const news = await getYahooRssNews(stock.ticker);
-      for (const a of news) {
-        if (!a.url || !a.title) continue;
-        out.push(
-          article({
-            headline: a.title,
-            summary: a.description,
-            url: a.url,
-            source: "Yahoo Finance",
-            publishedAt: a.publishedAt,
-            provider: "Yahoo RSS",
-            stockTickers: [stock.ticker],
-          })
-        );
+      try {
+        const news = await getYahooRssNews(stock.ticker);
+        for (const a of news) {
+          if (!a.url || !a.title) continue;
+          out.push(
+            article({
+              headline: a.title,
+              summary: a.description,
+              url: a.url,
+              source: "Yahoo Finance",
+              publishedAt: a.publishedAt,
+              provider: "Yahoo RSS",
+              stockTickers: [stock.ticker],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(300);
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 
@@ -188,25 +234,32 @@ export const polygonSource: NewsSource = {
   configured: () => !!process.env.POLYGON_API_KEY,
   async fetch(stocks, since) {
     const out: AggregatedArticle[] = [];
+    let failures = 0;
+    let lastError: unknown;
     for (const stock of stocks.filter((s) => isUsTicker(s.ticker))) {
-      const news = await getPolygonStockNews(stock.ticker, since);
-      for (const a of news) {
-        if (!a.article_url || !a.title) continue;
-        out.push(
-          article({
-            headline: a.title,
-            summary: a.description ?? null,
-            url: a.article_url,
-            source: a.publisher.name,
-            publishedAt: new Date(a.published_utc),
-            provider: "Polygon",
-            stockTickers: [stock.ticker],
-          })
-        );
+      try {
+        const news = await getPolygonStockNews(stock.ticker, since);
+        for (const a of news) {
+          if (!a.article_url || !a.title) continue;
+          out.push(
+            article({
+              headline: a.title,
+              summary: a.description ?? null,
+              url: a.article_url,
+              source: a.publisher.name,
+              publishedAt: new Date(a.published_utc),
+              provider: "Polygon",
+              stockTickers: [stock.ticker],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(12_000); // 5 req/min
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 
@@ -217,39 +270,46 @@ export const alphaVantageSource: NewsSource = {
   async fetch(stocks, since) {
     const out: AggregatedArticle[] = [];
     const BATCH = 5;
+    let failures = 0;
+    let lastError: unknown;
     for (let i = 0; i < stocks.length; i += BATCH) {
       const batch = stocks.slice(i, i + BATCH);
-      const news = await getAlphaVantageNews(batch.map((s) => s.ticker), since);
-      for (const a of news) {
-        if (!a.url || !a.title) continue;
-        const sentiment: ArticleSentiment[] = [];
-        for (const ts of a.ticker_sentiment) {
-          const stock = batch.find((s) => s.ticker === ts.ticker);
-          if (!stock) continue;
-          const score = parseFloat(ts.ticker_sentiment_score);
-          const relevance = parseFloat(ts.relevance_score);
-          sentiment.push({
-            ticker: stock.ticker,
-            score: Number.isNaN(score) ? 0 : score,
-            relevance: Number.isNaN(relevance) ? 0 : relevance,
-          });
+      try {
+        const news = await getAlphaVantageNews(batch.map((s) => s.ticker), since);
+        for (const a of news) {
+          if (!a.url || !a.title) continue;
+          const sentiment: ArticleSentiment[] = [];
+          for (const ts of a.ticker_sentiment) {
+            const stock = batch.find((s) => s.ticker === ts.ticker);
+            if (!stock) continue;
+            const score = parseFloat(ts.ticker_sentiment_score);
+            const relevance = parseFloat(ts.relevance_score);
+            sentiment.push({
+              ticker: stock.ticker,
+              score: Number.isNaN(score) ? 0 : score,
+              relevance: Number.isNaN(relevance) ? 0 : relevance,
+            });
+          }
+          out.push(
+            article({
+              headline: a.title,
+              summary: a.summary || null,
+              url: a.url,
+              source: a.source,
+              publishedAt: parseAlphaVantageDate(a.time_published),
+              provider: "Alpha Vantage",
+              stockTickers: sentiment.map((s) => s.ticker),
+              sentiment,
+            })
+          );
         }
-        out.push(
-          article({
-            headline: a.title,
-            summary: a.summary || null,
-            url: a.url,
-            source: a.source,
-            publishedAt: parseAlphaVantageDate(a.time_published),
-            provider: "Alpha Vantage",
-            stockTickers: sentiment.map((s) => s.ticker),
-            sentiment,
-          })
-        );
+      } catch (e) {
+        failures++;
+        lastError = e;
       }
       await sleep(1000);
     }
-    return out;
+    return partialOrThrow(out, failures, lastError);
   },
 };
 

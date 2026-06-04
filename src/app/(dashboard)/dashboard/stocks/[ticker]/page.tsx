@@ -41,6 +41,11 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
 
   const latest = stock.sentiments[0] ?? null;
   const m = latest ? mood(latest.score) : null;
+  const latestAspects = Object.entries(
+    (latest?.aspects as Record<string, { score: number; weight: number }> | null) ?? {}
+  )
+    .filter(([, a]) => a && typeof a.score === "number")
+    .sort((a, b) => (b[1].weight ?? 0) - (a[1].weight ?? 0));
   const quant = stock.quantAnalyses[0] ?? null;
   const estimate = stock.stockEstimates[0] ?? null;
 
@@ -295,10 +300,42 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       {latest?.summary && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Latest summary</CardTitle>
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-sm">Latest summary</CardTitle>
+              {latest.confidence != null && (
+                <Badge variant="outline" className="text-xs shrink-0">
+                  {Math.round(latest.confidence * 100)}% confidence
+                </Badge>
+              )}
+            </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             <p className="text-sm leading-relaxed text-muted-foreground">{latest.summary}</p>
+            {latest.keyDriver && (
+              <p className="text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">Key driver:</span> {latest.keyDriver}
+              </p>
+            )}
+            {latestAspects.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                {latestAspects.map(([key, a]) => (
+                  <div key={key} className="flex items-center gap-2 text-xs">
+                    <span className="text-muted-foreground w-32 shrink-0 capitalize">
+                      {key.replace(/_/g, " ")}
+                    </span>
+                    <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full ${a.score >= 0 ? "bg-green-500" : "bg-red-500"}`}
+                        style={{ width: `${Math.round(Math.abs(a.score) * 100)}%` }}
+                      />
+                    </div>
+                    <span className={`tabular-nums w-10 text-right ${a.score >= 0 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                      {a.score >= 0 ? "+" : ""}{a.score.toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
       )}

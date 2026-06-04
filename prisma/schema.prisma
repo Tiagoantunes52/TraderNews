@@ -90,6 +90,9 @@ model Sentiment {
   stockId            String
   score              Float
   summary            String?
+  confidence         Float?
+  keyDriver          String?
+  aspects            Json?
   articleCount       Int      @default(0)
   avgArticleAgeHours Float?
   date               DateTime @default(now())

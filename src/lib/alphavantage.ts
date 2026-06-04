@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 const BASE_URL = "https://www.alphavantage.co/query";
 
 export type AlphaVantageTickerSentiment = {
@@ -40,7 +42,7 @@ export async function getAlphaVantageNews(
   url.searchParams.set("limit", "50");
   url.searchParams.set("apikey", apiKey);
 
-  const res = await fetch(url.toString(), { cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { cache: "no-store" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Alpha Vantage error: ${res.status} — ${body}`);
@@ -81,7 +83,7 @@ export async function getEtfProfile(symbol: string): Promise<EtfProfileData | nu
   url.searchParams.set("symbol", symbol);
   url.searchParams.set("apikey", apiKey);
 
-  const res = await fetch(url.toString(), { cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { cache: "no-store" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Alpha Vantage error: ${res.status} — ${body}`);

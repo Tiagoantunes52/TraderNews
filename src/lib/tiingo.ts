@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 const BASE_URL = "https://api.tiingo.com/tiingo/news";
 
 // Tiingo uses concatenated lowercase for crypto: BTC-USD → btcusd, ETH-USD → ethusd
@@ -29,7 +31,7 @@ export async function getTiingoNews(
   url.searchParams.set("startDate", publishedAfter.toISOString().split("T")[0]);
   url.searchParams.set("limit", "100");
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithRetry(url.toString(), {
     headers: { Authorization: `Token ${apiKey}` },
     cache: "no-store",
   });
