@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 export type YahooRssArticle = {
   title: string;
   url: string;
@@ -18,7 +20,7 @@ function extractText(fragment: string, tag: string): string | null {
 
 export async function getYahooRssNews(ticker: string): Promise<YahooRssArticle[]> {
   const url = `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(ticker)}&region=US&lang=en-US`;
-  const res = await fetch(url, { cache: "no-store" });
+  const res = await fetchWithRetry(url, { cache: "no-store" });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Yahoo RSS error: ${res.status} — ${body}`);

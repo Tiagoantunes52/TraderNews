@@ -2,6 +2,8 @@
 // 0–100 crypto sentiment gauge we blend into per-coin sentiment, the same way
 // Alpha Vantage's per-article sentiment is blended for equities.
 
+import { fetchWithRetry } from "@/lib/http";
+
 const FNG_URL = "https://api.alternative.me/fng/";
 
 export type FearGreed = {
@@ -17,7 +19,7 @@ export function fngToScore(value: number): number {
 }
 
 export async function getCryptoFearGreed(): Promise<FearGreed | null> {
-  const res = await fetch(`${FNG_URL}?limit=1`, { cache: "no-store" });
+  const res = await fetchWithRetry(`${FNG_URL}?limit=1`, { cache: "no-store" });
   if (!res.ok) throw new Error(`Fear & Greed error: ${res.status}`);
 
   const data = (await res.json()) as {

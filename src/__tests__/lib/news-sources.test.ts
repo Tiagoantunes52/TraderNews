@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   mergeArticles,
   aggregateNews,
+  partialOrThrow,
   type AggregatedArticle,
   type NewsSource,
   type SourceStock,
@@ -108,5 +109,30 @@ describe("aggregateNews", () => {
     expect(res.articles).toHaveLength(1);
     expect(res.articles[0].stockTickers.sort()).toEqual(["AAPL", "MSFT"]);
     expect(res.fetched).toBe(2); // raw count is pre-merge
+  });
+});
+
+describe("partialOrThrow (per-iteration adapter isolation)", () => {
+  it("returns collected articles when some units succeeded despite failures", () => {
+    const collected = [mk({ url: "https://x.com/1" })];
+    // One ticker flaked but another returned data — keep the partial coverage.
+    expect(partialOrThrow(collected, 1, new Error("flake"))).toBe(collected);
+  });
+
+  it("returns articles when there were no failures at all", () => {
+    const collected = [mk({ url: "https://x.com/1" })];
+    expect(partialOrThrow(collected, 0, undefined)).toBe(collected);
+  });
+
+  it("re-throws when every unit failed and nothing was collected (total outage)", () => {
+    expect(() => partialOrThrow([], 3, new Error("boom"))).toThrow("boom");
+  });
+
+  it("returns an empty array when there were no units and no failures", () => {
+    expect(partialOrThrow([], 0, undefined)).toEqual([]);
+  });
+
+  it("wraps a non-Error thrown value when re-throwing", () => {
+    expect(() => partialOrThrow([], 1, "string failure")).toThrow("string failure");
   });
 });

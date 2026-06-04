@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/http";
+
 const BASE_URL = "https://finnhub.io/api/v1";
 const API_KEY = process.env.FINNHUB_API_KEY!;
 
@@ -18,7 +20,7 @@ async function get<T>(path: string, params: Record<string, string> = {}): Promis
   url.searchParams.set("token", API_KEY);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
-  const res = await fetch(url.toString(), { next: { revalidate: 3600 } });
+  const res = await fetchWithRetry(url.toString(), { next: { revalidate: 3600 } });
   if (!res.ok) throw new Error(`Finnhub error: ${res.status} ${path}`);
   return res.json();
 }
