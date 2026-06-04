@@ -135,7 +135,19 @@ async function saveArticlesWithDedup(
   );
 
   if (toCreate.length > 0) {
-    await db.article.createMany({ data: toCreate, skipDuplicates: true });
+    // Narrow to Article columns only: callers may pass richer objects (e.g.
+    // AggregatedArticle carries provider/stockTickers/sentiment), which Prisma
+    // would reject as unknown arguments.
+    await db.article.createMany({
+      data: toCreate.map((a) => ({
+        headline: a.headline,
+        summary: a.summary,
+        url: a.url,
+        source: a.source,
+        publishedAt: a.publishedAt,
+      })),
+      skipDuplicates: true,
+    });
   }
 
   const created =
