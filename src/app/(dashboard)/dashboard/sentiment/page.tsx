@@ -1,12 +1,28 @@
 import Link from "next/link";
 import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { mood } from "@/lib/mood";
+import { isEtf } from "@/lib/etf";
 import { SentimentSparkline } from "@/components/sentiment-sparkline";
 
 export const metadata = { title: "Sentiment — TraderNews" };
+
+type Category = "Stocks" | "ETFs" | "Crypto";
+
+function categorize(ticker: string, marketName: string): Category {
+  if (ticker.endsWith("-USD") || marketName === "CRYPTO") return "Crypto";
+  if (isEtf(ticker)) return "ETFs";
+  return "Stocks";
+}
+
+const GROUP_ORDER: { category: Category; emoji: string }[] = [
+  { category: "Stocks", emoji: "🏢" },
+  { category: "ETFs", emoji: "📊" },
+  { category: "Crypto", emoji: "₿" },
+];
 
 function formatChartDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
@@ -21,6 +37,7 @@ export default async function SentimentPage() {
     include: {
       stock: {
         include: {
+          market: { select: { name: true } },
           sentiments: { orderBy: { date: "desc" }, take: 30 },
         },
       },
@@ -32,6 +49,7 @@ export default async function SentimentPage() {
       id: stock.id,
       ticker: stock.ticker,
       name: stock.name,
+      category: categorize(stock.ticker, stock.market.name),
       latest: stock.sentiments[0]
         ? {
             score: stock.sentiments[0].score,
@@ -49,6 +67,12 @@ export default async function SentimentPage() {
         })),
     }))
     .sort((a, b) => (b.latest?.score ?? -Infinity) - (a.latest?.score ?? -Infinity));
+
+  const groups = GROUP_ORDER.map(({ category, emoji }) => ({
+    category,
+    emoji,
+    items: stocks.filter((s) => s.category === category),
+  })).filter((g) => g.items.length > 0);
 
   return (
     <div className="space-y-6">
@@ -70,71 +94,94 @@ export default async function SentimentPage() {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {stocks.map((stock) => {
-            const score = stock.latest?.score ?? 0;
-            const m = mood(score);
-            const hasHistory = stock.history.length > 1;
-
-            return (
-              <Card key={stock.id} className="rounded-2xl overflow-hidden border-0 shadow-sm bg-card">
-                <Link
-                  href={`/dashboard/stocks/${stock.ticker}`}
-                  className={`block bg-gradient-to-r ${m.gradient} p-5 hover:brightness-105 transition-all`}
-                >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="text-white/80 text-sm font-medium">{stock.name}</p>
-                      <p className="text-white text-2xl font-bold mt-0.5">{stock.ticker}</p>
-                    </div>
-                    <div className="text-right">
-                      <span className="text-4xl" aria-hidden>{m.emoji}</span>
-                    </div>
-                  </div>
-                  <div className="mt-3 flex items-end justify-between">
-                    <div>
-                      <p className="text-white text-4xl font-bold tabular-nums">{score.toFixed(2)}</p>
-                      <p className="text-white/80 text-sm mt-0.5">{m.label}</p>
-                    </div>
-                    {stock.latest && (
-                      <p className="text-white/70 text-xs">
-                        {formatDistanceToNow(new Date(stock.latest.date))}
-                      </p>
-                    )}
-                  </div>
-                </Link>
-
-                <CardContent className="p-4 space-y-3">
-                  {stock.latest?.summary && (
-                    <p className="text-sm text-muted-foreground leading-relaxed">
-                      {stock.latest.summary}
-                    </p>
-                  )}
-
-                  {hasHistory ? (
-                    <div className="space-y-1">
-                      <SentimentSparkline
-                        data={stock.history}
-                        color={m.chartColor}
-                        gradientId={`grad-${stock.id}`}
-                      />
-                      <div className="flex items-center justify-between text-[10px] text-muted-foreground px-1">
-                        <span>{formatChartDate(stock.history[0].date)}</span>
-                        <span>{stock.history.length} readings</span>
-                        <span>{formatChartDate(stock.history[stock.history.length - 1].date)}</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="text-xs text-muted-foreground text-center py-2">
-                      Run the pipeline again to see trend history
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
-            );
-          })}
+        <div className="space-y-8">
+          {groups.map((group) => (
+            <div key={group.category} className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span aria-hidden>{group.emoji}</span>
+                <h2 className="text-sm font-semibold text-muted-foreground">{group.category}</h2>
+                <Badge variant="outline" className="text-xs">{group.items.length}</Badge>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                {group.items.map((stock) => (
+                  <SentimentCard key={stock.id} stock={stock} />
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+type SentimentCardStock = {
+  id: string;
+  ticker: string;
+  name: string;
+  latest: { score: number; summary: string | null; date: string } | null;
+  history: { date: string; score: number; summary: string | null }[];
+};
+
+function SentimentCard({ stock }: { stock: SentimentCardStock }) {
+  const score = stock.latest?.score ?? 0;
+  const m = mood(score);
+  const hasHistory = stock.history.length > 1;
+
+  return (
+    <Card className="rounded-2xl overflow-hidden border-0 shadow-sm bg-card">
+      <Link
+        href={`/dashboard/stocks/${stock.ticker}`}
+        className={`block bg-gradient-to-r ${m.gradient} p-5 hover:brightness-105 transition-all`}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <p className="text-white/80 text-sm font-medium">{stock.name}</p>
+            <p className="text-white text-2xl font-bold mt-0.5">{stock.ticker}</p>
+          </div>
+          <div className="text-right">
+            <span className="text-4xl" aria-hidden>{m.emoji}</span>
+          </div>
+        </div>
+        <div className="mt-3 flex items-end justify-between">
+          <div>
+            <p className="text-white text-4xl font-bold tabular-nums">{score.toFixed(2)}</p>
+            <p className="text-white/80 text-sm mt-0.5">{m.label}</p>
+          </div>
+          {stock.latest && (
+            <p className="text-white/70 text-xs">
+              {formatDistanceToNow(new Date(stock.latest.date))}
+            </p>
+          )}
+        </div>
+      </Link>
+
+      <CardContent className="p-4 space-y-3">
+        {stock.latest?.summary && (
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            {stock.latest.summary}
+          </p>
+        )}
+
+        {hasHistory ? (
+          <div className="space-y-1">
+            <SentimentSparkline
+              data={stock.history}
+              color={m.chartColor}
+              gradientId={`grad-${stock.id}`}
+            />
+            <div className="flex items-center justify-between text-[10px] text-muted-foreground px-1">
+              <span>{formatChartDate(stock.history[0].date)}</span>
+              <span>{stock.history.length} readings</span>
+              <span>{formatChartDate(stock.history[stock.history.length - 1].date)}</span>
+            </div>
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground text-center py-2">
+            Run the pipeline again to see trend history
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
