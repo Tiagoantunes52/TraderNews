@@ -49,3 +49,36 @@ export async function getEarningsCalendar(from: string, to: string): Promise<Ear
   );
   return data.earningsCalendar ?? [];
 }
+
+// Insider transactions (SEC Form 4). Note: Finnhub does NOT return the insider's
+// role/title — only their name — so CEO/CFO identification needs EDGAR (deferred).
+export type FinnhubInsiderTxn = {
+  name: string;
+  share: number; // shares held after the transaction
+  change: number; // signed share delta (+ acquired, - disposed)
+  filingDate: string; // YYYY-MM-DD
+  transactionDate: string; // YYYY-MM-DD
+  transactionCode: string; // SEC code: P, S, A, M, F, G...
+  transactionPrice: number; // per-share price (0 when N/A, e.g. gifts)
+  isDerivative?: boolean;
+  id?: string; // SEC accession number
+  symbol?: string;
+};
+
+export async function getInsiderTransactions(symbol: string, from: string, to: string): Promise<FinnhubInsiderTxn[]> {
+  const data = await get<{ data: FinnhubInsiderTxn[]; symbol: string }>(
+    "/stock/insider-transactions", { symbol, from, to }
+  );
+  return data.data ?? [];
+}
+
+// Pre-aggregated monthly net-insider flow. `mspr` is Finnhub's monthly share
+// purchase ratio (-100..100): >0 net buying, <0 net selling.
+export type FinnhubInsiderSentiment = { symbol: string; year: number; month: number; change: number; mspr: number };
+
+export async function getInsiderSentiment(symbol: string, from: string, to: string): Promise<FinnhubInsiderSentiment[]> {
+  const data = await get<{ data: FinnhubInsiderSentiment[]; symbol: string }>(
+    "/stock/insider-sentiment", { symbol, from, to }
+  );
+  return data.data ?? [];
+}

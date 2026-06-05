@@ -53,13 +53,15 @@ model Stock {
   name           String
   market         Market          @relation(fields: [marketId], references: [id])
   marketId       String
-  articleStock   ArticleStock[]
-  sentiments     Sentiment[]
-  quantAnalyses  QuantAnalysis[]
-  stockEstimates StockEstimate[]
-  alerts         Alert[]
-  etfProfile     EtfProfile?
-  userStocks     UserStock[]
+  articleStock        ArticleStock[]
+  sentiments          Sentiment[]
+  quantAnalyses       QuantAnalysis[]
+  stockEstimates      StockEstimate[]
+  alerts              Alert[]
+  etfProfile          EtfProfile?
+  insiderTransactions InsiderTransaction[]
+  insiderSummaries    InsiderSummary[]
+  userStocks          UserStock[]
 }
 
 model Article {
@@ -158,7 +160,7 @@ model Alert {
   id        String   @id @default(cuid())
   stock     Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
   stockId   String
-  type      String // SIGNAL_CHANGE | VELOCITY_SPIKE | RSI_EXTREME
+  type      String // SIGNAL_CHANGE | VELOCITY_SPIKE | RSI_EXTREME | INSIDER_CLUSTER_BUY | INSIDER_FLOW_SHIFT
   title     String
   message   String
   value     Float?
@@ -179,6 +181,70 @@ model EtfProfile {
   holdings      Json? // [{ symbol, description, weight }]
   updatedAt     DateTime  @updatedAt
   createdAt     DateTime  @default(now())
+}
+
+// Raw normalized insider transactions (one row per filed Form 4 transaction line).
+// US-equity only; populated from Finnhub /stock/insider-transactions.
+model InsiderTransaction {
+  id              String  @id @default(cuid())
+  stock           Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId         String
+
+  insiderName     String
+  transactionCode String // raw SEC code: P, S, A, M, F, G, C, X...
+  txnType         String // normalized: OPEN_MARKET_BUY | OPEN_MARKET_SELL | GRANT | OPTION_EXERCISE | TAX_WITHHOLDING | GIFT | CONVERSION | OTHER
+  isPlanned       Boolean @default(false) // 10b5-1 (only populated once EDGAR is added)
+  isDerivative    Boolean @default(false)
+
+  shares          Float // signed: + acquired, - disposed
+  price           Float? // per-share transaction price
+  value           Float? // |shares| * price (notional)
+  sharesAfter     Float? // holdings after the transaction
+  pctHoldingsChg  Float? // |shares| / prior holdings, when computable
+
+  transactionDate DateTime
+  filingDate      DateTime
+  accessionId     String? // SEC filing accession number, when provided
+
+  // Stable identity key so overlapping re-fetch windows upsert as no-ops.
+  // Value-inclusive, so distinct lines never collapse; an amendment that restates
+  // shares/price lands as a new row (the summary uses the latest filingDate).
+  dedupKey        String  @unique
+
+  createdAt       DateTime @default(now())
+
+  @@index([stockId, transactionDate])
+  @@index([stockId, filingDate])
+}
+
+// Per-stock, per-day derived rollup — mirrors QuantAnalysis. Detectors read the
+// latest row vs the previous one (transition detection); the page reads history.
+model InsiderSummary {
+  id                 String  @id @default(cuid())
+  stock              Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId            String
+
+  // Trailing 90-day open-market aggregates (noise codes excluded).
+  buyCount90d        Int   @default(0)
+  sellCount90d       Int   @default(0)
+  distinctBuyers90d  Int   @default(0)
+  distinctSellers90d Int   @default(0)
+  netShares90d       Float @default(0) // signed open-market net shares
+  netValue90d        Float @default(0) // signed open-market net notional
+  buyValue90d        Float @default(0)
+  sellValue90d       Float @default(0)
+
+  // 14-day cluster window.
+  distinctBuyers14d  Int   @default(0)
+
+  mspr               Float? // Finnhub monthly share purchase ratio (latest month)
+  convictionScore    Float  @default(0) // combined -1..1
+  signals            Json? // [{ type, detail, value }] fired this run
+
+  date               DateTime @default(now())
+  createdAt          DateTime @default(now())
+
+  @@index([stockId, date])
 }
 
 model UserStock {
