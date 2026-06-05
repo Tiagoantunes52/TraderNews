@@ -14,7 +14,7 @@ import { detectSignalChange, detectVelocitySpike, detectRsiCross, type AlertDraf
 import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 import { processWithBudget } from "@/lib/concurrency";
 import { getInsiderTxns, isInsiderEligible } from "@/lib/insider-sources";
-import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift } from "@/lib/insider-detect";
+import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift, detectCsuiteBuy } from "@/lib/insider-detect";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -826,6 +826,10 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
             data: txns.map((t) => ({
               stockId: stock.id,
               insiderName: t.insiderName,
+              officerTitle: t.officerTitle,
+              isOfficer: t.isOfficer,
+              isDirector: t.isDirector,
+              isTenPctOwner: t.isTenPctOwner,
               transactionCode: t.transactionCode,
               txnType: t.txnType,
               isPlanned: t.isPlanned,
@@ -864,7 +868,7 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
         const prev = await db.insiderSummary.findFirst({
           where: { stockId: stock.id },
           orderBy: { date: "desc" },
-          select: { distinctBuyers14d: true, netValue90d: true },
+          select: { distinctBuyers14d: true, netValue90d: true, csuiteBuyValue14d: true },
         });
 
         await db.insiderSummary.create({
@@ -879,6 +883,7 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
             buyValue90d: summary.buyValue90d,
             sellValue90d: summary.sellValue90d,
             distinctBuyers14d: summary.distinctBuyers14d,
+            csuiteBuyValue14d: summary.csuiteBuyValue14d,
             mspr: summary.mspr,
             convictionScore: summary.convictionScore,
             signals: summary.signals,
@@ -890,6 +895,8 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
         if (clusterAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: clusterAlert });
         const flowAlert = detectInsiderFlowShift(stock.ticker, prev, summary);
         if (flowAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: flowAlert });
+        const csuiteAlert = detectCsuiteBuy(stock.ticker, prev, summary);
+        if (csuiteAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: csuiteAlert });
       } catch (e) {
         errors.push(`Insider failed for ${stock.ticker}: ${String(e)}`);
       }

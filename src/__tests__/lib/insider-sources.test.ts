@@ -2,10 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   normalizeTxnType,
   mapFinnhubTxn,
+  mapEdgarTxn,
   isInsiderEligible,
+  isCsuiteTitle,
   finnhubInsiderSource,
+  edgarInsiderSource,
 } from "@/lib/insider-sources";
 import type { FinnhubInsiderTxn } from "@/lib/finnhub";
+import type { Form4Owner, Form4Transaction } from "@/lib/edgar";
 
 describe("normalizeTxnType", () => {
   it("maps the open-market codes to conviction types", () => {
@@ -89,5 +93,69 @@ describe("finnhubInsiderSource", () => {
   it("is US-equity gated and configured by the Finnhub key", () => {
     expect(finnhubInsiderSource.supports("AAPL")).toBe(true);
     expect(finnhubInsiderSource.supports("BTC-USD")).toBe(false);
+  });
+});
+
+describe("isCsuiteTitle", () => {
+  it("recognizes the C-suite tier across spelled-out and abbreviated forms", () => {
+    expect(isCsuiteTitle("Chief Executive Officer")).toBe(true);
+    expect(isCsuiteTitle("Chief Financial Officer")).toBe(true);
+    expect(isCsuiteTitle("CEO")).toBe(true);
+    expect(isCsuiteTitle("CFO & Director")).toBe(true);
+    expect(isCsuiteTitle("President")).toBe(true);
+    expect(isCsuiteTitle("Chairman of the Board")).toBe(true);
+    expect(isCsuiteTitle("Principal Executive Officer")).toBe(true);
+  });
+
+  it("excludes sub-C-suite officer roles", () => {
+    expect(isCsuiteTitle("Principal Accounting Officer")).toBe(false);
+    expect(isCsuiteTitle("EVP, General Counsel")).toBe(false);
+    expect(isCsuiteTitle("Vice President")).toBe(false);
+    expect(isCsuiteTitle("Senior Vice President, Sales")).toBe(false);
+    expect(isCsuiteTitle(null)).toBe(false);
+    expect(isCsuiteTitle("")).toBe(false);
+  });
+});
+
+describe("mapEdgarTxn", () => {
+  const owner: Form4Owner = {
+    name: "MUSK ELON",
+    isOfficer: true,
+    isDirector: true,
+    isTenPctOwner: false,
+    officerTitle: "Chief Executive Officer",
+  };
+  const buy: Form4Transaction = {
+    transactionDate: "2026-05-20",
+    code: "P",
+    shares: 1000, // unsigned magnitude
+    price: 200,
+    acquired: true,
+    sharesAfter: 50000,
+  };
+
+  it("signs shares by acquired/disposed and carries role data through", () => {
+    const t = mapEdgarTxn("TSLA", owner, true, buy, "2026-05-22");
+    expect(t.txnType).toBe("OPEN_MARKET_BUY");
+    expect(t.shares).toBe(1000); // acquired → positive
+    expect(t.value).toBe(200_000);
+    expect(t.isOfficer).toBe(true);
+    expect(t.officerTitle).toBe("Chief Executive Officer");
+    expect(t.isPlanned).toBe(true);
+    expect(t.pctHoldingsChg).toBeCloseTo(1000 / 49000, 5);
+  });
+
+  it("negates shares on a disposal", () => {
+    const sell: Form4Transaction = { ...buy, code: "S", acquired: false };
+    const t = mapEdgarTxn("TSLA", owner, false, sell, "2026-05-22");
+    expect(t.txnType).toBe("OPEN_MARKET_SELL");
+    expect(t.shares).toBe(-1000);
+  });
+});
+
+describe("edgarInsiderSource", () => {
+  it("is US-equity gated and opt-in via INSIDER_EDGAR", () => {
+    expect(edgarInsiderSource.supports("AAPL")).toBe(true);
+    expect(edgarInsiderSource.supports("BTC-USD")).toBe(false);
   });
 });
