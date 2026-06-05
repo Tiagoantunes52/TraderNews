@@ -2,7 +2,12 @@
 // condition is met, or null otherwise. Side-effect free so they can be unit
 // tested independently of the pipeline and database.
 
-export type AlertType = "SIGNAL_CHANGE" | "VELOCITY_SPIKE" | "RSI_EXTREME";
+export type AlertType =
+  | "SIGNAL_CHANGE"
+  | "VELOCITY_SPIKE"
+  | "RSI_EXTREME"
+  | "INSIDER_CLUSTER_BUY"
+  | "INSIDER_FLOW_SHIFT";
 
 export type AlertDraft = {
   type: AlertType;

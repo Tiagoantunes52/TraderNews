@@ -1,0 +1,49 @@
+name: Insider Pipeline
+
+# Separate from the main news pipeline: Form 4 filings land daily (not intraday),
+# so insider data only needs a once-or-twice-daily refresh on its own schedule.
+on:
+  schedule:
+    - cron: "30 11 * * *"  # daily, 11:30 UTC (after US market open settles)
+  workflow_dispatch:        # manual trigger from the Actions UI
+
+concurrency:
+  group: insider-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run-insider:
+    runs-on: ubuntu-latest
+    environment: Production
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
+      MAX_POLLS: "30"
+      POLL_DELAY: "5"
+    steps:
+      - name: Check secrets are set
+        run: |
+          if [ -z "$APP_URL" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "$PIPELINE_SECRET" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+          echo "APP_URL is set (length: ${#APP_URL})"
+
+      # The insider stage is budget-bounded + resumable: it returns {"done": ...},
+      # processing a slice of US-equity tickers per call. Poll until done.
+      - name: Run insider stage
+        run: |
+          i=0
+          while [ "$i" -lt "$MAX_POLLS" ]; do
+            i=$((i + 1))
+            resp=$(curl -fsS -X POST "$APP_URL/api/pipeline/insider" \
+              -H "x-pipeline-secret: $PIPELINE_SECRET") || {
+                echo "insider: HTTP call failed (poll $i)"; exit 1; }
+            echo "poll $i: $resp"
+            done=$(printf '%s' "$resp" | jq -r '.done // empty')
+            if [ "$done" = "true" ]; then
+              echo "insider stage complete after $i poll(s)"
+              exit 0
+            fi
+            sleep "$POLL_DELAY"
+          done
+          echo "insider stage did not finish within $MAX_POLLS polls"
+          exit 1
