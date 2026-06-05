@@ -35,6 +35,15 @@ function fmtShares(n: number): string {
   return `${sign}${Math.round(abs)}`;
 }
 
+/** Short role tag for an insider, when EDGAR role data is present (Finnhub omits it). */
+function roleLabel(t: { officerTitle: string | null; isOfficer: boolean; isDirector: boolean; isTenPctOwner: boolean }): string | null {
+  if (t.officerTitle) return t.officerTitle;
+  if (t.isOfficer) return "Officer";
+  if (t.isDirector) return "Director";
+  if (t.isTenPctOwner) return "10% owner";
+  return null;
+}
+
 type Signal = { type: string; detail: string; value: number | null };
 
 function parseSignals(raw: unknown): Signal[] {
@@ -45,6 +54,10 @@ function parseSignals(raw: unknown): Signal[] {
 type InsiderTxnView = {
   id: string;
   insiderName: string;
+  officerTitle: string | null;
+  isOfficer: boolean;
+  isDirector: boolean;
+  isTenPctOwner: boolean;
   txnType: string;
   shares: number;
   value: number | null;
@@ -64,6 +77,7 @@ type InsiderRow = {
     distinctBuyers90d: number;
     distinctSellers90d: number;
     distinctBuyers14d: number;
+    csuiteBuyValue14d: number;
     mspr: number | null;
     signals: Signal[];
     date: string;
@@ -103,6 +117,7 @@ export default async function InsiderPage() {
             distinctBuyers90d: s.distinctBuyers90d,
             distinctSellers90d: s.distinctSellers90d,
             distinctBuyers14d: s.distinctBuyers14d,
+            csuiteBuyValue14d: s.csuiteBuyValue14d,
             mspr: s.mspr,
             signals: parseSignals(s.signals),
             date: s.date.toISOString(),
@@ -111,6 +126,10 @@ export default async function InsiderPage() {
       txns: stock.insiderTransactions.map((t) => ({
         id: t.id,
         insiderName: t.insiderName,
+        officerTitle: t.officerTitle,
+        isOfficer: t.isOfficer,
+        isDirector: t.isDirector,
+        isTenPctOwner: t.isTenPctOwner,
         txnType: t.txnType,
         shares: t.shares,
         value: t.value,
@@ -215,11 +234,13 @@ function InsiderCard({ row }: { row: InsiderRow }) {
                   <Badge
                     key={i}
                     className={
-                      sig.type === "CLUSTER_BUY" || sig.type === "LARGE_BUY" || sig.type === "NET_BUYING"
-                        ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-100"
-                        : sig.type === "NET_SELLING"
-                          ? "bg-rose-100 text-rose-800 hover:bg-rose-100"
-                          : ""
+                      sig.type === "CSUITE_BUY"
+                        ? "bg-emerald-600 text-white hover:bg-emerald-600"
+                        : sig.type === "CLUSTER_BUY" || sig.type === "LARGE_BUY" || sig.type === "NET_BUYING"
+                          ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-100"
+                          : sig.type === "NET_SELLING"
+                            ? "bg-rose-100 text-rose-800 hover:bg-rose-100"
+                            : ""
                     }
                   >
                     {sig.detail}
@@ -237,10 +258,12 @@ function InsiderCard({ row }: { row: InsiderRow }) {
                       : t.txnType === "OPEN_MARKET_SELL"
                         ? "text-rose-600"
                         : "text-muted-foreground";
+                  const role = roleLabel(t);
                   return (
                     <div key={t.id} className="flex items-center justify-between text-xs gap-2">
-                      <span className="truncate text-muted-foreground" title={t.insiderName}>
-                        {t.insiderName}
+                      <span className="truncate min-w-0" title={role ? `${t.insiderName} — ${role}` : t.insiderName}>
+                        <span className="text-muted-foreground">{t.insiderName}</span>
+                        {role && <span className="text-muted-foreground/60"> · {role}</span>}
                       </span>
                       <span className="flex items-center gap-2 shrink-0">
                         <span className={`font-medium ${txTone}`}>

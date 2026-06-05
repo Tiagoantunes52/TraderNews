@@ -7,7 +7,8 @@ export type AlertType =
   | "VELOCITY_SPIKE"
   | "RSI_EXTREME"
   | "INSIDER_CLUSTER_BUY"
-  | "INSIDER_FLOW_SHIFT";
+  | "INSIDER_FLOW_SHIFT"
+  | "INSIDER_CSUITE_BUY";
 
 export type AlertDraft = {
   type: AlertType;

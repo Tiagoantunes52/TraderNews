@@ -9,7 +9,7 @@
 // first-ever summary (prev == null) never fires.
 
 import type { AlertDraft } from "@/lib/alerts";
-import type { InsiderTxn } from "@/lib/insider-sources";
+import { isCsuiteTitle, type InsiderTxn } from "@/lib/insider-sources";
 
 // Tunable thresholds — starting points calibrated for liquid US large-caps.
 // Revisit after a few weeks of live alerts; smaller-caps warrant lower floors.
@@ -18,6 +18,7 @@ export const CLUSTER_WINDOW_DAYS = 14;
 export const CLUSTER_BUYERS_THRESHOLD = 3; // distinct open-market buyers in the cluster window
 export const LARGE_HOLDINGS_PCT = 0.25; // a buy that lifts an insider's position ≥25%
 export const FLOW_SHIFT_MIN_VALUE = 50_000; // ignore tiny net-flow sign flips (USD)
+export const CSUITE_BUY_MIN_VALUE = 100_000; // CEO/CFO/COO open-market buys past this fire (USD)
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -34,6 +35,7 @@ export type InsiderSummaryData = {
   buyValue90d: number;
   sellValue90d: number;
   distinctBuyers14d: number;
+  csuiteBuyValue14d: number; // open-market CEO/CFO/COO/Chair buy notional in the cluster window
   mspr: number | null;
   convictionScore: number;
   signals: InsiderSignal[];
@@ -67,9 +69,15 @@ export function summarizeInsider(txns: InsiderTxn[], mspr: number | null, now: D
   const netValue90d = buyValue90d - sellValue90d;
   const netShares90d = in90.reduce((s, t) => s + t.shares, 0);
 
-  const distinctBuyers14d = new Set(
-    open.filter((t) => t.txnType === "OPEN_MARKET_BUY" && t.transactionDate >= since14).map((t) => t.insiderName)
-  ).size;
+  const buys14 = open.filter((t) => t.txnType === "OPEN_MARKET_BUY" && t.transactionDate >= since14);
+  const distinctBuyers14d = new Set(buys14.map((t) => t.insiderName)).size;
+
+  // C-suite conviction: open-market buys (excluding 10b5-1 planned trades) by a
+  // CEO/CFO/COO/Chair. Only the EDGAR source carries roles, so this stays 0 when
+  // running on Finnhub alone — a clean degradation, never a false signal.
+  const csuiteBuyValue14d = buys14
+    .filter((t) => !t.isPlanned && t.isOfficer && isCsuiteTitle(t.officerTitle))
+    .reduce((s, t) => s + (t.value ?? 0), 0);
 
   const total = buyValue90d + sellValue90d;
   let convictionScore = total > 0 ? (buyValue90d - sellValue90d) / total : 0;
@@ -87,6 +95,9 @@ export function summarizeInsider(txns: InsiderTxn[], mspr: number | null, now: D
   if (netValue90d !== 0) {
     signals.push({ type: netValue90d > 0 ? "NET_BUYING" : "NET_SELLING", detail: `net ${fmtUsd(netValue90d)} over 90d`, value: netValue90d });
   }
+  if (csuiteBuyValue14d > 0) {
+    signals.push({ type: "CSUITE_BUY", detail: `C-suite bought ${fmtUsd(csuiteBuyValue14d)} in ${CLUSTER_WINDOW_DAYS}d`, value: csuiteBuyValue14d });
+  }
 
   return {
     buyCount90d: buys90.length,
@@ -98,6 +109,7 @@ export function summarizeInsider(txns: InsiderTxn[], mspr: number | null, now: D
     buyValue90d,
     sellValue90d,
     distinctBuyers14d,
+    csuiteBuyValue14d,
     mspr: mspr ?? null,
     convictionScore,
     signals,
@@ -105,7 +117,7 @@ export function summarizeInsider(txns: InsiderTxn[], mspr: number | null, now: D
 }
 
 /** Fields a detector needs from the previous day's stored summary. */
-export type PrevInsiderSummary = { distinctBuyers14d: number; netValue90d: number };
+export type PrevInsiderSummary = { distinctBuyers14d: number; netValue90d: number; csuiteBuyValue14d: number };
 
 /**
  * Fires when the count of distinct open-market buyers in the cluster window
@@ -153,4 +165,28 @@ export function detectInsiderFlowShift(
     message: `${arrow} Insider 90-day flow for ${ticker} flipped to ${dir} (net ${fmtUsd(curr.netValue90d)}).`,
     value: curr.netValue90d,
   };
+}
+
+/**
+ * Fires when C-suite open-market buying in the cluster window crosses up through
+ * the value floor — a CEO/CFO/COO putting real personal money in is the single
+ * highest-conviction insider signal. Needs EDGAR role data (csuiteBuyValue14d is
+ * 0 on Finnhub), and is transition-only so a standing position doesn't re-email.
+ */
+export function detectCsuiteBuy(
+  ticker: string,
+  prev: PrevInsiderSummary | null,
+  curr: Pick<InsiderSummaryData, "csuiteBuyValue14d">,
+  minValue: number = CSUITE_BUY_MIN_VALUE
+): AlertDraft | null {
+  if (prev == null) return null;
+  if (curr.csuiteBuyValue14d >= minValue && prev.csuiteBuyValue14d < minValue) {
+    return {
+      type: "INSIDER_CSUITE_BUY",
+      title: `${ticker} C-suite buying`,
+      message: `🟢 C-suite insiders bought ${fmtUsd(curr.csuiteBuyValue14d)} of ${ticker} on the open market in the last ${CLUSTER_WINDOW_DAYS} days.`,
+      value: curr.csuiteBuyValue14d,
+    };
+  }
+  return null;
 }
