@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
-import { runPipeline } from "@/lib/pipeline";
+import { runQuantStage } from "@/lib/pipeline";
 import { isPipelineAuthorized } from "@/lib/cron-auth";
 
-// All-in-one run (every stage to completion). Kept for manual/legacy triggers;
-// the scheduled GitHub Actions cron uses the per-stage endpoints so no single
-// invocation runs the whole pipeline within one 300s window.
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
@@ -13,8 +10,7 @@ async function handle(req: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   try {
-    const result = await runPipeline();
-    return NextResponse.json(result);
+    return NextResponse.json(await runQuantStage());
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }

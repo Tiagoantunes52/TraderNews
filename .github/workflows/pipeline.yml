@@ -5,19 +5,59 @@ on:
     - cron: "0 */3 * * *"  # every 3 hours
   workflow_dispatch:       # allow manual trigger from GitHub Actions UI
 
+# Never let two pipeline runs overlap: the stages are idempotent per day, but
+# concurrent runs would waste API budget re-attempting the same stocks.
+concurrency:
+  group: news-pipeline
+  cancel-in-progress: false
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     environment: Production
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
+      # Max polls per stage before giving up (each poll = one ~<=300s HTTP call).
+      MAX_POLLS: "30"
+      POLL_DELAY: "5"
     steps:
       - name: Check secrets are set
         run: |
-          if [ -z "${{ secrets.APP_URL }}" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
-          if [ -z "${{ secrets.PIPELINE_SECRET }}" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+          if [ -z "$APP_URL" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "$PIPELINE_SECRET" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
           echo "APP_URL is set (length: ${#APP_URL})"
-        env:
-          APP_URL: ${{ secrets.APP_URL }}
-      - name: Trigger pipeline
+
+      # Each stage runs as its own serverless invocation (its own 300s budget) and
+      # returns {"done": true|false}. The batched stages process a slice per call
+      # and resume on the next, so we poll until done. Stages run in dependency
+      # order: news -> sentiment -> quant -> estimate.
+      - name: Run pipeline stages
         run: |
-          curl -f -X POST "${{ secrets.APP_URL }}/api/pipeline/run" \
-            -H "x-pipeline-secret: ${{ secrets.PIPELINE_SECRET }}"
+          run_stage() {
+            local stage="$1"
+            echo "::group::Stage: $stage"
+            local i=0
+            while [ "$i" -lt "$MAX_POLLS" ]; do
+              i=$((i + 1))
+              resp=$(curl -fsS -X POST "$APP_URL/api/pipeline/$stage" \
+                -H "x-pipeline-secret: $PIPELINE_SECRET") || {
+                  echo "Stage $stage: HTTP call failed (poll $i)"; echo "::endgroup::"; return 1; }
+              echo "poll $i: $resp"
+              done=$(printf '%s' "$resp" | jq -r '.done // empty')
+              if [ "$done" = "true" ]; then
+                echo "Stage $stage complete after $i poll(s)"
+                echo "::endgroup::"
+                return 0
+              fi
+              sleep "$POLL_DELAY"
+            done
+            echo "Stage $stage did not finish within $MAX_POLLS polls"
+            echo "::endgroup::"
+            return 1
+          }
+
+          run_stage news
+          run_stage sentiment
+          run_stage quant
+          run_stage estimate
