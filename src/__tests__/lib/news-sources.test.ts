@@ -3,6 +3,7 @@ import {
   mergeArticles,
   aggregateNews,
   partialOrThrow,
+  DEFAULT_SOURCES,
   type AggregatedArticle,
   type NewsSource,
   type SourceStock,
@@ -60,6 +61,18 @@ describe("mergeArticles", () => {
       mk({ url: "https://x.com/c", provider: "Yahoo RSS" }),
     ]);
     expect(merged[0].provider).toBe("Yahoo RSS");
+  });
+});
+
+describe("DEFAULT_SOURCES", () => {
+  it("no longer includes Polygon (replaced by Finnhub + Yahoo for US tickers)", () => {
+    expect(DEFAULT_SOURCES.map((s) => s.name)).not.toContain("Polygon");
+  });
+
+  it("still covers Finnhub and Yahoo RSS", () => {
+    const names = DEFAULT_SOURCES.map((s) => s.name);
+    expect(names).toContain("Finnhub");
+    expect(names).toContain("Yahoo RSS");
   });
 });
 

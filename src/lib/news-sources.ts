@@ -12,7 +12,6 @@ import { getMarketauxStockNews } from "@/lib/marketaux";
 import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
 import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
-import { getPolygonStockNews } from "@/lib/polygon";
 import { normalizeUrl } from "@/lib/normalize";
 
 export type SourceStock = { id: string; ticker: string };
@@ -228,40 +227,10 @@ export const yahooRssSource: NewsSource = {
   },
 };
 
-/** Polygon.io — US tickers, free tier 5 req/min. */
-export const polygonSource: NewsSource = {
-  name: "Polygon",
-  configured: () => !!process.env.POLYGON_API_KEY,
-  async fetch(stocks, since) {
-    const out: AggregatedArticle[] = [];
-    let failures = 0;
-    let lastError: unknown;
-    for (const stock of stocks.filter((s) => isUsTicker(s.ticker))) {
-      try {
-        const news = await getPolygonStockNews(stock.ticker, since);
-        for (const a of news) {
-          if (!a.article_url || !a.title) continue;
-          out.push(
-            article({
-              headline: a.title,
-              summary: a.description ?? null,
-              url: a.article_url,
-              source: a.publisher.name,
-              publishedAt: new Date(a.published_utc),
-              provider: "Polygon",
-              stockTickers: [stock.ticker],
-            })
-          );
-        }
-      } catch (e) {
-        failures++;
-        lastError = e;
-      }
-      await sleep(12_000); // 5 req/min
-    }
-    return partialOrThrow(out, failures, lastError);
-  },
-};
+// Polygon.io was removed: its US-ticker news fully overlaps Finnhub + Yahoo RSS
+// (which both cover the same tickers) yet its free tier forces 12s/request pacing
+// (5 req/min), making it the single largest contributor to pipeline wall-time for
+// no unique coverage. Finnhub + Yahoo replace it at a fraction of the cost.
 
 /** Alpha Vantage — all tickers, batched; carries per-ticker sentiment scores. */
 export const alphaVantageSource: NewsSource = {
@@ -318,7 +287,6 @@ export const DEFAULT_SOURCES: NewsSource[] = [
   marketauxSource,
   tiingoSource,
   yahooRssSource,
-  polygonSource,
   alphaVantageSource,
 ];
 
@@ -350,6 +318,11 @@ export function mergeArticles(all: AggregatedArticle[]): AggregatedArticle[] {
 /**
  * Run every configured source over `stocks`, isolating failures, and return the
  * merged article set. Unconfigured sources are recorded as non-fatal skips.
+ *
+ * Sources run concurrently: each adapter paces itself internally against its own
+ * provider's rate limit, so overlapping them makes the stage's wall-time the
+ * slowest single source rather than the sum of all of them. Failures stay
+ * isolated — one source throwing never discards another's results.
  */
 export async function aggregateNews(
   stocks: SourceStock[],
@@ -360,19 +333,27 @@ export async function aggregateNews(
   const perProvider: Record<string, number> = {};
   const errors: string[] = [];
 
-  for (const source of sources) {
-    if (!source.configured()) {
+  const settled = await Promise.allSettled(
+    sources.map((source) => {
+      if (!source.configured()) {
+        return Promise.reject(new SourceSkipped());
+      }
+      return source.fetch(stocks, since);
+    })
+  );
+
+  // allSettled preserves input order, so zip results back to their source.
+  settled.forEach((res, i) => {
+    const source = sources[i];
+    if (res.status === "fulfilled") {
+      perProvider[source.name] = (perProvider[source.name] ?? 0) + res.value.length;
+      collected.push(...res.value);
+    } else if (res.reason instanceof SourceSkipped) {
       errors.push(`${source.name} skipped: not configured`);
-      continue;
+    } else {
+      errors.push(`${source.name} failed: ${String(res.reason)}`);
     }
-    try {
-      const articles = await source.fetch(stocks, since);
-      perProvider[source.name] = (perProvider[source.name] ?? 0) + articles.length;
-      collected.push(...articles);
-    } catch (e) {
-      errors.push(`${source.name} failed: ${String(e)}`);
-    }
-  }
+  });
 
   return {
     articles: mergeArticles(collected),
@@ -381,3 +362,6 @@ export async function aggregateNews(
     errors,
   };
 }
+
+/** Sentinel rejection used to distinguish "not configured" from a real failure. */
+class SourceSkipped extends Error {}

@@ -80,6 +80,10 @@ model ArticleStock {
   stock          Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
   stockId        String
   sentimentScore Float?
+  // Alpha Vantage relevance for this (article, stock) pair. Persisted alongside
+  // the score so the relevance-weighted sentiment blend survives the split
+  // between the news stage (which writes it) and the sentiment stage (which reads it).
+  sentimentRelevance Float?
 
   @@unique([articleId, stockId])
 }
