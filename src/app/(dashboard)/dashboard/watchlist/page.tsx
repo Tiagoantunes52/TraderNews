@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { TrendingUp, TrendingDown, Minus } from "lucide-react";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { getWatchlistLimit } from "@/lib/settings";
 import { isEtf } from "@/lib/etf";
 import { AddStockSearch } from "./add-stock-search";
 import { WatchlistRow } from "./watchlist-row";
@@ -35,6 +36,8 @@ export default async function WatchlistPage() {
   const user = await getOrCreateUser();
   if (!user) return null;
 
+  const limit = await getWatchlistLimit();
+
   const userStocks = await db.userStock.findMany({
     where: { userId: user.id },
     include: {
@@ -50,6 +53,7 @@ export default async function WatchlistPage() {
 
   const watchlist = userStocks.map((us) => us.stock);
   const watchlistIds = watchlist.map((s) => s.id);
+  const atLimit = watchlist.length >= limit;
 
   const groups = GROUP_ORDER.map(({ category, emoji }) => ({
     category,
@@ -60,12 +64,17 @@ export default async function WatchlistPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold">Watchlist</h1>
+        <div className="flex items-center gap-2">
+          <h1 className="text-2xl font-bold">Watchlist</h1>
+          <Badge variant={atLimit ? "destructive" : "secondary"} className="text-xs tabular-nums">
+            {watchlist.length} / {limit}
+          </Badge>
+        </div>
         <p className="text-muted-foreground text-sm mt-1">Track stocks and see their sentiment</p>
       </div>
 
       <div className="max-w-xl">
-        <AddStockSearch existingIds={watchlistIds} />
+        <AddStockSearch existingIds={watchlistIds} atLimit={atLimit} limit={limit} />
       </div>
 
       {watchlist.length === 0 ? (

@@ -11,7 +11,15 @@ import { Search, Plus, Loader2 } from "lucide-react";
 
 type SearchStock = { id: string; ticker: string; name: string };
 
-export function AddStockSearch({ existingIds }: { existingIds: string[] }) {
+export function AddStockSearch({
+  existingIds,
+  atLimit = false,
+  limit,
+}: {
+  existingIds: string[];
+  atLimit?: boolean;
+  limit?: number;
+}) {
   const router = useRouter();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchStock[]>([]);
@@ -41,6 +49,12 @@ export function AddStockSearch({ existingIds }: { existingIds: string[] }) {
   }, [query]);
 
   const addStock = (stock: SearchStock) => {
+    if (atLimit) {
+      toast.error(`Watchlist full${limit ? ` (${limit})` : ""}`, {
+        description: "Remove a stock to add another.",
+      });
+      return;
+    }
     setAddingId(stock.id);
     setOptimisticAdded((prev) => new Set(prev).add(stock.id));
 
@@ -51,7 +65,10 @@ export function AddStockSearch({ existingIds }: { existingIds: string[] }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ stockId: stock.id }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const data = await res.json().catch(() => null);
+          throw new Error(data?.error ?? `HTTP ${res.status}`);
+        }
         toast.success(`Added ${stock.ticker} to watchlist`);
         setQuery("");
         setResults([]);
@@ -84,6 +101,11 @@ export function AddStockSearch({ existingIds }: { existingIds: string[] }) {
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
+      {atLimit && (
+        <p className="text-xs text-muted-foreground mt-1.5">
+          Watchlist full{limit ? ` (${limit})` : ""}. Remove a stock to add another.
+        </p>
+      )}
       {showDropdown && (
         <Card className="absolute z-10 w-full mt-1 shadow-lg">
           <CardContent className="p-1">
@@ -109,7 +131,7 @@ export function AddStockSearch({ existingIds }: { existingIds: string[] }) {
                       size="sm"
                       variant="ghost"
                       onClick={() => addStock(stock)}
-                      disabled={isAdding}
+                      disabled={isAdding || atLimit}
                       aria-label={`Add ${stock.ticker} to watchlist`}
                     >
                       {isAdding ? (
