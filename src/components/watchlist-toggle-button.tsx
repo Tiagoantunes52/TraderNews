@@ -29,7 +29,10 @@ export function WatchlistToggleButton({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ stockId }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const data = await res.json().catch(() => null);
+          throw new Error(data?.error ?? `HTTP ${res.status}`);
+        }
         toast.success(next ? `Added ${ticker} to watchlist` : `Removed ${ticker} from watchlist`);
         router.refresh();
       } catch (err) {

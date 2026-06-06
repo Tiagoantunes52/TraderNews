@@ -2,13 +2,17 @@ import { notFound } from "next/navigation";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
+import { getWatchlistLimit } from "@/lib/settings";
 import { InvitationsManager } from "./invitations-manager";
+import { WatchlistLimitForm } from "./watchlist-limit-form";
 
 export const metadata = { title: "Admin — TraderNews" };
 
 export default async function AdminPage() {
   const user = await getOrCreateUser();
   if (!isAdmin(user)) notFound();
+
+  const watchlistLimit = await getWatchlistLimit();
 
   const invitations = await db.invitation.findMany({
     orderBy: [{ acceptedAt: { sort: "asc", nulls: "first" } }, { createdAt: "desc" }],
@@ -35,6 +39,8 @@ export default async function AdminPage() {
           Invite people to TraderNews. Only invited emails can sign up.
         </p>
       </div>
+
+      <WatchlistLimitForm initialLimit={watchlistLimit} />
 
       <InvitationsManager initialInvitations={serialized} />
     </div>

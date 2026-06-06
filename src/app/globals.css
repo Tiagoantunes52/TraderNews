@@ -128,3 +128,74 @@
     @apply font-sans;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Landing page animations (CSS-only, zero JS dependencies).
+
+   Two patterns:
+   1. .hero-rise  — fires once on initial load (above-the-fold hero content).
+   2. .reveal / .is-visible — scroll-reveal toggled by the <Reveal> client
+      component via IntersectionObserver.
+
+   Both animate only GPU-friendly `transform` + `opacity`. No layout props.
+   Everything is disabled under prefers-reduced-motion (see the bottom block).
+--------------------------------------------------------------------------- */
+
+@keyframes landing-rise {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 16px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* Hero: animate in on load with a small staggered cascade. */
+.hero-rise {
+  opacity: 0;
+  animation: landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.hero-rise-1 {
+  animation-delay: 0.08s;
+}
+.hero-rise-2 {
+  animation-delay: 0.16s;
+}
+.hero-rise-3 {
+  animation-delay: 0.24s;
+}
+.hero-rise-4 {
+  animation-delay: 0.32s;
+}
+
+/* Scroll-reveal: start hidden + offset, transition to visible when JS adds
+   `.is-visible`. transition-delay is set inline by <Reveal> for staggering. */
+.reveal {
+  opacity: 0;
+  transform: translate3d(0, 20px, 0);
+  transition-property: opacity, transform;
+  transition-duration: 0.6s;
+  transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+}
+.reveal.is-visible {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+/* Accessibility: respect the user's motion preference. Content is shown
+   immediately with no entrance animation or transform. */
+@media (prefers-reduced-motion: reduce) {
+  .hero-rise {
+    opacity: 1;
+    animation: none;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+    will-change: auto;
+  }
+}

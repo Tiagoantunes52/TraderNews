@@ -37,6 +37,7 @@ model Invitation {
   createdAt         DateTime  @default(now())
 
   @@index([email])
+  @@index([invitedById])
 }
 
 model Market {
@@ -62,6 +63,8 @@ model Stock {
   insiderTransactions InsiderTransaction[]
   insiderSummaries    InsiderSummary[]
   userStocks          UserStock[]
+
+  @@index([marketId])
 }
 
 model Article {
@@ -88,6 +91,7 @@ model ArticleStock {
   sentimentRelevance Float?
 
   @@unique([articleId, stockId])
+  @@index([stockId])
 }
 
 model Sentiment {
@@ -261,6 +265,7 @@ model UserStock {
   stockId String
 
   @@unique([userId, stockId])
+  @@index([stockId])
 }
 
 model UserMarket {
@@ -271,4 +276,13 @@ model UserMarket {
   marketId String
 
   @@unique([userId, marketId])
+  @@index([marketId])
+}
+
+// Global, app-wide settings as a key/value store (admin-editable at runtime).
+// Currently holds `watchlistLimit`; new singleton settings can reuse this table.
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
 }
