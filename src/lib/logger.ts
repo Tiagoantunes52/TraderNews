@@ -34,6 +34,13 @@ const AXIOM_DATASET = process.env.AXIOM_DATASET;
 const AXIOM_URL = process.env.AXIOM_URL ?? "https://api.axiom.co";
 const AXIOM_ENABLED = Boolean(AXIOM_TOKEN && AXIOM_DATASET);
 
+// Axiom's regional edge domains (e.g. eu-central-1.aws.edge.axiom.co) use a
+// different ingest path (`/v1/ingest/{dataset}`) than the standard API
+// (`/v1/datasets/{dataset}/ingest`). Pick the right one from the host.
+const AXIOM_INGEST_URL = AXIOM_URL.includes(".edge.axiom.co")
+  ? `${AXIOM_URL}/v1/ingest/${encodeURIComponent(AXIOM_DATASET ?? "")}`
+  : `${AXIOM_URL}/v1/datasets/${encodeURIComponent(AXIOM_DATASET ?? "")}/ingest`;
+
 const SERVICE = "tradernews";
 // VERCEL_ENV is "production" | "preview" | "development" on Vercel.
 const ENV = process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "development";
@@ -63,12 +70,16 @@ type LogRecord = {
 const MAX_BUFFER = 100;
 let buffer: LogRecord[] = [];
 let inFlight: Promise<void> | null = null;
+// Surface an Axiom delivery failure to stderr exactly once per instance, so a
+// misconfig (wrong region/dataset/token) is visible in Vercel logs instead of
+// being silently swallowed. Never sent back to Axiom (would loop).
+let axiomWarned = false;
 
 function ship(): Promise<void> {
   if (!AXIOM_ENABLED || buffer.length === 0) return inFlight ?? Promise.resolve();
   const batch = buffer;
   buffer = [];
-  inFlight = fetch(`${AXIOM_URL}/v1/datasets/${AXIOM_DATASET}/ingest`, {
+  inFlight = fetch(AXIOM_INGEST_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${AXIOM_TOKEN}`,
@@ -78,8 +89,20 @@ function ship(): Promise<void> {
     signal: AbortSignal.timeout(5_000),
     keepalive: true, // let the POST finish even as the function winds down
   })
-    .then(() => undefined)
-    .catch(() => undefined); // best-effort: a logging failure must never surface
+    .then(async (res) => {
+      if (!res.ok && !axiomWarned) {
+        axiomWarned = true;
+        const detail = await res.text().catch(() => "");
+        console.warn(`[logger] Axiom ingest failed: HTTP ${res.status} ${detail.slice(0, 200)}`);
+      }
+    })
+    .catch((e) => {
+      // best-effort: a logging failure must never surface to the caller
+      if (!axiomWarned) {
+        axiomWarned = true;
+        console.warn(`[logger] Axiom ingest error: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    });
   return inFlight;
 }
 
