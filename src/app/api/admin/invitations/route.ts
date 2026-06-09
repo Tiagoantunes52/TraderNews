@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { clerkClient } from "@clerk/nextjs/server";
 import { db } from "@/lib/db";
 import { requireAdmin } from "@/lib/auth";
+import { withRoute, reportError } from "@/lib/observability";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -18,7 +19,7 @@ function extractClerkError(err: unknown): string {
   return "Failed to send invitation email";
 }
 
-export async function GET() {
+export const GET = withRoute("admin/invitations", async () => {
   const guard = await requireAdmin();
   if (guard instanceof NextResponse) return guard;
 
@@ -31,9 +32,9 @@ export async function GET() {
   });
 
   return NextResponse.json(invitations);
-}
+});
 
-export async function POST(req: Request) {
+export const POST = withRoute("admin/invitations", async (req: Request) => {
   const guard = await requireAdmin();
   if (guard instanceof NextResponse) return guard;
 
@@ -82,7 +83,7 @@ export async function POST(req: Request) {
   } catch (err) {
     // Clerk errors carry rich detail on `errors[]`; surface it so the admin sees the real reason.
     const detail = extractClerkError(err);
-    console.error("Clerk createInvitation failed", { email, redirectUrl, detail, err });
+    reportError("clerk_create_invitation_failed", err, { email, redirectUrl, detail });
     return NextResponse.json(
       { error: `Clerk invitation failed: ${detail}` },
       { status: 502 }
@@ -94,4 +95,4 @@ export async function POST(req: Request) {
   });
 
   return NextResponse.json(invitation, { status: 201 });
-}
+});

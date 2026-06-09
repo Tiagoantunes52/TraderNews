@@ -1,20 +1,9 @@
-import { NextResponse } from "next/server";
 import { runQuantStage } from "@/lib/pipeline";
-import { isPipelineAuthorized } from "@/lib/cron-auth";
+import { stageRoute } from "@/lib/pipeline-route";
 
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
-async function handle(req: Request) {
-  if (!isPipelineAuthorized(req)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-  try {
-    return NextResponse.json(await runQuantStage());
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 500 });
-  }
-}
-
+const handle = stageRoute("quant", runQuantStage);
 export const GET = handle;
 export const POST = handle;

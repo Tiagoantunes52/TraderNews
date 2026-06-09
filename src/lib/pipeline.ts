@@ -15,6 +15,7 @@ import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 import { processWithBudget } from "@/lib/concurrency";
 import { getInsiderTxns, isInsiderEligible } from "@/lib/insider-sources";
 import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift, detectCsuiteBuy } from "@/lib/insider-detect";
+import { reportError } from "@/lib/observability";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -271,6 +272,7 @@ export async function runNewsStage(): Promise<NewsStageResult> {
     saved += r.saved;
   } catch (e) {
     errors.push(`General news fetch failed: ${String(e)}`);
+    reportError("news_general_fetch_failed", e, { stage: "news" });
   }
 
   // 2. Stock-specific news for watched stocks — one centralised concurrent pass.
@@ -775,6 +777,7 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
     errors.push(...res.errors);
   } catch (e) {
     errors.push(`Alert processing failed: ${String(e)}`);
+    reportError("alert_processing_failed", e, { stage: "estimate" });
   }
 
   return {
@@ -911,6 +914,7 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
     errors.push(...res.errors);
   } catch (e) {
     errors.push(`Alert processing failed: ${String(e)}`);
+    reportError("alert_processing_failed", e, { stage: "insider" });
   }
 
   return {

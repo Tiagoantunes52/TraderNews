@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { withRoute } from "@/lib/observability";
 
-export async function POST(req: Request) {
+export const POST = withRoute("settings/alerts", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -20,4 +21,4 @@ export async function POST(req: Request) {
 
   await db.user.update({ where: { id: user.id }, data: { alertEmails: enabled } });
   return NextResponse.json({ alertEmails: enabled });
-}
+});
