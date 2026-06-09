@@ -11,7 +11,17 @@
 // deliberately does NOT retry 4xx (e.g. 403 permission, 429 rate limit), where
 // retrying is pointless or harmful.
 
+import { logger } from "@/lib/logger";
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function hostOf(input: string | URL): string {
+  try {
+    return new URL(input.toString()).host;
+  } catch {
+    return "unknown";
+  }
+}
 
 export type FetchRetryOptions = {
   timeoutMs?: number;          // per-attempt timeout
@@ -49,6 +59,15 @@ export async function fetchWithRetry(
     } finally {
       clearTimeout(timer);
     }
+    // Reached only when we're about to retry (success returns above; the final
+    // failed attempt throws above). One warn per retry surfaces which upstream
+    // is flapping without waiting for the caller to swallow it into a string.
+    logger.warn("fetch_retry", {
+      host: hostOf(input),
+      attempt,
+      attempts,
+      reason: lastErr instanceof Error ? lastErr.message : String(lastErr),
+    });
     await sleep(retryDelayMs * attempt);
   }
   throw lastErr;

@@ -2,8 +2,9 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { getWatchlistLimit } from "@/lib/settings";
+import { withRoute } from "@/lib/observability";
 
-export async function POST(req: Request) {
+export const POST = withRoute("watchlist", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -43,9 +44,9 @@ export async function POST(req: Request) {
   }
 
   return NextResponse.json({ ok: true });
-}
+});
 
-export async function DELETE(req: Request) {
+export const DELETE = withRoute("watchlist", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -54,4 +55,4 @@ export async function DELETE(req: Request) {
   await db.userStock.deleteMany({ where: { userId: user.id, stockId } });
 
   return NextResponse.json({ ok: true });
-}
+});

@@ -5,8 +5,9 @@ import {
   MIN_WATCHLIST_LIMIT,
   MAX_WATCHLIST_LIMIT,
 } from "@/lib/settings";
+import { withRoute } from "@/lib/observability";
 
-export async function PATCH(req: Request) {
+export const PATCH = withRoute("admin/settings", async (req: Request) => {
   const guard = await requireAdmin();
   if (guard instanceof NextResponse) return guard;
 
@@ -28,4 +29,4 @@ export async function PATCH(req: Request) {
 
   const watchlistLimit = await setWatchlistLimit(value);
   return NextResponse.json({ watchlistLimit });
-}
+});
