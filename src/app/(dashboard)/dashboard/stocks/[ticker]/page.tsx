@@ -8,6 +8,7 @@ import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
 import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
+import { CongressTradeList } from "@/components/congress-trade-list";
 import { mood } from "@/lib/mood";
 import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
 
@@ -23,6 +24,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
       stockEstimates: { orderBy: { date: "desc" }, take: 1 },
       etfProfile: true,
+      congressTrades: { orderBy: { transactionDate: "desc" }, take: 10 },
       articleStock: {
         include: { article: true },
         orderBy: { article: { publishedAt: "desc" } },
@@ -350,6 +352,30 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
           <SentimentHistoryChart data={history} color={m?.chartColor ?? "#64748b"} />
         </CardContent>
       </Card>
+
+      {/* Congress activity — hidden unless this ticker has disclosed trades */}
+      {stock.congressTrades.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Congress activity</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <CongressTradeList
+              trades={stock.congressTrades.map((t) => ({
+                id: t.id,
+                politician: t.politician,
+                party: t.party,
+                state: t.state,
+                txnType: t.txnType,
+                amountRange: t.amountRange,
+                transactionDate: t.transactionDate.toISOString(),
+                disclosureDate: t.disclosureDate.toISOString(),
+                ptrLink: t.ptrLink,
+              }))}
+            />
+          </CardContent>
+        </Card>
+      )}
 
       {/* Recent headlines */}
       <div>

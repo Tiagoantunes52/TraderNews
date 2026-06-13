@@ -13,16 +13,16 @@ enum Role {
 }
 
 model User {
-  id              String        @id @default(cuid())
-  clerkId         String        @unique
-  email           String?       @unique
-  role            Role          @default(USER)
-  alertEmails     Boolean       @default(true)
-  createdAt       DateTime      @default(now())
+  id              String       @id @default(cuid())
+  clerkId         String       @unique
+  email           String?      @unique
+  role            Role         @default(USER)
+  alertEmails     Boolean      @default(true)
+  createdAt       DateTime     @default(now())
   userStocks      UserStock[]
   userMarkets     UserMarket[]
-  invitationsSent Invitation[]  @relation("InvitedBy")
-  invitationUsed  Invitation?   @relation("AcceptedBy")
+  invitationsSent Invitation[] @relation("InvitedBy")
+  invitationUsed  Invitation?  @relation("AcceptedBy")
 }
 
 model Invitation {
@@ -49,11 +49,11 @@ model Market {
 }
 
 model Stock {
-  id             String          @id @default(cuid())
-  ticker         String          @unique
-  name           String
-  market         Market          @relation(fields: [marketId], references: [id])
-  marketId       String
+  id                  String               @id @default(cuid())
+  ticker              String               @unique
+  name                String
+  market              Market               @relation(fields: [marketId], references: [id])
+  marketId            String
   articleStock        ArticleStock[]
   sentiments          Sentiment[]
   quantAnalyses       QuantAnalysis[]
@@ -62,6 +62,7 @@ model Stock {
   etfProfile          EtfProfile?
   insiderTransactions InsiderTransaction[]
   insiderSummaries    InsiderSummary[]
+  congressTrades      CongressTrade[]
   userStocks          UserStock[]
 
   @@index([marketId])
@@ -79,12 +80,12 @@ model Article {
 }
 
 model ArticleStock {
-  id             String  @id @default(cuid())
-  article        Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
-  articleId      String
-  stock          Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId        String
-  sentimentScore Float?
+  id                 String  @id @default(cuid())
+  article            Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  articleId          String
+  stock              Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId            String
+  sentimentScore     Float?
   // Alpha Vantage relevance for this (article, stock) pair. Persisted alongside
   // the score so the relevance-weighted sentiment blend survives the split
   // between the news stage (which writes it) and the sentiment stage (which reads it).
@@ -112,21 +113,21 @@ model Sentiment {
 }
 
 model QuantAnalysis {
-  id             String   @id @default(cuid())
-  stock          Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId        String
-  price          Float?
-  change1d       Float?
-  change7d       Float?
-  change30d      Float?
-  rsi14          Float?
-  sma20          Float?
-  sma50          Float?
-  volatility30d  Float?
-  volumeRatio10d Float?
-  macdHistogram  Float?
-  priceVs60dHigh Float?
-  priceVs60dLow  Float?
+  id                  String    @id @default(cuid())
+  stock               Stock     @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId             String
+  price               Float?
+  change1d            Float?
+  change7d            Float?
+  change30d           Float?
+  rsi14               Float?
+  sma20               Float?
+  sma50               Float?
+  volatility30d       Float?
+  volumeRatio10d      Float?
+  macdHistogram       Float?
+  priceVs60dHigh      Float?
+  priceVs60dLow       Float?
   relativeStr7d       Float?
   bollingerWidth      Float?
   bollingerPctB       Float?
@@ -136,8 +137,8 @@ model QuantAnalysis {
   daysToEarnings      Int?
   relativeStrSector7d Float?
   score               Float
-  date                DateTime @default(now())
-  createdAt           DateTime @default(now())
+  date                DateTime  @default(now())
+  createdAt           DateTime  @default(now())
 
   @@index([stockId, date])
 }
@@ -190,9 +191,9 @@ model EtfProfile {
 // Raw normalized insider transactions (one row per filed Form 4 transaction line).
 // US-equity only; populated from Finnhub /stock/insider-transactions.
 model InsiderTransaction {
-  id              String  @id @default(cuid())
-  stock           Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId         String
+  id      String @id @default(cuid())
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
 
   insiderName     String
   // Insider role/relationship — only populated by the EDGAR source (Finnhub omits it).
@@ -205,11 +206,11 @@ model InsiderTransaction {
   isPlanned       Boolean @default(false) // 10b5-1 (from EDGAR aff10b5One)
   isDerivative    Boolean @default(false)
 
-  shares          Float // signed: + acquired, - disposed
-  price           Float? // per-share transaction price
-  value           Float? // |shares| * price (notional)
-  sharesAfter     Float? // holdings after the transaction
-  pctHoldingsChg  Float? // |shares| / prior holdings, when computable
+  shares         Float // signed: + acquired, - disposed
+  price          Float? // per-share transaction price
+  value          Float? // |shares| * price (notional)
+  sharesAfter    Float? // holdings after the transaction
+  pctHoldingsChg Float? // |shares| / prior holdings, when computable
 
   transactionDate DateTime
   filingDate      DateTime
@@ -218,9 +219,9 @@ model InsiderTransaction {
   // Stable identity key so overlapping re-fetch windows upsert as no-ops.
   // Value-inclusive, so distinct lines never collapse; an amendment that restates
   // shares/price lands as a new row (the summary uses the latest filingDate).
-  dedupKey        String  @unique
+  dedupKey String @unique
 
-  createdAt       DateTime @default(now())
+  createdAt DateTime @default(now())
 
   @@index([stockId, transactionDate])
   @@index([stockId, filingDate])
@@ -229,9 +230,9 @@ model InsiderTransaction {
 // Per-stock, per-day derived rollup — mirrors QuantAnalysis. Detectors read the
 // latest row vs the previous one (transition detection); the page reads history.
 model InsiderSummary {
-  id                 String  @id @default(cuid())
-  stock              Stock   @relation(fields: [stockId], references: [id], onDelete: Cascade)
-  stockId            String
+  id      String @id @default(cuid())
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
 
   // Trailing 90-day open-market aggregates (noise codes excluded).
   buyCount90d        Int   @default(0)
@@ -244,17 +245,43 @@ model InsiderSummary {
   sellValue90d       Float @default(0)
 
   // 14-day cluster window.
-  distinctBuyers14d  Int   @default(0)
-  csuiteBuyValue14d  Float @default(0) // open-market CEO/CFO/COO/Chair buys (EDGAR roles)
+  distinctBuyers14d Int   @default(0)
+  csuiteBuyValue14d Float @default(0) // open-market CEO/CFO/COO/Chair buys (EDGAR roles)
 
-  mspr               Float? // Finnhub monthly share purchase ratio (latest month)
-  convictionScore    Float  @default(0) // combined -1..1
-  signals            Json? // [{ type, detail, value }] fired this run
+  mspr            Float? // Finnhub monthly share purchase ratio (latest month)
+  convictionScore Float  @default(0) // combined -1..1
+  signals         Json? // [{ type, detail, value }] fired this run
 
-  date               DateTime @default(now())
-  createdAt          DateTime @default(now())
+  date      DateTime @default(now())
+  createdAt DateTime @default(now())
 
   @@index([stockId, date])
+}
+
+// US congressional trading (STOCK Act disclosures), sourced from the AInvest
+// developer API (per-ticker, /ownership/congress). Engagement feature, not a fast
+// signal — the STOCK Act permits up to a 45-day disclosure lag, so rows are
+// ingested daily on the insider workflow. Only watched tickers are persisted.
+// AInvest reports party + state (not chamber); owner/ptrLink are kept nullable
+// for a future richer source and stay null today.
+model CongressTrade {
+  id              String   @id @default(cuid())
+  stock           Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId         String
+  politician      String
+  party           String? // Democrat | Republican | Independent (AInvest `party`)
+  state           String? // US state abbreviation (AInvest `state`)
+  owner           String? // self | spouse | joint | child — not supplied by AInvest
+  txnType         String // PURCHASE | SALE | EXCHANGE | OTHER
+  amountRange     String // verbatim range string, e.g. "$100K-$250K"
+  transactionDate DateTime
+  disclosureDate  DateTime
+  ptrLink         String? // disclosure link; persisted only if http(s) — not supplied by AInvest
+  // Value-inclusive identity key so overlapping re-fetch windows upsert as no-ops.
+  dedupKey        String   @unique
+  createdAt       DateTime @default(now())
+
+  @@index([stockId, transactionDate])
 }
 
 model UserStock {
