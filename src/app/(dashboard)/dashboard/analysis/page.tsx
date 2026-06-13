@@ -4,6 +4,7 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { mood } from "@/lib/mood";
+import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
 
 export const metadata = { title: "Analysis — TraderNews" };
 export const dynamic = "force-dynamic";
@@ -46,13 +47,14 @@ function ScoreBar({ label, score, color }: { label: string; score: number; color
 }
 
 function RsiBadge({ rsi }: { rsi: number }) {
-  if (rsi < 30)
+  const signal = classifyRsi(rsi);
+  if (signal === "bullish") // oversold
     return (
       <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">
         Oversold
       </span>
     );
-  if (rsi > 70)
+  if (signal === "bearish") // overbought
     return (
       <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">
         Overbought
@@ -179,7 +181,7 @@ export default async function AnalysisPage() {
                           {q.price > q.sma20 ? "↑" : "↓"} SMA20
                         </span>
                       )}
-                      {q.bollingerWidth != null && q.bollingerWidth < 0.05 && (
+                      {isBollingerSqueeze(q.bollingerWidth) && (
                         <span className="px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
                           BB squeeze
                         </span>

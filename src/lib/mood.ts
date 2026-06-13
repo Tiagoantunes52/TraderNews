@@ -1,3 +1,5 @@
+import { THRESHOLDS, classifySentiment } from "@/lib/signals";
+
 export type Mood = {
   emoji: string;
   label: string;
@@ -6,8 +8,13 @@ export type Mood = {
   text: string;
 };
 
+// "Very bullish/bearish" extends the shared bull/bear boundary outward; the inner
+// boundary is THRESHOLDS.sentimentBull so the emoji label flips at the same score
+// the heatmap and moodBucket() do.
+const VERY = 0.6;
+
 export function mood(score: number): Mood {
-  if (score > 0.6)
+  if (score > VERY)
     return {
       emoji: "🚀",
       label: "Very Bullish",
@@ -15,7 +22,7 @@ export function mood(score: number): Mood {
       chartColor: "#22c55e",
       text: "text-emerald-600 dark:text-emerald-400",
     };
-  if (score > 0.2)
+  if (score > THRESHOLDS.sentimentBull)
     return {
       emoji: "📈",
       label: "Bullish",
@@ -23,7 +30,7 @@ export function mood(score: number): Mood {
       chartColor: "#4ade80",
       text: "text-green-600 dark:text-green-400",
     };
-  if (score > -0.2)
+  if (score > -THRESHOLDS.sentimentBull)
     return {
       emoji: "😐",
       label: "Neutral",
@@ -31,7 +38,7 @@ export function mood(score: number): Mood {
       chartColor: "#64748b",
       text: "text-slate-500 dark:text-slate-400",
     };
-  if (score > -0.6)
+  if (score > -VERY)
     return {
       emoji: "📉",
       label: "Bearish",
@@ -50,9 +57,17 @@ export function mood(score: number): Mood {
 
 export type MoodBucket = "bull" | "bear" | "neutral" | "none";
 
+// Thin wrapper over the shared classifier so the news filter and the heatmap can
+// never disagree on what counts as bullish.
 export function moodBucket(score: number | undefined | null): MoodBucket {
-  if (score === undefined || score === null) return "none";
-  if (score > 0.2) return "bull";
-  if (score < -0.2) return "bear";
-  return "neutral";
+  switch (classifySentiment(score)) {
+    case "bullish":
+      return "bull";
+    case "bearish":
+      return "bear";
+    case "neutral":
+      return "neutral";
+    default:
+      return "none";
+  }
 }

@@ -9,6 +9,7 @@ import { formatDistanceToNow } from "@/lib/format-date";
 import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
 import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
 import { mood } from "@/lib/mood";
+import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
 
 export default async function StockDetailPage({ params }: PageProps<"/dashboard/stocks/[ticker]">) {
   const { ticker } = await params;
@@ -148,10 +149,10 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
             {quant?.rsi14 != null && (
               <div className="flex items-center gap-3 text-sm flex-wrap">
                 <span className="text-muted-foreground">RSI {quant.rsi14.toFixed(0)}</span>
-                {quant.rsi14 < 30 && (
+                {classifyRsi(quant.rsi14) === "bullish" && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</span>
                 )}
-                {quant.rsi14 > 70 && (
+                {classifyRsi(quant.rsi14) === "bearish" && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</span>
                 )}
                 {quant.sma20 != null && quant.price != null && (
@@ -169,7 +170,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                     %B {(quant.bollingerPctB * 100).toFixed(0)}
                   </span>
                 )}
-                {quant.bollingerWidth != null && quant.bollingerWidth < 0.05 && (
+                {isBollingerSqueeze(quant.bollingerWidth) && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
                     BB squeeze
                   </span>

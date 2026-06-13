@@ -8,20 +8,37 @@ import { sectorForTicker } from "@/lib/sectors";
 import { pearson } from "@/lib/stats";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { SentimentSparkline, type SparklinePoint } from "@/components/sentiment-sparkline";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  THRESHOLDS,
+  SIGNAL_HINTS,
+  classifySentiment,
+  classifyRsi,
+  classifyMacd,
+  classifyMomentum,
+  type Signal,
+} from "@/lib/signals";
 
 export const metadata = { title: "Portfolio — TraderNews" };
 export const dynamic = "force-dynamic";
 
 const HISTORY = 60; // records pulled per stock for history-based views
-const CONCENTRATION_THRESHOLD = 0.4; // flag a sector above 40% of watchlist
 
-type Cell = "bullish" | "bearish" | "neutral" | null;
+// Signal agreement columns. Labels are local (presentation); the bullish/bearish
+// explanations come from SIGNAL_HINTS so the copy stays tied to the actual
+// thresholds the cells are classified with.
+const SIGNAL_COLUMNS = [
+  { key: "sentiment", label: "Sentiment", hint: SIGNAL_HINTS.sentiment },
+  { key: "rsi", label: "RSI", hint: SIGNAL_HINTS.rsi },
+  { key: "macd", label: "MACD", hint: SIGNAL_HINTS.macd },
+  { key: "momentum", label: "Momentum", hint: SIGNAL_HINTS.momentum },
+] as const;
 
 function dayStr(d: Date): string {
   return d.toISOString().split("T")[0];
 }
 
-function cellClass(c: Cell): string {
+function cellClass(c: Signal): string {
   switch (c) {
     case "bullish":
       return "bg-green-500/80 text-white";
@@ -114,10 +131,10 @@ export default async function PortfolioPage() {
       const q = s.latestQuant;
       const sentScore = s.estimate?.sentimentScore ?? s.latestSentiment?.score ?? null;
       const cells = {
-        sentiment: signFromScore(sentScore, 0.1),
-        rsi: rsiCell(q?.rsi14 ?? null),
-        macd: signFromScore(q?.macdHistogram ?? null, 0),
-        momentum: signFromScore(q?.change7d ?? null, 0.5),
+        sentiment: classifySentiment(sentScore),
+        rsi: classifyRsi(q?.rsi14),
+        macd: classifyMacd(q?.macdHistogram, q?.price),
+        momentum: classifyMomentum(q?.change7d),
       };
       const vals = Object.values(cells);
       const bull = vals.filter((c) => c === "bullish").length;
@@ -144,7 +161,7 @@ export default async function PortfolioPage() {
       pct: total > 0 ? tickers.length / total : 0,
     }))
     .sort((a, b) => b.count - a.count);
-  const overweight = sectors.filter((s) => s.pct > CONCENTRATION_THRESHOLD);
+  const overweight = sectors.filter((s) => s.pct > THRESHOLDS.sectorConcentration);
 
   // ── View 4: Sentiment-vs-price correlation ─────────────────────────────
   const correlations = stocks
@@ -286,13 +303,13 @@ export default async function PortfolioPage() {
                   <p className="text-amber-800 dark:text-amber-300">
                     {overweight.map((s) => `${s.name} is ${Math.round(s.pct * 100)}%`).join(", ")} of
                     your watchlist — consider diversifying (threshold{" "}
-                    {Math.round(CONCENTRATION_THRESHOLD * 100)}%).
+                    {Math.round(THRESHOLDS.sectorConcentration * 100)}%).
                   </p>
                 </div>
               )}
               <div className="space-y-2">
                 {sectors.map((s) => {
-                  const over = s.pct > CONCENTRATION_THRESHOLD;
+                  const over = s.pct > THRESHOLDS.sectorConcentration;
                   return (
                     <div key={s.name} className="flex items-center gap-2 text-xs">
                       <span className="w-40 shrink-0 truncate" title={s.tickers.join(", ")}>
@@ -333,10 +350,16 @@ export default async function PortfolioPage() {
                     <thead>
                       <tr className="text-muted-foreground">
                         <th className="text-left font-medium px-1">Stock</th>
-                        <th className="font-medium px-1">Sentiment</th>
-                        <th className="font-medium px-1">RSI</th>
-                        <th className="font-medium px-1">MACD</th>
-                        <th className="font-medium px-1">Momentum</th>
+                        {SIGNAL_COLUMNS.map((col) => (
+                          <th key={col.key} className="font-medium px-1">
+                            <Tooltip>
+                              <TooltipTrigger className="cursor-help underline decoration-dotted decoration-muted-foreground/50 underline-offset-2">
+                                {col.label}
+                              </TooltipTrigger>
+                              <TooltipContent className="text-balance">{col.hint}</TooltipContent>
+                            </Tooltip>
+                          </th>
+                        ))}
                       </tr>
                     </thead>
                     <tbody>
@@ -350,14 +373,14 @@ export default async function PortfolioPage() {
                               {r.ticker}
                             </Link>
                           </td>
-                          {(["sentiment", "rsi", "macd", "momentum"] as const).map((k) => (
-                            <td key={k} className="px-0.5">
+                          {SIGNAL_COLUMNS.map((col) => (
+                            <td key={col.key} className="px-0.5">
                               <div
                                 className={`h-7 rounded-md flex items-center justify-center font-medium ${cellClass(
-                                  r.cells[k]
+                                  r.cells[col.key]
                                 )}`}
                               >
-                                {cellGlyph(r.cells[k])}
+                                {cellGlyph(r.cells[col.key])}
                               </div>
                             </td>
                           ))}
@@ -451,21 +474,7 @@ function weightedSentiment(entries: { score: number; weight: number }[]): number
   return entries.reduce((a, e) => a + e.score * e.weight, 0) / totalW;
 }
 
-function signFromScore(v: number | null | undefined, threshold: number): Cell {
-  if (v == null) return null;
-  if (v > threshold) return "bullish";
-  if (v < -threshold) return "bearish";
-  return "neutral";
-}
-
-function rsiCell(rsi: number | null): Cell {
-  if (rsi == null) return null;
-  if (rsi < 30) return "bullish"; // oversold → mean-reversion upside
-  if (rsi > 70) return "bearish"; // overbought
-  return "neutral";
-}
-
-function cellGlyph(c: Cell): string {
+function cellGlyph(c: Signal): string {
   switch (c) {
     case "bullish":
       return "▲";
