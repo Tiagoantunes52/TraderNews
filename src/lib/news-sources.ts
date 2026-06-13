@@ -12,9 +12,12 @@ import { getMarketauxStockNews } from "@/lib/marketaux";
 import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
 import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
+import { getGoogleNews } from "@/lib/google-news";
 import { normalizeUrl } from "@/lib/normalize";
 
-export type SourceStock = { id: string; ticker: string };
+// `name` (company name) is needed by name-keyed sources like Google News; it's
+// optional so ticker-only callers/tests keep working.
+export type SourceStock = { id: string; ticker: string; name?: string };
 
 export type ArticleSentiment = { ticker: string; score: number; relevance: number };
 
@@ -227,6 +230,47 @@ export const yahooRssSource: NewsSource = {
   },
 };
 
+/**
+ * Google News RSS — local-language coverage for non-US (European) tickers,
+ * keyed by company name in the exchange's locale. Keyless. This is the main
+ * coverage source for Euronext / XETRA / BME / etc. names that the US-centric
+ * providers and Yahoo RSS miss. US tickers are intentionally skipped (already
+ * well covered) to keep request volume down and avoid noisy name collisions.
+ */
+export const googleNewsSource: NewsSource = {
+  name: "Google News",
+  configured: () => true,
+  async fetch(stocks, since) {
+    const out: AggregatedArticle[] = [];
+    let failures = 0;
+    let lastError: unknown;
+    const targets = stocks.filter((s) => isNonUsTicker(s.ticker) && s.name);
+    for (const stock of targets) {
+      try {
+        const news = await getGoogleNews(stock.name!, stock.ticker, since);
+        for (const a of news) {
+          out.push(
+            article({
+              headline: a.title,
+              summary: null,
+              url: a.url,
+              source: a.source,
+              publishedAt: a.publishedAt,
+              provider: "Google News",
+              stockTickers: [stock.ticker],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
+      }
+      await sleep(400);
+    }
+    return partialOrThrow(out, failures, lastError);
+  },
+};
+
 // Polygon.io was removed: its US-ticker news fully overlaps Finnhub + Yahoo RSS
 // (which both cover the same tickers) yet its free tier forces 12s/request pacing
 // (5 req/min), making it the single largest contributor to pipeline wall-time for
@@ -288,6 +332,7 @@ export const DEFAULT_SOURCES: NewsSource[] = [
   tiingoSource,
   yahooRssSource,
   alphaVantageSource,
+  googleNewsSource,
 ];
 
 // ── Merge ─────────────────────────────────────────────────────────────────

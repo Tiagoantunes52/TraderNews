@@ -277,7 +277,7 @@ export async function runNewsStage(): Promise<NewsStageResult> {
 
   // 2. Stock-specific news for watched stocks — one centralised concurrent pass.
   const stocks = await db.stock.findMany({
-    select: { id: true, ticker: true },
+    select: { id: true, ticker: true, name: true },
     where: watchedStocksWhere(),
   });
 
