@@ -5,6 +5,7 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { isInsiderEligible } from "@/lib/insider-sources";
+import { CongressTradeList, type CongressTradeView } from "@/components/congress-trade-list";
 
 export const metadata = { title: "Insider Trades — TraderNews" };
 
@@ -143,6 +144,27 @@ export default async function InsiderPage() {
     .sort((a, b) => (b.summary?.convictionScore ?? -2) - (a.summary?.convictionScore ?? -2));
   const uncovered = rows.filter((r) => !r.eligible);
 
+  // Most recent congressional disclosures across the whole watchlist (any ticker,
+  // incl. ETFs/class shares that insider data skips). Each row links to its stock.
+  const congressTrades = await db.congressTrade.findMany({
+    where: { stock: { userStocks: { some: { userId: user.id } } } },
+    orderBy: { transactionDate: "desc" },
+    take: 8,
+    include: { stock: { select: { ticker: true } } },
+  });
+  const congressViews: CongressTradeView[] = congressTrades.map((t) => ({
+    id: t.id,
+    ticker: t.stock.ticker,
+    politician: t.politician,
+    party: t.party,
+    state: t.state,
+    txnType: t.txnType,
+    amountRange: t.amountRange,
+    transactionDate: t.transactionDate.toISOString(),
+    disclosureDate: t.disclosureDate.toISOString(),
+    ptrLink: t.ptrLink,
+  }));
+
   return (
     <div className="space-y-6">
       <div>
@@ -168,6 +190,20 @@ export default async function InsiderPage() {
             <InsiderCard key={row.id} row={row} />
           ))}
         </div>
+      )}
+
+      {congressViews.length > 0 && (
+        <Card className="rounded-2xl">
+          <CardContent className="py-4 space-y-3">
+            <div>
+              <p className="text-sm font-medium">Congress activity</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Recent STOCK Act disclosures across your watchlist
+              </p>
+            </div>
+            <CongressTradeList trades={congressViews} />
+          </CardContent>
+        </Card>
       )}
 
       {uncovered.length > 0 && (

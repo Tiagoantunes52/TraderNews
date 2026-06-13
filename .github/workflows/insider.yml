@@ -50,3 +50,29 @@ jobs:
           done
           echo "insider stage did not finish within $MAX_POLLS polls"
           exit 1
+
+      # Congress (STOCK Act) disclosures share this daily cadence — the 45-day
+      # disclosure lag means more-frequent runs would gain nothing — and reuse the
+      # same secrets, concurrency group and run id. The stage returns {"done": true}
+      # immediately, so the poll loop exits on the first iteration. Note: if the
+      # insider step above fails, this step is skipped (steps are sequential and we
+      # don't set `if: always()`); that's acceptable — both retry on the next run.
+      - name: Run congress stage
+        run: |
+          i=0
+          while [ "$i" -lt "$MAX_POLLS" ]; do
+            i=$((i + 1))
+            resp=$(curl -fsS -X POST "$APP_URL/api/pipeline/congress" \
+              -H "x-pipeline-secret: $PIPELINE_SECRET" \
+              -H "x-pipeline-run-id: $RUN_ID") || {
+                echo "congress: HTTP call failed (poll $i)"; exit 1; }
+            echo "poll $i: $resp"
+            done=$(printf '%s' "$resp" | jq -r '.done // empty')
+            if [ "$done" = "true" ]; then
+              echo "congress stage complete after $i poll(s)"
+              exit 0
+            fi
+            sleep "$POLL_DELAY"
+          done
+          echo "congress stage did not finish within $MAX_POLLS polls"
+          exit 1

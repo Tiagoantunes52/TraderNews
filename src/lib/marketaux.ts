@@ -25,7 +25,8 @@ export async function getMarketauxStockNews(
   url.searchParams.set("filter_entities", "true");
   // Marketaux expects YYYY-MM-DDTHH:mm format (no seconds, no Z)
   url.searchParams.set("published_after", publishedAfter.toISOString().slice(0, 16));
-  url.searchParams.set("language", "en");
+  // No `language` filter: this source handles non-US tickers, whose news is
+  // mostly local-language (PT/FR/DE/…). Pinning English dropped most EU coverage.
   url.searchParams.set("limit", "3"); // free tier cap
 
   const res = await fetchWithRetry(url.toString(), { cache: "no-store" });

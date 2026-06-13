@@ -8,7 +8,9 @@ import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
 import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
+import { CongressTradeList } from "@/components/congress-trade-list";
 import { mood } from "@/lib/mood";
+import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
 
 export default async function StockDetailPage({ params }: PageProps<"/dashboard/stocks/[ticker]">) {
   const { ticker } = await params;
@@ -22,6 +24,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
       stockEstimates: { orderBy: { date: "desc" }, take: 1 },
       etfProfile: true,
+      congressTrades: { orderBy: { transactionDate: "desc" }, take: 10 },
       articleStock: {
         include: { article: true },
         orderBy: { article: { publishedAt: "desc" } },
@@ -148,10 +151,10 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
             {quant?.rsi14 != null && (
               <div className="flex items-center gap-3 text-sm flex-wrap">
                 <span className="text-muted-foreground">RSI {quant.rsi14.toFixed(0)}</span>
-                {quant.rsi14 < 30 && (
+                {classifyRsi(quant.rsi14) === "bullish" && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</span>
                 )}
-                {quant.rsi14 > 70 && (
+                {classifyRsi(quant.rsi14) === "bearish" && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</span>
                 )}
                 {quant.sma20 != null && quant.price != null && (
@@ -169,7 +172,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                     %B {(quant.bollingerPctB * 100).toFixed(0)}
                   </span>
                 )}
-                {quant.bollingerWidth != null && quant.bollingerWidth < 0.05 && (
+                {isBollingerSqueeze(quant.bollingerWidth) && (
                   <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
                     BB squeeze
                   </span>
@@ -349,6 +352,30 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
           <SentimentHistoryChart data={history} color={m?.chartColor ?? "#64748b"} />
         </CardContent>
       </Card>
+
+      {/* Congress activity — hidden unless this ticker has disclosed trades */}
+      {stock.congressTrades.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Congress activity</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <CongressTradeList
+              trades={stock.congressTrades.map((t) => ({
+                id: t.id,
+                politician: t.politician,
+                party: t.party,
+                state: t.state,
+                txnType: t.txnType,
+                amountRange: t.amountRange,
+                transactionDate: t.transactionDate.toISOString(),
+                disclosureDate: t.disclosureDate.toISOString(),
+                ptrLink: t.ptrLink,
+              }))}
+            />
+          </CardContent>
+        </Card>
+      )}
 
       {/* Recent headlines */}
       <div>
