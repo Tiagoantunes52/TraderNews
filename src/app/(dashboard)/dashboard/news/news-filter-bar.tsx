@@ -4,9 +4,8 @@ import { useState, useEffect, useTransition } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Search, X, Loader2 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 const TIME_OPTIONS = [
   { value: "all", label: "All time" },
@@ -112,33 +111,23 @@ export function NewsFilterBar({ tickers }: { tickers: string[] }) {
       {tickers.length > 0 && (
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-medium text-muted-foreground shrink-0">Ticker</span>
-          <button
-            type="button"
-            onClick={() => updateParam("ticker", "all")}
-            className={cn(
-              "transition-colors",
-              currentTicker === "all" ? "" : "opacity-50 hover:opacity-100"
-            )}
+          <ToggleGroup
+            type="single"
+            value={currentTicker}
+            onValueChange={(v) => updateParam("ticker", v || "all")}
+            variant="outline"
+            size="sm"
+            className="flex-wrap"
           >
-            <Badge variant={currentTicker === "all" ? "default" : "outline"} className="cursor-pointer">
+            <ToggleGroupItem value="all" className="text-xs">
               All
-            </Badge>
-          </button>
-          {tickers.map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => updateParam("ticker", t)}
-              className={cn(
-                "transition-colors",
-                currentTicker === t ? "" : "opacity-60 hover:opacity-100"
-              )}
-            >
-              <Badge variant={currentTicker === t ? "default" : "outline"} className="cursor-pointer">
+            </ToggleGroupItem>
+            {tickers.map((t) => (
+              <ToggleGroupItem key={t} value={t} className="text-xs">
                 {t}
-              </Badge>
-            </button>
-          ))}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
         </div>
       )}
 
@@ -165,21 +154,20 @@ function ChipGroup<T extends string>({
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
       <span className="text-xs font-medium text-muted-foreground shrink-0">{label}</span>
-      {options.map((opt) => (
-        <button
-          key={opt.value}
-          type="button"
-          onClick={() => onChange(opt.value)}
-          className={cn(
-            "text-xs px-2.5 py-1 rounded-full border transition-colors",
-            value === opt.value
-              ? "bg-primary text-primary-foreground border-primary"
-              : "bg-transparent text-muted-foreground border-border hover:bg-muted"
-          )}
-        >
-          {opt.label}
-        </button>
-      ))}
+      <ToggleGroup
+        type="single"
+        value={value}
+        onValueChange={(v) => v && onChange(v as T)}
+        variant="outline"
+        size="sm"
+        className="flex-wrap"
+      >
+        {options.map((opt) => (
+          <ToggleGroupItem key={opt.value} value={opt.value} className="text-xs">
+            {opt.label}
+          </ToggleGroupItem>
+        ))}
+      </ToggleGroup>
     </div>
   );
 }

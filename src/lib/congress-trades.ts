@@ -10,10 +10,42 @@
 // kept on the row shape (always null) so a richer source can populate them later.
 
 import { fetchWithRetry } from "@/lib/http";
+import { marketNamesForTicker } from "@/lib/market-utils";
 
 const AINVEST_BASE_URL = process.env.AINVEST_BASE_URL || "https://openapi.ainvest.com/open";
 const PAGE_SIZE = 50;
 const MAX_PAGES = 10; // safety bound — 500 most-recent disclosures per ticker is ample
+
+// Free-tier pacing. AInvest throttles aggressively (status 4014), so requests run
+// serially (concurrency 1 in the stage) with a fixed gap between them, plus a few
+// backoff retries when we do get throttled. The 45-day disclosure lag makes the
+// added latency irrelevant. All env-tunable; 0 disables the wait (used in tests).
+const REQUEST_SPACING_MS = Number(process.env.CONGRESS_REQUEST_SPACING_MS ?? 1000);
+const RATE_LIMIT_BACKOFF_MS = Number(process.env.CONGRESS_RATE_LIMIT_BACKOFF_MS ?? 1000);
+const RATE_LIMIT_RETRIES = 4;
+
+// AInvest envelope status codes we special-case.
+const AINVEST_OK = 0;
+const AINVEST_UNKNOWN_TICKER = 4012; // non-US / unlisted symbol — a clean skip, not an error
+const AINVEST_RATE_LIMITED = 4014; // free-tier frequency cap — retryable with backoff
+
+// US exchanges in the app's market taxonomy (see market-utils). AInvest covers
+// US-listed securities only.
+const US_MARKETS = new Set(["NYSE", "NASDAQ"]);
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Carries the AInvest envelope status_code so the caller can tell a benign
+ *  unknown-ticker skip apart from a real failure. */
+class AinvestError extends Error {
+  constructor(
+    public code: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "AinvestError";
+  }
+}
 
 /** Normalized transaction side. AInvest only distinguishes buy/sell; EXCHANGE/OTHER
  *  are reserved so a richer source (full/partial sale, exchange) maps in cleanly. */
@@ -54,10 +86,16 @@ export function isCongressConfigured(): boolean {
   return !!process.env.AINVEST_API_KEY;
 }
 
-/** Congress trades US-listed securities including ETFs and class shares (SPY, BRK.B),
- *  so — unlike insider data — ETFs are NOT excluded. Crypto has no congress data. */
+/**
+ * AInvest is keyed by US ticker symbol and only knows US-listed securities, so
+ * querying a foreign listing just returns 4012 "unknown ticker" and burns the
+ * free-tier rate budget. Gate on the app's market mapping: US class shares like
+ * BRK.B stay in (they resolve to NYSE/NASDAQ), while foreign exchanges (.L/.PA/
+ * .MI/...) and crypto are skipped. This is a source-coverage filter, not a legal
+ * one — the STOCK Act itself requires disclosing foreign-stock and crypto trades.
+ */
 export function isCongressEligible(ticker: string): boolean {
-  return !ticker.endsWith("-USD");
+  return marketNamesForTicker(ticker).some((m) => US_MARKETS.has(m));
 }
 
 /** Map AInvest's coarse side (tolerating a few richer synonyms) to our taxonomy. */
@@ -151,16 +189,25 @@ async function fetchPage(ticker: string, page: number, apiKey: string): Promise<
   url.searchParams.set("page", String(page));
   url.searchParams.set("size", String(PAGE_SIZE));
 
-  const res = await fetchWithRetry(
-    url,
-    { headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" } },
-    { timeoutMs: 30_000 }
-  );
-  if (!res.ok) throw new Error(`AInvest HTTP ${res.status}`);
+  // fetchWithRetry covers transport/5xx; AInvest's rate limit is a 200 with a 4014
+  // body, so we retry that here with exponential backoff.
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetchWithRetry(
+      url,
+      { headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" } },
+      { timeoutMs: 30_000 }
+    );
+    if (!res.ok) throw new Error(`AInvest HTTP ${res.status}`);
 
-  const body = (await res.json()) as AinvestEnvelope;
-  if (body.status_code !== 0) throw new Error(`AInvest status ${body.status_code}: ${body.status_msg ?? "error"}`);
-  return rowsOf(body);
+    const body = (await res.json()) as AinvestEnvelope;
+    if (body.status_code === AINVEST_OK) return rowsOf(body);
+
+    if (body.status_code === AINVEST_RATE_LIMITED && attempt < RATE_LIMIT_RETRIES) {
+      await sleep(RATE_LIMIT_BACKOFF_MS * 2 ** attempt);
+      continue;
+    }
+    throw new AinvestError(body.status_code ?? -1, `AInvest status ${body.status_code}: ${body.status_msg ?? "error"}`);
+  }
 }
 
 function dedupe(rows: CongressTradeRow[]): CongressTradeRow[] {
@@ -185,6 +232,7 @@ export async function getCongressTrades(
   const out: CongressTradeRow[] = [];
   try {
     for (let page = 1; page <= MAX_PAGES; page++) {
+      if (REQUEST_SPACING_MS > 0) await sleep(REQUEST_SPACING_MS); // pace under the free-tier cap
       const rows = await fetchPage(ticker, page, apiKey);
       if (rows.length === 0) break;
 
@@ -201,6 +249,11 @@ export async function getCongressTrades(
       if (rows.length < PAGE_SIZE || !anyInWindow) break;
     }
   } catch (e) {
+    // An unknown ticker (a listing AInvest doesn't cover) is a clean skip, not an
+    // error — keeps the stage's errors array signal-only.
+    if (e instanceof AinvestError && e.code === AINVEST_UNKNOWN_TICKER) {
+      return { trades: dedupe(out), error: null };
+    }
     return { trades: dedupe(out), error: `Congress fetch failed for ${ticker}: ${String(e)}` };
   }
   return { trades: dedupe(out), error: null };

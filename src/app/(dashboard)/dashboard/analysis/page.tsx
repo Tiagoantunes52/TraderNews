@@ -1,5 +1,7 @@
 import Link from "next/link";
 import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
@@ -13,16 +15,17 @@ function ChangePill({ value, label }: { value: number | null | undefined; label:
   if (value == null) return null;
   const pos = value >= 0;
   return (
-    <span
-      className={`text-xs px-1.5 py-0.5 rounded-full font-medium tabular-nums ${
+    <Badge
+      className={cn(
+        "font-medium tabular-nums",
         pos
           ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400"
           : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
-      }`}
+      )}
     >
       {pos ? "+" : ""}
       {value.toFixed(1)}% {label}
-    </span>
+    </Badge>
   );
 }
 
@@ -50,21 +53,13 @@ function RsiBadge({ rsi }: { rsi: number }) {
   const signal = classifyRsi(rsi);
   if (signal === "bullish") // oversold
     return (
-      <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">
-        Oversold
-      </span>
+      <Badge className="bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</Badge>
     );
   if (signal === "bearish") // overbought
     return (
-      <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">
-        Overbought
-      </span>
+      <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</Badge>
     );
-  return (
-    <span className="text-xs px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
-      Neutral
-    </span>
-  );
+  return <Badge variant="secondary">Neutral</Badge>;
 }
 
 export default async function AnalysisPage() {
@@ -182,17 +177,15 @@ export default async function AnalysisPage() {
                         </span>
                       )}
                       {isBollingerSqueeze(q.bollingerWidth) && (
-                        <span className="px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
-                          BB squeeze
-                        </span>
+                        <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">BB squeeze</Badge>
                       )}
                       {q.atrPct != null && (
                         <span>{q.atrPct.toFixed(1)}% ATR</span>
                       )}
                       {q.daysToEarnings != null && q.daysToEarnings <= 7 && (
-                        <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                        <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
                           Earnings in {q.daysToEarnings}d
-                        </span>
+                        </Badge>
                       )}
                     </div>
                   )}

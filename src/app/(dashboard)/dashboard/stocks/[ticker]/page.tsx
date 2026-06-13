@@ -152,10 +152,10 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
               <div className="flex items-center gap-3 text-sm flex-wrap">
                 <span className="text-muted-foreground">RSI {quant.rsi14.toFixed(0)}</span>
                 {classifyRsi(quant.rsi14) === "bullish" && (
-                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</span>
+                  <Badge className="bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</Badge>
                 )}
                 {classifyRsi(quant.rsi14) === "bearish" && (
-                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</span>
+                  <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</Badge>
                 )}
                 {quant.sma20 != null && quant.price != null && (
                   <span className={`text-xs ${quant.price > quant.sma20 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
@@ -173,9 +173,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   </span>
                 )}
                 {isBollingerSqueeze(quant.bollingerWidth) && (
-                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">
-                    BB squeeze
-                  </span>
+                  <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">BB squeeze</Badge>
                 )}
                 {quant.atrPct != null && (
                   <span className="text-xs text-muted-foreground">
@@ -183,9 +181,9 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   </span>
                 )}
                 {quant.daysToEarnings != null && quant.daysToEarnings <= 7 && (
-                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                  <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
                     Earnings in {quant.daysToEarnings}d
-                  </span>
+                  </Badge>
                 )}
               </div>
             )}
@@ -357,7 +355,15 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
       {stock.congressTrades.length > 0 && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Congress activity</CardTitle>
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-sm">Congress activity</CardTitle>
+              <Badge variant="secondary" className="text-xs">
+                {stock.congressTrades.length} disclosure{stock.congressTrades.length === 1 ? "" : "s"}
+              </Badge>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              US lawmakers&apos; reported trades in {stock.ticker} (STOCK Act)
+            </p>
           </CardHeader>
           <CardContent>
             <CongressTradeList

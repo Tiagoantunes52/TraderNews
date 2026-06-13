@@ -34,9 +34,10 @@ const ESTIMATE_CONCURRENCY = Number(process.env.PIPELINE_ESTIMATE_CONCURRENCY) |
 const INSIDER_CONCURRENCY = Number(process.env.PIPELINE_INSIDER_CONCURRENCY) || 2;
 const INSIDER_BACKFILL_DAYS = Number(process.env.INSIDER_BACKFILL_DAYS) || 90;
 // Congress disclosures lag the trade by up to 45 days (STOCK Act), so a wide
-// trailing window keeps newly-disclosed older trades in view. AInvest is one
-// lightweight call per ticker; modest concurrency stays under its free-tier rate.
-const CONGRESS_CONCURRENCY = Number(process.env.PIPELINE_CONGRESS_CONCURRENCY) || 3;
+// trailing window keeps newly-disclosed older trades in view. AInvest's free tier
+// throttles hard (status 4014), so the stage runs serially (concurrency 1) and the
+// source paces + backs off per request; the 45-day lag makes the latency a non-issue.
+const CONGRESS_CONCURRENCY = Number(process.env.PIPELINE_CONGRESS_CONCURRENCY) || 1;
 const CONGRESS_BACKFILL_DAYS = Number(process.env.CONGRESS_BACKFILL_DAYS) || 180;
 
 export type PipelineResult = {

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { RefreshCw, LogOut, CheckCircle, XCircle, Loader2, ShieldCheck, Bell, BellOff } from "lucide-react";
 
 type PipelineStatus = "idle" | "running" | "success" | "error";
@@ -193,9 +194,15 @@ export function SettingsClient({ isAdmin, alertEmails }: { isAdmin: boolean; ale
               <span className="font-medium">Alert emails</span>
               <span className="text-muted-foreground">{alertsOn ? "On" : "Off"}</span>
             </div>
-            <Button variant={alertsOn ? "outline" : "default"} size="sm" onClick={toggleAlerts} disabled={alertsSaving}>
-              {alertsSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : alertsOn ? "Turn off" : "Turn on"}
-            </Button>
+            <div className="flex items-center gap-2">
+              {alertsSaving && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+              <Switch
+                checked={alertsOn}
+                onCheckedChange={toggleAlerts}
+                disabled={alertsSaving}
+                aria-label="Toggle alert emails"
+              />
+            </div>
           </div>
         </CardContent>
       </Card>

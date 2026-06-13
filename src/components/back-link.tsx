@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 export function BackLink({ fallbackHref = "/dashboard", label = "Back" }: { fallbackHref?: string; label?: string }) {
   const router = useRouter();
@@ -15,12 +16,12 @@ export function BackLink({ fallbackHref = "/dashboard", label = "Back" }: { fall
   };
 
   return (
-    <button
-      type="button"
+    <Button
+      variant="link"
       onClick={onClick}
-      className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
+      className="h-auto gap-1 p-0 text-sm text-muted-foreground hover:text-foreground"
     >
       <ArrowLeft className="h-4 w-4" /> {label}
-    </button>
+    </Button>
   );
 }
