@@ -2,6 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { track } from "@vercel/analytics/react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Check, Loader2 } from "lucide-react";
@@ -37,6 +38,7 @@ export function MarketToggleCard({
           body: JSON.stringify({ marketId }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        track(next ? "market_follow" : "market_unfollow", { market: name });
         toast.success(next ? `Following ${name}` : `Unfollowed ${name}`);
         router.refresh();
       } catch (err) {

@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+// Zero out the source's pacing + rate-limit backoff so retries are instant in tests
+// (hoisted above the import so the module reads these at load time).
+vi.hoisted(() => {
+  process.env.CONGRESS_REQUEST_SPACING_MS = "0";
+  process.env.CONGRESS_RATE_LIMIT_BACKOFF_MS = "0";
+});
+
 // Control the HTTP layer so we can drive AInvest's paginated envelope directly
 // (the issue calls for vi.mock("@/lib/http")).
 vi.mock("@/lib/http", () => ({ fetchWithRetry: vi.fn() }));
@@ -54,11 +61,13 @@ describe("normalizeCongressTxnType", () => {
 });
 
 describe("isCongressEligible", () => {
-  it("allows US equities, ETFs and class shares but not crypto", () => {
+  it("allows US equities, ETFs and class shares but not foreign listings or crypto", () => {
     expect(isCongressEligible("AAPL")).toBe(true);
-    expect(isCongressEligible("SPY")).toBe(true); // ETFs DO get traded by Congress
-    expect(isCongressEligible("BRK.B")).toBe(true); // class share
-    expect(isCongressEligible("BTC-USD")).toBe(false); // no congress data for crypto
+    expect(isCongressEligible("SPY")).toBe(true); // ETF, US-listed
+    expect(isCongressEligible("BRK.B")).toBe(true); // US class share — resolves to NYSE/NASDAQ
+    expect(isCongressEligible("BTC-USD")).toBe(false); // crypto
+    expect(isCongressEligible("EGL.LS")).toBe(false); // Euronext Lisbon — AInvest won't know it
+    expect(isCongressEligible("BA.L")).toBe(false); // LSE
   });
 });
 
@@ -192,9 +201,26 @@ describe("getCongressTrades", () => {
     expect(error).toContain("Congress fetch failed for AAPL");
   });
 
-  it("treats a non-zero AInvest status_code as a failure", async () => {
+  it("treats an unknown-ticker (4012) as a clean skip, not an error", async () => {
     mockFetch.mockResolvedValueOnce(page([], 4012));
+    const { trades, error } = await getCongressTrades("AAPL", new Date("2026-01-01"));
+    expect(trades).toEqual([]);
+    expect(error).toBeNull();
+    expect(mockFetch).toHaveBeenCalledTimes(1); // unknown ticker is not retried
+  });
+
+  it("retries on a 4014 rate limit and then succeeds", async () => {
+    mockFetch.mockResolvedValueOnce(page([], 4014)).mockResolvedValueOnce(page([RAW]));
+    const { trades, error } = await getCongressTrades("AAPL", new Date("2026-01-01"));
+    expect(error).toBeNull();
+    expect(trades).toHaveLength(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up with an error after exhausting 4014 retries", async () => {
+    mockFetch.mockResolvedValue(page([], 4014));
     const { error } = await getCongressTrades("AAPL", new Date("2026-01-01"));
-    expect(error).toContain("AInvest status 4012");
+    expect(error).toContain("AInvest status 4014");
+    expect(mockFetch).toHaveBeenCalledTimes(5); // 1 initial + RATE_LIMIT_RETRIES (4)
   });
 });

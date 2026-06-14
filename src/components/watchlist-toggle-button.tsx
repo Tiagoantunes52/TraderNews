@@ -2,6 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { track } from "@vercel/analytics/react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Star, Loader2, Check } from "lucide-react";
@@ -33,6 +34,7 @@ export function WatchlistToggleButton({
           const data = await res.json().catch(() => null);
           throw new Error(data?.error ?? `HTTP ${res.status}`);
         }
+        track(next ? "watchlist_add" : "watchlist_remove", { ticker });
         toast.success(next ? `Added ${ticker} to watchlist` : `Removed ${ticker} from watchlist`);
         router.refresh();
       } catch (err) {
