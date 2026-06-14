@@ -11,6 +11,7 @@ import { getStockNews } from "@/lib/finnhub";
 import { getMarketauxStockNews } from "@/lib/marketaux";
 import { getAlphaVantageNews, parseAlphaVantageDate } from "@/lib/alphavantage";
 import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
+import { getAlpacaNews } from "@/lib/alpaca";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getGoogleNews } from "@/lib/google-news";
 import { normalizeUrl } from "@/lib/normalize";
@@ -195,6 +196,53 @@ export const tiingoSource: NewsSource = {
   },
 };
 
+/**
+ * Alpaca News (Benzinga-sourced) — US equities only, free on the Basic plan.
+ * Articles arrive already symbol-tagged, so tickers are read straight off each
+ * article's `symbols` (intersected with the batched watchlist) — no headline
+ * matching. Supplements Finnhub/Yahoo for US names; international stays on the
+ * other sources. Alpaca accepts many symbols per request, so this batches wide.
+ */
+export const alpacaSource: NewsSource = {
+  name: "Alpaca",
+  configured: () => !!process.env.ALPACA_API_KEY_ID && !!process.env.ALPACA_API_SECRET_KEY,
+  async fetch(stocks, since) {
+    const out: AggregatedArticle[] = [];
+    const us = stocks.filter((s) => isUsTicker(s.ticker));
+    const BATCH = 10;
+    let failures = 0;
+    let lastError: unknown;
+    for (let i = 0; i < us.length; i += BATCH) {
+      const batch = us.slice(i, i + BATCH);
+      const watched = new Map(batch.map((s) => [s.ticker, s]));
+      try {
+        const news = await getAlpacaNews([...watched.keys()], since);
+        for (const a of news) {
+          if (!a.url || !a.headline) continue;
+          const tickers = a.symbols.filter((sym) => watched.has(sym));
+          if (tickers.length === 0) continue; // tagged only with unwatched symbols
+          out.push(
+            article({
+              headline: a.headline,
+              summary: a.summary || null,
+              url: a.url,
+              source: a.source ? a.source[0].toUpperCase() + a.source.slice(1) : "Benzinga",
+              publishedAt: new Date(a.created_at),
+              provider: "Alpaca",
+              stockTickers: [...new Set(tickers)],
+            })
+          );
+        }
+      } catch (e) {
+        failures++;
+        lastError = e;
+      }
+      await sleep(350);
+    }
+    return partialOrThrow(out, failures, lastError);
+  },
+};
+
 /** Yahoo Finance RSS — free, keyless, any ticker globally. */
 export const yahooRssSource: NewsSource = {
   name: "Yahoo RSS",
@@ -330,6 +378,7 @@ export const DEFAULT_SOURCES: NewsSource[] = [
   finnhubSource,
   marketauxSource,
   tiingoSource,
+  alpacaSource,
   yahooRssSource,
   alphaVantageSource,
   googleNewsSource,

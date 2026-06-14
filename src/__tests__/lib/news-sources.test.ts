@@ -1,13 +1,22 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// Only the Alpaca adapter's transport is mocked; the synthetic sources used by
+// the other suites don't touch the low-level modules.
+vi.mock("@/lib/alpaca", () => ({ getAlpacaNews: vi.fn() }));
+
+import { getAlpacaNews } from "@/lib/alpaca";
 import {
   mergeArticles,
   aggregateNews,
   partialOrThrow,
+  alpacaSource,
   DEFAULT_SOURCES,
   type AggregatedArticle,
   type NewsSource,
   type SourceStock,
 } from "@/lib/news-sources";
+
+const mockAlpaca = vi.mocked(getAlpacaNews);
 
 function mk(partial: Partial<AggregatedArticle> & { url: string }): AggregatedArticle {
   return {
@@ -73,6 +82,71 @@ describe("DEFAULT_SOURCES", () => {
     const names = DEFAULT_SOURCES.map((s) => s.name);
     expect(names).toContain("Finnhub");
     expect(names).toContain("Yahoo RSS");
+  });
+
+  it("includes the Alpaca source", () => {
+    expect(DEFAULT_SOURCES.map((s) => s.name)).toContain("Alpaca");
+  });
+});
+
+describe("alpacaSource adapter", () => {
+  const ALPACA_RAW = {
+    id: 1,
+    headline: "Apple climbs",
+    author: "A",
+    created_at: "2026-06-01T12:00:00Z",
+    updated_at: "2026-06-01T12:00:00Z",
+    summary: "Up on earnings.",
+    url: "https://example.com/aapl",
+    symbols: ["AAPL", "SPY"],
+    source: "benzinga",
+  };
+
+  beforeEach(() => {
+    process.env.ALPACA_API_KEY_ID = "id";
+    process.env.ALPACA_API_SECRET_KEY = "secret";
+    mockAlpaca.mockReset();
+  });
+
+  it("is configured only when both credentials are present", () => {
+    expect(alpacaSource.configured()).toBe(true);
+    delete process.env.ALPACA_API_SECRET_KEY;
+    expect(alpacaSource.configured()).toBe(false);
+  });
+
+  it("queries US tickers only and never the low-level fn for non-US/crypto", async () => {
+    mockAlpaca.mockResolvedValue([]);
+    await alpacaSource.fetch(
+      [
+        { id: "1", ticker: "AAPL" },
+        { id: "2", ticker: "JMT.LS" }, // non-US → excluded
+        { id: "3", ticker: "BTC-USD" }, // crypto → excluded
+      ],
+      new Date("2026-05-01")
+    );
+    expect(mockAlpaca).toHaveBeenCalledTimes(1);
+    expect(mockAlpaca.mock.calls[0][0]).toEqual(["AAPL"]);
+  });
+
+  it("keeps only the watched symbols an article is tagged with, and maps the publisher", async () => {
+    mockAlpaca.mockResolvedValue([ALPACA_RAW]);
+    const out = await alpacaSource.fetch([{ id: "1", ticker: "AAPL" }], new Date("2026-05-01"));
+    expect(out).toHaveLength(1);
+    expect(out[0].stockTickers).toEqual(["AAPL"]); // SPY tagged but unwatched → dropped
+    expect(out[0].provider).toBe("Alpaca");
+    expect(out[0].source).toBe("Benzinga"); // "benzinga" title-cased
+  });
+
+  it("drops an article tagged only with unwatched symbols", async () => {
+    mockAlpaca.mockResolvedValue([{ ...ALPACA_RAW, symbols: ["TSLA"] }]);
+    const out = await alpacaSource.fetch([{ id: "1", ticker: "AAPL" }], new Date("2026-05-01"));
+    expect(out).toEqual([]);
+  });
+
+  it("is a no-op (no fetch) when there are no US tickers", async () => {
+    const out = await alpacaSource.fetch([{ id: "1", ticker: "JMT.LS" }], new Date("2026-05-01"));
+    expect(out).toEqual([]);
+    expect(mockAlpaca).not.toHaveBeenCalled();
   });
 });
 
