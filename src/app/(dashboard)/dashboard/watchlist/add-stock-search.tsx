@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useTransition } from "react";
 import { useRouter } from "next/navigation";
+import { track } from "@vercel/analytics/react";
 import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -69,6 +70,7 @@ export function AddStockSearch({
           const data = await res.json().catch(() => null);
           throw new Error(data?.error ?? `HTTP ${res.status}`);
         }
+        track("watchlist_add", { ticker: stock.ticker });
         toast.success(`Added ${stock.ticker} to watchlist`);
         setQuery("");
         setResults([]);

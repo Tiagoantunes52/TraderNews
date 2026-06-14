@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { track } from "@vercel/analytics/react";
 import { toast } from "sonner";
 import { useUser, SignOutButton } from "@clerk/nextjs";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -59,6 +60,7 @@ export function SettingsClient({ isAdmin, alertEmails }: { isAdmin: boolean; ale
       if (!res.ok) throw new Error(data.error ?? "Pipeline failed");
       setPipelineResult(data);
       setPipelineStatus("success");
+      track("pipeline_trigger");
       toast.success("Pipeline finished", {
         description: `${data.articles.saved} new articles, ${data.sentiments} sentiment readings`,
       });
