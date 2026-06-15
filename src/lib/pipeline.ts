@@ -660,8 +660,13 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
 // ── Stage 4: Estimate ───────────────────────────────────────────────────────
 //
 // Blend the latest sentiment + quant rows into a combined estimate for each
-// watched stock lacking today's estimate, and detect/persist all alerts
-// (RSI extreme, signal change, velocity spike) here so watchers get one digest.
+// watched stock whose today estimate is missing OR stale — i.e. a newer sentiment
+// has landed since the estimate was last computed (e.g. the morning run estimated
+// off yesterday's sentiment because today's hadn't arrived yet, then the real
+// sentiment landed hours later). Today's estimate is refreshed in place so
+// everything that reads it (the analysis page, the paper book) tracks the latest
+// sentiment. All alerts (RSI extreme, signal change, velocity spike) are
+// detected/persisted here so watchers get one digest.
 export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchStageResult> {
   const errors: string[] = [];
   let created = 0;
@@ -672,9 +677,31 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
   const sevenDaysAgo = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
   const yesterday = new Date(to.getTime() - 86_400_000);
 
-  const worklist = await db.stock.findMany({
-    where: { ...watchedStocksWhere(), stockEstimates: { none: { date: { gte: todayUTC } } } },
+  // Watched stocks whose today estimate is missing or stale. "Stale" = a sentiment
+  // newer than the estimate's last computation has landed. The estimate snapshots
+  // the sentiment score, so it must be recomputed when sentiment moves — otherwise
+  // a delayed sentiment leaves the day's estimate (and the signal the paper book
+  // trades on) frozen on the prior day's read.
+  const watched = await db.stock.findMany({
+    where: watchedStocksWhere(),
     select: { id: true, ticker: true },
+  });
+  const watchedIds = watched.map((s) => s.id);
+  const [sentMax, estToday] = await Promise.all([
+    db.sentiment.groupBy({ by: ["stockId"], where: { stockId: { in: watchedIds } }, _max: { date: true } }),
+    db.stockEstimate.groupBy({
+      by: ["stockId"],
+      where: { stockId: { in: watchedIds }, date: { gte: todayUTC } },
+      _max: { date: true },
+    }),
+  ]);
+  const latestSentimentAt = new Map(sentMax.map((r) => [r.stockId, r._max.date]));
+  const todayEstimateAt = new Map(estToday.map((r) => [r.stockId, r._max.date]));
+  const worklist = watched.filter((s) => {
+    const sAt = latestSentimentAt.get(s.id);
+    if (!sAt) return false; // no sentiment yet → nothing to estimate from
+    const eAt = todayEstimateAt.get(s.id);
+    return !eAt || eAt.getTime() < sAt.getTime();
   });
 
   const outcome = await processWithBudget(
@@ -754,28 +781,38 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
         });
         const sentimentDelta = oldEstimate ? combinedScore - oldEstimate.combinedScore : null;
 
-        // Previous signal (before inserting today's) for signal-change detection
+        // Latest existing estimate: its signal is the baseline for signal-change
+        // detection (including an intraday flip when we refresh today's row), and
+        // when it's today's row we update it in place — one estimate per stock per
+        // UTC day, so no stale snapshot is left behind when sentiment moves.
         const prevEstimate = await db.stockEstimate.findFirst({
           where: { stockId: stock.id },
           orderBy: { date: "desc" },
-          select: { signal: true },
+          select: { id: true, signal: true, date: true },
         });
 
         const signal = scoreToSignal(combinedScore);
+        const data = {
+          sentimentScore,
+          quantScore,
+          combinedScore,
+          signal,
+          confidence,
+          dataWarnings: warnings,
+          sentimentDelta,
+          articleVelocityRatio,
+        };
 
-        await db.stockEstimate.create({
-          data: {
-            stockId: stock.id,
-            sentimentScore,
-            quantScore,
-            combinedScore,
-            signal,
-            confidence,
-            dataWarnings: warnings,
-            sentimentDelta,
-            articleVelocityRatio,
-          },
-        });
+        if (prevEstimate && prevEstimate.date.getTime() >= todayUTC.getTime()) {
+          // Refresh today's estimate; bump `date` to mark the recompute time so the
+          // staleness check above won't re-run it until a newer sentiment lands.
+          await db.stockEstimate.update({
+            where: { id: prevEstimate.id },
+            data: { ...data, date: new Date() },
+          });
+        } else {
+          await db.stockEstimate.create({ data: { stockId: stock.id, ...data } });
+        }
         created++;
 
         // All alert detection lives here so watchers get a single digest per run.
