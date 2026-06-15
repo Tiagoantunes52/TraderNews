@@ -10,18 +10,7 @@ import {
   CartesianGrid,
   Legend,
 } from "recharts";
-
-// Books overlaid on the equity curve. SIM_COMBINED leads (the headline book); the
-// Alpaca live line only appears when paper trading is configured and has snapshots.
-export const BOOK_META = [
-  { key: "SIM_COMBINED", label: "Combined", color: "#6366f1" },
-  { key: "SIM_SENTIMENT", label: "Sentiment", color: "#10b981" },
-  { key: "SIM_QUANT", label: "Quant", color: "#f59e0b" },
-  { key: "ALPACA", label: "Alpaca (live)", color: "#ec4899" },
-] as const;
-
-export type BookKey = (typeof BOOK_META)[number]["key"];
-export type EquityPoint = { date: string } & Partial<Record<BookKey, number>>;
+import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
 
 function fmtUsd(v: number): string {
   const abs = Math.abs(v);

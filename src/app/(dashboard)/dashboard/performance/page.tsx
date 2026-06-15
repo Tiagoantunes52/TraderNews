@@ -7,12 +7,8 @@ import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { SIM_STARTING_EQUITY, STRATEGIES, STRATEGY_BOOK, type Strategy } from "@/lib/paper-trading";
-import {
-  PerformanceEquityChart,
-  BOOK_META,
-  type BookKey,
-  type EquityPoint,
-} from "@/components/performance-equity-chart";
+import { PerformanceEquityChart } from "@/components/performance-equity-chart";
+import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
 
 export const metadata = { title: "Signal Performance — TraderNews" };
 
