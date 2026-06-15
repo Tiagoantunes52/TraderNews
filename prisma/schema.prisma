@@ -63,6 +63,8 @@ model Stock {
   insiderTransactions InsiderTransaction[]
   insiderSummaries    InsiderSummary[]
   congressTrades      CongressTrade[]
+  paperOrders         PaperOrder[]
+  simPositions        SimPosition[]
   userStocks          UserStock[]
 
   @@index([marketId])
@@ -282,6 +284,80 @@ model CongressTrade {
   createdAt       DateTime @default(now())
 
   @@index([stockId, transactionDate])
+}
+
+// Signal-performance tracking (issue #14). The app acts on its own daily signals
+// with simulated trades and tracks hypothetical P&L per signal source, answering
+// "how predictive are our signals — and which source (sentiment / quant / the
+// combined estimate) leads?". Long-only, US-equity only, confidence-weighted
+// sizing, daily and idempotent per UTC day (rides pipeline.yml after `estimate`).
+
+// Audit log of REAL orders placed on the Alpaca paper account for the COMBINED
+// book, with fill reconciliation. The Alpaca book is the credible, fills-included
+// proof; the SimPosition books below are the apples-to-apples per-signal compare.
+model PaperOrder {
+  id      String @id @default(cuid())
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
+
+  side           String // BUY | SELL
+  signal         String // scoreToSignal label that triggered the order (combined book)
+  notional       Float? // requested notional ($) — set on confidence-weighted buys
+  qty            Float? // requested quantity — set on sell-to-close
+  alpacaOrderId  String? @unique // Alpaca order id; null only if submission failed pre-id
+  status         String // Alpaca order status (new|accepted|filled|canceled|...)
+  filledQty      Float?
+  filledAvgPrice Float?
+  submittedAt    DateTime @default(now())
+  filledAt       DateTime?
+
+  @@index([stockId, submittedAt])
+}
+
+// Internal mark-to-market position per (stock, strategy). At most one OPEN row per
+// pair. Sizing uses the estimate's confidence for every strategy (held constant),
+// so only the *signal* differs between books — an apples-to-apples comparison of
+// which signal source picks better. Runs even without Alpaca keys.
+model SimPosition {
+  id      String @id @default(cuid())
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
+
+  strategy     String // SENTIMENT | QUANT | COMBINED
+  status       String // OPEN | CLOSED
+  qty          Float
+  entryDate    DateTime
+  entryPrice   Float
+  confidence   Float
+  lastMarkDate DateTime
+  lastMarkPrice Float?
+  exitDate     DateTime?
+  exitPrice    Float?
+  realizedPnl  Float?
+
+  createdAt DateTime @default(now())
+
+  @@index([strategy, status])
+  @@index([stockId, strategy])
+}
+
+// Daily equity point per book — drives the performance equity curves and the
+// summary cards. One row per (book, UTC-day); the per-day SIM_COMBINED row is also
+// the stage's idempotency guard. Sim equity = starting + Σrealized + Σunrealized
+// (unconstrained by cash — it measures signal quality, not capital allocation);
+// the ALPACA row comes straight from the paper account.
+model PaperEquitySnapshot {
+  id             String   @id @default(cuid())
+  book           String // ALPACA | SIM_SENTIMENT | SIM_QUANT | SIM_COMBINED
+  date           DateTime
+  equity         Float
+  cash           Float?
+  realizedPnl    Float    @default(0)
+  unrealizedPnl  Float    @default(0)
+  openPositions  Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@unique([book, date])
 }
 
 model UserStock {

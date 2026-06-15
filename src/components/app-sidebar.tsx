@@ -12,7 +12,7 @@ import {
   SidebarHeader,
   SidebarFooter,
 } from "@/components/ui/sidebar";
-import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Briefcase, UserSearch } from "lucide-react";
+import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Briefcase, UserSearch, LineChart } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -28,11 +28,16 @@ const baseNavItems = [
   { label: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 
-const adminNavItem = { label: "Admin", href: "/dashboard/admin", icon: Shield };
+// Admin-only. Signal Performance is an operator view (it drives a single shared
+// Alpaca paper account), so it lives behind the same gate as Admin.
+const adminNavItems = [
+  { label: "Performance", href: "/dashboard/performance", icon: LineChart },
+  { label: "Admin", href: "/dashboard/admin", icon: Shield },
+];
 
 export function AppSidebar({ isAdmin = false }: { isAdmin?: boolean }) {
   const pathname = usePathname();
-  const navItems = isAdmin ? [...baseNavItems, adminNavItem] : baseNavItems;
+  const navItems = isAdmin ? [...baseNavItems, ...adminNavItems] : baseNavItems;
 
   return (
     <Sidebar>

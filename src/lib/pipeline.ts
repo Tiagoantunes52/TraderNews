@@ -16,6 +16,23 @@ import { processWithBudget } from "@/lib/concurrency";
 import { getInsiderTxns, isInsiderEligible } from "@/lib/insider-sources";
 import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift, detectCsuiteBuy } from "@/lib/insider-detect";
 import { getCongressTrades, isCongressConfigured, isCongressEligible } from "@/lib/congress-trades";
+import {
+  STRATEGIES,
+  STRATEGY_BOOK,
+  deriveSignals,
+  reconcilePosition,
+  summarizeBook,
+  confidenceNotional,
+  isPaperTradeEligible,
+  isEntrySignal,
+} from "@/lib/paper-trading";
+import {
+  isPaperTradingConfigured,
+  getAccount,
+  getPositions,
+  submitMarketOrder,
+  getOrder,
+} from "@/lib/alpaca-trading";
 import { reportError } from "@/lib/observability";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -1007,6 +1024,270 @@ export async function runCongressStage(opts: StageOptions = {}): Promise<Congres
   );
 
   return { stage: "congress", fetched, created, errors, done: true };
+}
+
+export type PaperStageResult = {
+  stage: "paper";
+  rebalanced: boolean; // false on the same-day no-op; true once it acts
+  ordersSubmitted: number; // real Alpaca paper orders placed this run
+  simOpened: number; // internal sim positions opened
+  simClosed: number; // internal sim positions closed
+  done: true;
+  errors: string[];
+};
+
+// Terminal Alpaca order states — once an order reaches one, there's nothing left
+// to reconcile, so it drops out of the pending-fill recheck.
+const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced"]);
+
+// ── Paper trading / signal performance ───────────────────────────────────────
+//
+// Acts on today's estimates with simulated long-only trades and tracks hypothetical
+// P&L per signal source — sentiment, quant, and the combined estimate — to measure
+// which predicts best (issue #14). Two layers:
+//   • SIM books (DB-only, always run): one mark-to-market book per strategy. Sizing
+//     is held constant (the estimate's confidence) so only the *signal* differs.
+//   • ALPACA book (only when paper keys are set): the combined signal is mirrored
+//     with REAL orders on the paper account, giving a fills-included reality check.
+//
+// Idempotent per UTC day via the SIM_COMBINED equity snapshot: the 3-hourly
+// pipeline.yml calls this after `estimate`, but it only acts on the first call each
+// day. Single-shot (`done: true`); the watchlist is small enough for one pass and
+// the wall-clock budget isn't needed, but errors are isolated so one bad ticker or
+// an Alpaca hiccup never sinks the run. US-equities only (foreign/crypto filtered).
+export async function runPaperStage(): Promise<PaperStageResult> {
+  const errors: string[] = [];
+  let ordersSubmitted = 0;
+  let simOpened = 0;
+  let simClosed = 0;
+
+  const to = new Date();
+  const todayUTC = startOfUtcDay(to);
+
+  // Per-day idempotency guard: the SIM_COMBINED snapshot for today doubles as the
+  // "already ran" marker, so repeat calls in the same day are cheap no-ops.
+  const alreadyRan = await db.paperEquitySnapshot.findUnique({
+    where: { book_date: { book: "SIM_COMBINED", date: todayUTC } },
+    select: { id: true },
+  });
+  if (alreadyRan) {
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+  }
+
+  // Today's estimates for watched stocks, newest first; dedupe to one per stock.
+  const estimateRows = await db.stockEstimate.findMany({
+    where: { date: { gte: todayUTC }, stock: watchedStocksWhere() },
+    orderBy: { date: "desc" },
+    select: {
+      stockId: true,
+      sentimentScore: true,
+      quantScore: true,
+      combinedScore: true,
+      confidence: true,
+      stock: { select: { ticker: true } },
+    },
+  });
+  const estimates = [...new Map(estimateRows.map((e) => [e.stockId, e])).values()].filter((e) =>
+    isPaperTradeEligible(e.stock.ticker)
+  );
+
+  // Mark price = latest QuantAnalysis close per stock (already computed by the quant
+  // stage). No price → the stock can't be marked/sized, so it's skipped this run.
+  const stockIds = estimates.map((e) => e.stockId);
+  const quantRows =
+    stockIds.length > 0
+      ? await db.quantAnalysis.findMany({
+          where: { stockId: { in: stockIds }, price: { not: null } },
+          orderBy: { date: "desc" },
+          distinct: ["stockId"],
+          select: { stockId: true, price: true },
+        })
+      : [];
+  const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
+
+  // ── Sim books (always run) ─────────────────────────────────────────────────
+  // Index open positions by (stock, strategy) for O(1) reconciliation.
+  const openPositions = await db.simPosition.findMany({
+    where: { status: "OPEN", stockId: { in: stockIds.length > 0 ? stockIds : ["__none__"] } },
+    select: { id: true, stockId: true, strategy: true, qty: true, entryPrice: true },
+  });
+  const openByKey = new Map(openPositions.map((p) => [`${p.stockId}|${p.strategy}`, p]));
+
+  for (const est of estimates) {
+    const price = priceByStock.get(est.stockId);
+    if (price == null) continue;
+    const signals = deriveSignals(est);
+
+    for (const strategy of STRATEGIES) {
+      const signal = signals[strategy];
+      if (signal == null) continue; // e.g. QUANT with no quant score
+      const open = openByKey.get(`${est.stockId}|${strategy}`) ?? null;
+      const action = reconcilePosition(signal, price, est.confidence, open);
+
+      try {
+        if (action.type === "OPEN") {
+          await db.simPosition.create({
+            data: {
+              stockId: est.stockId,
+              strategy,
+              status: "OPEN",
+              qty: action.qty,
+              entryDate: to,
+              entryPrice: action.price,
+              confidence: est.confidence,
+              lastMarkDate: to,
+              lastMarkPrice: action.price,
+            },
+          });
+          simOpened++;
+        } else if (action.type === "CLOSE" && open) {
+          await db.simPosition.update({
+            where: { id: open.id },
+            data: {
+              status: "CLOSED",
+              exitDate: to,
+              exitPrice: action.price,
+              realizedPnl: action.realizedPnl,
+              lastMarkDate: to,
+              lastMarkPrice: action.price,
+            },
+          });
+          simClosed++;
+        } else if (action.type === "MARK" && open) {
+          await db.simPosition.update({
+            where: { id: open.id },
+            data: { lastMarkDate: to, lastMarkPrice: action.price },
+          });
+        }
+      } catch (e) {
+        errors.push(`Sim ${strategy} failed for ${est.stock.ticker}: ${String(e)}`);
+      }
+    }
+  }
+
+  // Per-book equity snapshot from the full position history (cumulative realized +
+  // current unrealized). Written last so the SIM_COMBINED row only lands once the
+  // day's reconciliation succeeded — keeping it honest as the idempotency marker.
+  for (const strategy of STRATEGIES) {
+    try {
+      const [closed, open] = await Promise.all([
+        db.simPosition.findMany({ where: { strategy, status: "CLOSED" }, select: { realizedPnl: true } }),
+        db.simPosition.findMany({
+          where: { strategy, status: "OPEN" },
+          select: { qty: true, entryPrice: true, lastMarkPrice: true },
+        }),
+      ]);
+      const summary = summarizeBook(closed, open);
+      const book = STRATEGY_BOOK[strategy];
+      const data = {
+        equity: summary.equity,
+        realizedPnl: summary.realizedPnl,
+        unrealizedPnl: summary.unrealizedPnl,
+        openPositions: summary.openPositions,
+      };
+      await db.paperEquitySnapshot.upsert({
+        where: { book_date: { book, date: todayUTC } },
+        create: { book, date: todayUTC, ...data },
+        update: data,
+      });
+    } catch (e) {
+      errors.push(`Equity snapshot failed for ${strategy}: ${String(e)}`);
+    }
+  }
+
+  // ── Alpaca book (only when paper keys are configured) ──────────────────────
+  if (isPaperTradingConfigured()) {
+    try {
+      // Reconcile fills for orders still pending from a previous run.
+      const pending = await db.paperOrder.findMany({
+        where: { alpacaOrderId: { not: null } },
+        orderBy: { submittedAt: "desc" },
+        take: 100,
+        select: { id: true, alpacaOrderId: true, status: true },
+      });
+      for (const o of pending) {
+        if (TERMINAL_ORDER_STATUS.has(o.status)) continue;
+        try {
+          const remote = await getOrder(o.alpacaOrderId!);
+          await db.paperOrder.update({
+            where: { id: o.id },
+            data: {
+              status: remote.status,
+              filledQty: remote.filledQty,
+              filledAvgPrice: remote.filledAvgPrice,
+              filledAt: remote.filledAt ? new Date(remote.filledAt) : null,
+            },
+          });
+        } catch (e) {
+          errors.push(`Order reconcile failed (${o.alpacaOrderId}): ${String(e)}`);
+        }
+      }
+
+      // Desired state per stock: long when the combined signal is a buy, else flat.
+      const positions = await getPositions();
+      const posBySymbol = new Map(positions.map((p) => [p.symbol, p]));
+
+      for (const est of estimates) {
+        const ticker = est.stock.ticker;
+        const combinedSignal = scoreToSignal(est.combinedScore);
+        const held = posBySymbol.get(ticker);
+        const wantLong = isEntrySignal(combinedSignal);
+        try {
+          if (wantLong && !held) {
+            const notional = confidenceNotional(est.confidence);
+            const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
+            await db.paperOrder.create({
+              data: {
+                stockId: est.stockId,
+                side: "BUY",
+                signal: combinedSignal,
+                notional,
+                alpacaOrderId: order.id,
+                status: order.status,
+              },
+            });
+            ordersSubmitted++;
+          } else if (!wantLong && held && held.qty > 0) {
+            const qty = Math.abs(held.qty);
+            const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
+            await db.paperOrder.create({
+              data: {
+                stockId: est.stockId,
+                side: "SELL",
+                signal: combinedSignal,
+                qty,
+                alpacaOrderId: order.id,
+                status: order.status,
+              },
+            });
+            ordersSubmitted++;
+          }
+        } catch (e) {
+          errors.push(`Alpaca order failed for ${ticker}: ${String(e)}`);
+        }
+      }
+
+      // Equity straight from the paper account; unrealized rolled up from positions.
+      const account = await getAccount();
+      const unrealized = positions.reduce((s, p) => s + (p.unrealizedPl ?? 0), 0);
+      const data = {
+        equity: account.equity ?? 0,
+        cash: account.cash,
+        unrealizedPnl: unrealized,
+        openPositions: positions.length,
+      };
+      await db.paperEquitySnapshot.upsert({
+        where: { book_date: { book: "ALPACA", date: todayUTC } },
+        create: { book: "ALPACA", date: todayUTC, realizedPnl: 0, ...data },
+        update: data,
+      });
+    } catch (e) {
+      errors.push(`Alpaca book failed: ${String(e)}`);
+      reportError("paper_alpaca_book_failed", e, { stage: "paper" });
+    }
+  }
+
+  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, done: true, errors };
 }
 
 /**
