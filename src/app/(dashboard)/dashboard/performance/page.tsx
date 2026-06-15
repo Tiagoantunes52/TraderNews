@@ -50,13 +50,13 @@ export default async function PerformancePage() {
         entryPrice: true,
         lastMarkPrice: true,
         entryDate: true,
-        stock: { select: { ticker: true } },
+        stock: { select: { ticker: true, name: true } },
       },
     }),
     db.paperOrder.findMany({
       orderBy: { submittedAt: "desc" },
       take: 12,
-      include: { stock: { select: { ticker: true } } },
+      include: { stock: { select: { ticker: true, name: true } } },
     }),
   ]);
 
@@ -232,8 +232,12 @@ export default async function PerformancePage() {
                     const upnl = p.qty * (mark - p.entryPrice);
                     return (
                       <div key={i} className="flex items-center justify-between text-xs gap-2">
-                        <Link href={`/dashboard/stocks/${p.stock.ticker}`} className="font-medium hover:underline">
-                          {p.stock.ticker}
+                        <Link
+                          href={`/dashboard/stocks/${p.stock.ticker}`}
+                          title={p.stock.ticker}
+                          className="font-medium hover:underline truncate min-w-0"
+                        >
+                          {p.stock.name}
                         </Link>
                         <span className="flex items-center gap-2 shrink-0">
                           <Badge variant="outline" className="font-normal">
@@ -268,8 +272,12 @@ export default async function PerformancePage() {
               <div className="space-y-1.5">
                 {recentOrders.map((o) => (
                   <div key={o.id} className="flex items-center justify-between text-xs gap-2">
-                    <Link href={`/dashboard/stocks/${o.stock.ticker}`} className="font-medium hover:underline">
-                      {o.stock.ticker}
+                    <Link
+                      href={`/dashboard/stocks/${o.stock.ticker}`}
+                      title={o.stock.ticker}
+                      className="font-medium hover:underline truncate min-w-0"
+                    >
+                      {o.stock.name}
                     </Link>
                     <span className="flex items-center gap-2 shrink-0">
                       <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
