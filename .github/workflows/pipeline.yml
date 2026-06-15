@@ -33,7 +33,9 @@ jobs:
       # Each stage runs as its own serverless invocation (its own 300s budget) and
       # returns {"done": true|false}. The batched stages process a slice per call
       # and resume on the next, so we poll until done. Stages run in dependency
-      # order: news -> sentiment -> quant -> estimate.
+      # order: news -> sentiment -> quant -> estimate -> paper. `paper` acts on the
+      # fresh estimates but is idempotent per UTC day, so the extra 3-hourly calls
+      # are cheap no-ops after the first run each day.
       - name: Run pipeline stages
         run: |
           run_stage() {
@@ -64,3 +66,4 @@ jobs:
           run_stage sentiment
           run_stage quant
           run_stage estimate
+          run_stage paper
