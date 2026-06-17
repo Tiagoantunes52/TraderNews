@@ -50,7 +50,17 @@ export const DELETE = withRoute("watchlist", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { stockId } = await req.json();
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+
+  const stockId = (body as { stockId?: unknown })?.stockId;
+  if (typeof stockId !== "string" || !stockId) {
+    return NextResponse.json({ error: "`stockId` is required" }, { status: 400 });
+  }
 
   await db.userStock.deleteMany({ where: { userId: user.id, stockId } });
 
