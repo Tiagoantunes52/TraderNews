@@ -5,6 +5,12 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  submitEntryWithStop,
+  submitTrailingStop,
+  submitStopSell,
+  cancelOrder,
+  getOpenOrders,
+  getClock,
 } from "@/lib/alpaca-trading";
 
 function jsonResponse(body: unknown) {
@@ -59,8 +65,18 @@ describe("alpaca-trading client", () => {
     );
     const positions = await getPositions();
     expect(positions).toEqual([
-      { symbol: "AAPL", qty: 3, unrealizedPl: 12.5 },
-      { symbol: "MSFT", qty: 1, unrealizedPl: -4 },
+      { symbol: "AAPL", qty: 3, unrealizedPl: 12.5, avgEntryPrice: null, currentPrice: null },
+      { symbol: "MSFT", qty: 1, unrealizedPl: -4, avgEntryPrice: null, currentPrice: null },
+    ]);
+  });
+
+  it("parses avg entry + current price when present", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse([{ symbol: "AAPL", qty: "3", unrealized_pl: "12.5", avg_entry_price: "100.2", current_price: "104.5" }]))
+    );
+    expect(await getPositions()).toEqual([
+      { symbol: "AAPL", qty: 3, unrealizedPl: 12.5, avgEntryPrice: 100.2, currentPrice: 104.5 },
     ]);
   });
 
@@ -132,5 +148,86 @@ describe("alpaca-trading client", () => {
     vi.stubGlobal("fetch", mockFetch);
     await getPositions();
     expect(mockFetch.mock.calls[0][0]).toBe("https://example.test/v2/positions");
+  });
+
+  describe("broker-enforced protective orders", () => {
+    it("submitEntryWithStop sends a marketable-limit OTO buy with a GTC stop leg", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        jsonResponse({ id: "parent1", status: "accepted", legs: [{ id: "stop1", type: "stop" }] })
+      );
+      vi.stubGlobal("fetch", mockFetch);
+      const res = await submitEntryWithStop({ symbol: "AAPL", qty: 3, limitPrice: 100.49, stopPrice: 92.1 });
+      expect(res).toEqual({
+        order: { id: "parent1", status: "accepted", filledQty: null, filledAvgPrice: null, filledAt: null },
+        stopOrderId: "stop1",
+      });
+      const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("https://paper-api.alpaca.markets/v2/orders");
+      const body = JSON.parse(init.body as string);
+      expect(body).toEqual({
+        symbol: "AAPL",
+        qty: "3",
+        side: "buy",
+        type: "limit",
+        limit_price: "100.49",
+        time_in_force: "gtc",
+        order_class: "oto",
+        stop_loss: { stop_price: "92.10" },
+      });
+    });
+
+    it("submitEntryWithStop tolerates a response with no legs", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ id: "p2", status: "accepted" })));
+      const res = await submitEntryWithStop({ symbol: "AAPL", qty: 1, limitPrice: 10, stopPrice: 9 });
+      expect(res.stopOrderId).toBeNull();
+    });
+
+    it("submitTrailingStop sends a GTC trailing_stop sell with trail_percent", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "t1", status: "accepted" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await submitTrailingStop({ symbol: "AAPL", qty: 3, trailPercent: 12 });
+      const body = JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+      expect(body).toEqual({ symbol: "AAPL", qty: "3", side: "sell", type: "trailing_stop", trail_percent: "12.00", time_in_force: "gtc" });
+    });
+
+    it("submitStopSell sends a GTC stop sell", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "s1", status: "accepted" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await submitStopSell({ symbol: "AAPL", qty: 2, stopPrice: 88.5 });
+      const body = JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+      expect(body).toEqual({ symbol: "AAPL", qty: "2", side: "sell", type: "stop", stop_price: "88.50", time_in_force: "gtc" });
+    });
+
+    it("cancelOrder DELETEs by id and tolerates 404/422", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 204 } as Response);
+      vi.stubGlobal("fetch", mockFetch);
+      await cancelOrder("o9");
+      const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("https://paper-api.alpaca.markets/v2/orders/o9");
+      expect(init.method).toBe("DELETE");
+      // already-gone statuses don't throw
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 422, text: async () => "" } as Response));
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+      // a real error still throws
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response));
+      await expect(cancelOrder("o9")).rejects.toThrow("Alpaca cancel error: 500");
+    });
+
+    it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        jsonResponse([{ id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", stop_price: "92.1", trail_percent: null }])
+      );
+      vi.stubGlobal("fetch", mockFetch);
+      const orders = await getOpenOrders("AAPL");
+      expect(mockFetch.mock.calls[0][0]).toBe("https://paper-api.alpaca.markets/v2/orders?status=open&symbols=AAPL");
+      expect(orders).toEqual([
+        { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: 3, stopPrice: 92.1, trailPercent: null },
+      ]);
+    });
+
+    it("getClock parses is_open + next_close", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ is_open: true, next_close: "2026-06-17T20:00:00Z" })));
+      expect(await getClock()).toEqual({ isOpen: true, nextClose: "2026-06-17T20:00:00Z" });
+    });
   });
 });

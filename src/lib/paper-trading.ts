@@ -144,6 +144,20 @@ export function isRiskBooksEnabled(): boolean {
   return process.env.PAPER_RISK_BOOKS === "1";
 }
 
+/**
+ * Gate for pushing the live book's protective exits to the broker (native Alpaca
+ * stop / trailing-stop orders, enforced continuously instead of once/day). Engages
+ * only alongside the risk books — it's the live counterpart of the COMBINED_RM sim.
+ */
+export function isBrokerStopsEnabled(): boolean {
+  return process.env.PAPER_BROKER_STOPS === "1";
+}
+
+// Marketable-limit buffer for broker entries: a limit priced this far through the
+// spread fills like a market order but lets the order be GTC (so the attached stop
+// persists). The cap, not the fill price — you still fill at the market price.
+const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.005);
+
 // US exchanges in the app's market taxonomy (see market-utils). Paper trading is
 // US-equity only — same coverage gate as the congress feature.
 const US_MARKETS = new Set(["NYSE", "NASDAQ"]);
@@ -345,6 +359,92 @@ export function reconcileRiskManaged(args: {
   if (score > cfg.entryScoreMin && confidence >= cfg.minConfidence) {
     const qty = sizePosition(confidence, price, base);
     if (qty > 0) return { type: "OPEN", qty, price };
+  }
+  return { type: "NONE" };
+}
+
+// ── Live Alpaca book with broker-enforced stops (PAPER_BROKER_STOPS) ──────────
+//
+// When enabled, the live book mirrors the COMBINED_RM *decision* but hands the
+// *protective* exits to the broker: entries go in as whole-share marketable-limit
+// buys with an attached GTC stop, and the fixed stop is replaced by a native
+// trailing stop once the position is up enough. The broker enforces those exits
+// continuously (intraday, gap-aware) for free — the once/day stage can't. Only the
+// exits a broker can't make (signal flip, time stop) stay app-side. `planBrokerAction`
+// is the pure decision; the stage executes it via the alpaca-trading client.
+
+/** Cents-rounded price for Alpaca limit/stop fields. */
+function cents(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+export type BrokerAction =
+  | { type: "ENTER"; qty: number; limitPrice: number; stopPrice: number }
+  | { type: "EXIT"; reason: string } // signal/time exit: cancel the resting stop + market-sell
+  | { type: "ARM_TRAILING"; trailPercent: number } // replace the fixed stop with a trailing stop
+  | { type: "REPAIR_STOP"; stopPrice: number } // held but no protective order: re-place a GTC stop
+  | { type: "NONE" };
+
+/**
+ * Decide the live broker book's action for one stock from the COMBINED_RM sim
+ * transitions + the live broker state. Pure (no network/DB) so it's unit-testable.
+ *
+ * - EXIT only on an *info* exit (SIGNAL/TIME) — price exits (STOP/TRAIL) are enforced
+ *   broker-side, so we never double-handle them here.
+ * - ENTER only on a *fresh* sim OPEN when flat — never re-buy a name the broker just
+ *   stopped out while the sim is merely still-long (the re-entry guard).
+ * - While held & still-long: arm the trailing stop once up `trailActivatePct` (a fixed
+ *   stop is resting), or repair a missing protective order.
+ */
+export function planBrokerAction(input: {
+  opened: boolean; // COMBINED_RM made a fresh OPEN this run
+  stillLong: boolean; // COMBINED_RM is long after this run
+  exitReason: string | null; // COMBINED_RM close reason this run (STOP|TRAIL|SIGNAL|TIME)
+  held: boolean; // live Alpaca position exists
+  avgEntryPrice: number | null;
+  currentPrice: number | null;
+  restingProtectiveType: "stop" | "trailing_stop" | null; // resting protective order, if any
+  price: number; // reference price (latest quant close) for sizing + stop/limit
+  atrPct: number | null;
+  confidence: number;
+  cfg?: RiskConfig;
+  base?: number;
+  entryLimitBufferPct?: number;
+}): BrokerAction {
+  const cfg = input.cfg ?? DEFAULT_RISK_CONFIG;
+  const base = input.base ?? BASE_NOTIONAL;
+  const buffer = input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT;
+  const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, price, atrPct, confidence } = input;
+
+  const infoExit = exitReason === "SIGNAL" || exitReason === "TIME";
+  if (held && infoExit) return { type: "EXIT", reason: exitReason! };
+
+  if (!held) {
+    if (opened && price > 0) {
+      const qty = Math.floor(confidenceNotional(confidence, base) / price);
+      if (qty >= 1) {
+        const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
+        return { type: "ENTER", qty, limitPrice: cents(price * (1 + buffer)), stopPrice: cents(price * (1 - stopPct)) };
+      }
+    }
+    return { type: "NONE" };
+  }
+
+  // Held and still wanted → keep the protective order correct.
+  if (stillLong) {
+    if (restingProtectiveType == null) {
+      const anchor = avgEntryPrice ?? price;
+      return { type: "REPAIR_STOP", stopPrice: cents(anchor * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct))) };
+    }
+    if (
+      restingProtectiveType === "stop" &&
+      avgEntryPrice != null &&
+      currentPrice != null &&
+      avgEntryPrice > 0 &&
+      (currentPrice - avgEntryPrice) / avgEntryPrice >= cfg.trailActivatePct
+    ) {
+      return { type: "ARM_TRAILING", trailPercent: cents(riskDistancePct(cfg, atrPct, cfg.trailPct) * 100) };
+    }
   }
   return { type: "NONE" };
 }

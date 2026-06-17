@@ -24,8 +24,10 @@ import {
   STRATEGY_IS_RM,
   reconcilePosition,
   reconcileRiskManaged,
+  planBrokerAction,
   riskConfig,
   isRiskBooksEnabled,
+  isBrokerStopsEnabled,
   utcDaysBetween,
   summarizeBook,
   confidenceNotional,
@@ -40,6 +42,13 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  getClock,
+  getOpenOrders,
+  cancelOrder,
+  submitEntryWithStop,
+  submitTrailingStop,
+  submitStopSell,
+  type AlpacaOpenOrder,
 } from "@/lib/alpaca-trading";
 import { reportError } from "@/lib/observability";
 
@@ -1085,6 +1094,42 @@ export type PaperStageResult = {
 // to reconcile, so it drops out of the pending-fill recheck.
 const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced"]);
 
+// ── Near-close trade window (PAPER_TRADE_NEAR_CLOSE) ──────────────────────────
+// Act only in the final minutes before the US close: deepest liquidity of the day
+// and aligns the live book with the sim books' close marks. When enabled, the whole
+// paper stage no-ops out of the window WITHOUT writing the idempotency snapshot, so
+// the day's first in-window run does the sim marks + live trades together.
+function isTradeNearCloseEnabled(): boolean {
+  return process.env.PAPER_TRADE_NEAR_CLOSE === "1";
+}
+
+// Static UTC fallback when the Alpaca clock isn't available (sim-only). Allows the
+// window before BOTH possible UTC close times (20:00 EDT / 21:00 EST) on weekdays.
+function withinStaticCloseWindow(now: Date, windowMin: number): boolean {
+  const day = now.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const inWindow = (close: number) => mins > close - windowMin && mins <= close;
+  return inWindow(20 * 60) || inWindow(21 * 60);
+}
+
+// True when we're within `PAPER_TRADE_WINDOW_MIN` (default 30) minutes of the close.
+// Prefers the broker clock (DST/holiday-proof); falls back to the static window.
+async function inCloseWindow(): Promise<boolean> {
+  const windowMin = Number(process.env.PAPER_TRADE_WINDOW_MIN) || 30;
+  if (isPaperTradingConfigured()) {
+    try {
+      const clock = await getClock();
+      if (!clock.isOpen || !clock.nextClose) return false;
+      const minsToClose = (new Date(clock.nextClose).getTime() - Date.now()) / 60_000;
+      return minsToClose > 0 && minsToClose <= windowMin;
+    } catch {
+      // clock fetch failed — fall back to the static window
+    }
+  }
+  return withinStaticCloseWindow(new Date(), windowMin);
+}
+
 // ── Paper trading / signal performance ───────────────────────────────────────
 //
 // Acts on today's estimates with simulated long-only trades and tracks hypothetical
@@ -1098,7 +1143,12 @@ const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expir
 //     management without contaminating the pure attribution baseline.
 //   • ALPACA book (only when paper keys are set): the combined signal mirrored with
 //     REAL orders — the risk-managed combined decision when the flag is on, else the
-//     pure combined signal — a fills-included reality check.
+//     pure combined signal — a fills-included reality check. With PAPER_BROKER_STOPS
+//     it switches to whole-share entries with broker-enforced GTC stop / trailing
+//     orders, so protective exits run continuously at the broker instead of once/day.
+//
+// When PAPER_TRADE_NEAR_CLOSE is set the whole stage only acts in the final minutes
+// before the US close (deep liquidity; close-aligned marks) — see inCloseWindow.
 //
 // Idempotent per UTC day via the SIM_COMBINED equity snapshot: the 3-hourly
 // pipeline.yml calls this after `estimate`, but it only acts on the first call each
@@ -1121,6 +1171,12 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     select: { id: true },
   });
   if (alreadyRan) {
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+  }
+
+  // Near-close gate: when enabled, out-of-window runs no-op WITHOUT writing the
+  // idempotency snapshot, so the day's first in-window run does all the work.
+  if (isTradeNearCloseEnabled() && !(await inCloseWindow())) {
     return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
   }
 
@@ -1169,6 +1225,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // The live Alpaca book mirrors the COMBINED_RM book's open/flat decision (when the
   // flag is on), so the real fills track the same risk-managed signal the sim does.
   const combinedRmLong = new Set<string>(); // stockIds long after this run
+  const combinedRmOpened = new Set<string>(); // fresh OPEN this run (drives broker entries + re-entry guard)
   const combinedRmExit = new Map<string, string>(); // stockId → exit reason on close
 
   // Index open positions by (stock, strategy) for O(1) reconciliation.
@@ -1232,6 +1289,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
 
       // Capture the COMBINED_RM decision so the Alpaca book can mirror it.
       if (strategy === "COMBINED_RM") {
+        if (action.type === "OPEN") combinedRmOpened.add(est.stockId);
         if (action.type === "OPEN" || action.type === "MARK") combinedRmLong.add(est.stockId);
         else if (action.type === "CLOSE" && action.reason) combinedRmExit.set(est.stockId, action.reason);
       }
@@ -1346,51 +1404,123 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }
       }
 
-      // Desired state per stock. With risk books on, the live account mirrors the
-      // COMBINED_RM decision (so real fills carry the same stop/trail/confirmed-exit
-      // protection the sim models); otherwise it mirrors the pure combined signal.
+      // Desired state per stock. Two modes:
+      //  • Broker stops ON: entries go in as whole-share marketable-limit buys with a
+      //    broker-enforced GTC stop; the broker handles the stop/trailing exits
+      //    intraday, so the stage only places signal/time exits and arms/repairs the
+      //    protective order. Driven by COMBINED_RM transitions (see planBrokerAction).
+      //  • OFF: the live account mirrors the COMBINED_RM (or pure combined) signal with
+      //    plain notional market orders — the original behavior, unchanged.
+      const brokerStops = isBrokerStopsEnabled() && riskEnabled;
       const positions = await getPositions();
       const posBySymbol = new Map(positions.map((p) => [p.symbol, p]));
 
-      for (const est of estimates) {
-        const ticker = est.stock.ticker;
-        const combinedSignal = scoreToSignal(est.combinedScore);
-        const held = posBySymbol.get(ticker);
-        const wantLong = riskEnabled ? combinedRmLong.has(est.stockId) : isEntrySignal(combinedSignal);
-        // Label a sell with the risk-managed exit reason (STOP/TRAIL/…) when present.
-        const sellSignal = riskEnabled ? combinedRmExit.get(est.stockId) ?? combinedSignal : combinedSignal;
+      if (brokerStops) {
+        // One pass over the broker's resting orders → the protective order per symbol.
+        let openOrders: AlpacaOpenOrder[] = [];
         try {
-          if (wantLong && !held) {
-            const notional = confidenceNotional(est.confidence);
-            const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
-            await db.paperOrder.create({
-              data: {
-                stockId: est.stockId,
-                side: "BUY",
-                signal: combinedSignal,
-                notional,
-                alpacaOrderId: order.id,
-                status: order.status,
-              },
-            });
-            ordersSubmitted++;
-          } else if (!wantLong && held && held.qty > 0) {
-            const qty = Math.abs(held.qty);
-            const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
-            await db.paperOrder.create({
-              data: {
-                stockId: est.stockId,
-                side: "SELL",
-                signal: sellSignal,
-                qty,
-                alpacaOrderId: order.id,
-                status: order.status,
-              },
-            });
-            ordersSubmitted++;
-          }
+          openOrders = await getOpenOrders();
         } catch (e) {
-          errors.push(`Alpaca order failed for ${ticker}: ${String(e)}`);
+          errors.push(`Alpaca open-orders fetch failed: ${String(e)}`);
+        }
+        const protectiveBySymbol = new Map<string, AlpacaOpenOrder>();
+        for (const o of openOrders) {
+          if (o.side === "sell" && (o.type === "stop" || o.type === "trailing_stop")) protectiveBySymbol.set(o.symbol, o);
+        }
+
+        for (const est of estimates) {
+          const ticker = est.stock.ticker;
+          const price = priceByStock.get(est.stockId);
+          if (price == null) continue;
+          const held = posBySymbol.get(ticker);
+          const protective = protectiveBySymbol.get(ticker) ?? null;
+          const action = planBrokerAction({
+            opened: combinedRmOpened.has(est.stockId),
+            stillLong: combinedRmLong.has(est.stockId),
+            exitReason: combinedRmExit.get(est.stockId) ?? null,
+            held: !!held,
+            avgEntryPrice: held?.avgEntryPrice ?? null,
+            currentPrice: held?.currentPrice ?? null,
+            restingProtectiveType: protective?.type === "trailing_stop" ? "trailing_stop" : protective ? "stop" : null,
+            price,
+            atrPct: atrPctByStock.get(est.stockId) ?? null,
+            confidence: est.confidence,
+            cfg,
+          });
+          try {
+            if (action.type === "ENTER") {
+              const { order, stopOrderId } = await submitEntryWithStop({
+                symbol: ticker,
+                qty: action.qty,
+                limitPrice: action.limitPrice,
+                stopPrice: action.stopPrice,
+              });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: action.qty, alpacaOrderId: order.id, status: order.status },
+              });
+              if (stopOrderId) {
+                // Record the protective leg so the pending-fill reconcile loop catches
+                // a broker stop-out (and a cancel/replace) with no extra code.
+                await db.paperOrder.create({
+                  data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty: action.qty, alpacaOrderId: stopOrderId, status: "held" },
+                });
+              }
+              ordersSubmitted++;
+            } else if (action.type === "EXIT" && held) {
+              if (protective) await cancelOrder(protective.id);
+              const qty = Math.abs(held.qty);
+              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "SELL", signal: action.reason, qty, alpacaOrderId: order.id, status: order.status },
+              });
+              ordersSubmitted++;
+            } else if (action.type === "ARM_TRAILING" && held && protective) {
+              await cancelOrder(protective.id);
+              const qty = Math.abs(held.qty);
+              const order = await submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
+              });
+              ordersSubmitted++;
+            } else if (action.type === "REPAIR_STOP" && held) {
+              const qty = Math.abs(held.qty);
+              const order = await submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
+              });
+              ordersSubmitted++;
+            }
+          } catch (e) {
+            errors.push(`Alpaca broker action failed for ${ticker}: ${String(e)}`);
+          }
+        }
+      } else {
+        for (const est of estimates) {
+          const ticker = est.stock.ticker;
+          const combinedSignal = scoreToSignal(est.combinedScore);
+          const held = posBySymbol.get(ticker);
+          const wantLong = riskEnabled ? combinedRmLong.has(est.stockId) : isEntrySignal(combinedSignal);
+          // Label a sell with the risk-managed exit reason (STOP/TRAIL/…) when present.
+          const sellSignal = riskEnabled ? combinedRmExit.get(est.stockId) ?? combinedSignal : combinedSignal;
+          try {
+            if (wantLong && !held) {
+              const notional = confidenceNotional(est.confidence);
+              const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional, alpacaOrderId: order.id, status: order.status },
+              });
+              ordersSubmitted++;
+            } else if (!wantLong && held && held.qty > 0) {
+              const qty = Math.abs(held.qty);
+              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
+              await db.paperOrder.create({
+                data: { stockId: est.stockId, side: "SELL", signal: sellSignal, qty, alpacaOrderId: order.id, status: order.status },
+              });
+              ordersSubmitted++;
+            }
+          } catch (e) {
+            errors.push(`Alpaca order failed for ${ticker}: ${String(e)}`);
+          }
         }
       }
 
