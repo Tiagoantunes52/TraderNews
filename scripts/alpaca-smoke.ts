@@ -10,12 +10,14 @@ import {
   getAccount,
   getPositions,
   getOpenOrders,
+  getAccountActivities,
   submitEntryWithStop,
   submitStopSell,
   submitTrailingStop,
   cancelOrder,
   submitMarketOrder,
 } from "../src/lib/alpaca-trading";
+import { realizedFromFills } from "../src/lib/paper-trading";
 
 async function readOnly() {
   console.log("configured:", isPaperTradingConfigured());
@@ -25,6 +27,9 @@ async function readOnly() {
   console.log("positions:  ", pos.length, JSON.stringify(pos.slice(0, 8)));
   const open = await getOpenOrders();
   console.log("openOrders: ", open.length, JSON.stringify(open.slice(0, 8)));
+  const { trades, totalRealized } = realizedFromFills(await getAccountActivities());
+  console.log("realized:   ", `$${totalRealized.toFixed(2)} over ${trades.length} closed trades`);
+  console.log("  recent:   ", JSON.stringify(trades.slice(0, 5)));
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

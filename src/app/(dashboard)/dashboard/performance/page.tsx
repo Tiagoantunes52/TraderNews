@@ -6,7 +6,8 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
 import { formatDistanceToNow } from "@/lib/format-date";
-import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, type Strategy } from "@/lib/paper-trading";
+import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, realizedFromFills, type Strategy, type ClosedTrade } from "@/lib/paper-trading";
+import { isPaperTradingConfigured, getAccountActivities } from "@/lib/alpaca-trading";
 import { PerformanceEquityChart } from "@/components/performance-equity-chart";
 import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
 
@@ -143,7 +144,56 @@ export default async function PerformancePage() {
     return { key, meta, latest, returnPct };
   });
 
-  const alpacaConfigured = booksPresent.has("ALPACA");
+  const alpacaConfigured = isPaperTradingConfigured();
+
+  // Realized P&L for the live Alpaca book, reconstructed from its fill history
+  // (Alpaca has no closed-position endpoint). Best-effort: degrade to empty if the
+  // account is unreachable so the rest of the page still renders.
+  let alpacaClosed: { trades: ClosedTrade[]; totalRealized: number } = { trades: [], totalRealized: 0 };
+  if (alpacaConfigured) {
+    try {
+      alpacaClosed = realizedFromFills(await getAccountActivities());
+    } catch {
+      // leave empty
+    }
+  }
+
+  // Alpaca fills only carry tickers — look up names for the closed-trade list.
+  const alpacaSymbols = [...new Set(alpacaClosed.trades.map((t) => t.symbol))];
+  const alpacaNames = new Map<string, string>(
+    alpacaSymbols.length > 0
+      ? (
+          await db.stock.findMany({ where: { ticker: { in: alpacaSymbols } }, select: { ticker: true, name: true } })
+        ).map((s) => [s.ticker, s.name])
+      : []
+  );
+
+  // Unified per-book performance rows: each simulated signal source + the live Alpaca book.
+  type BookRow = { key: string; label: string; color: string; closed: number; open: number; wins: number; realized: number };
+  const bookRows: BookRow[] = ratedStrategies.map((strat) => {
+    const st = statsByStrategy.get(strat)!;
+    return {
+      key: strat,
+      label: STRATEGY_LABEL[strat],
+      color: BOOK_META.find((b) => b.key === STRATEGY_BOOK[strat])!.color,
+      closed: st.closed,
+      open: openCountByStrategy.get(strat) ?? 0,
+      wins: st.wins,
+      realized: st.realized,
+    };
+  });
+  if (alpacaConfigured && (booksPresent.has("ALPACA") || alpacaClosed.trades.length > 0)) {
+    const meta = BOOK_META.find((b) => b.key === "ALPACA")!;
+    bookRows.push({
+      key: "ALPACA",
+      label: meta.label,
+      color: meta.color,
+      closed: alpacaClosed.trades.length,
+      open: latestByBook.get("ALPACA")?.openPositions ?? 0,
+      wins: alpacaClosed.trades.filter((t) => t.realizedPnl > 0).length,
+      realized: alpacaClosed.totalRealized,
+    });
+  }
 
   return (
     <div className="space-y-6">
@@ -178,8 +228,8 @@ export default async function PerformancePage() {
           <div className="mb-3">
             <p className="text-sm font-medium">Equity curves</p>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Hypothetical equity of each signal source, sized by estimate confidence. Sim books start from{" "}
-              {fmtUsd(SIM_STARTING_EQUITY)}.
+              Each book&apos;s equity over time — the simulated signal books (sized by estimate confidence, starting
+              from {fmtUsd(SIM_STARTING_EQUITY)}) and the live Alpaca paper account.
             </p>
           </div>
           <PerformanceEquityChart data={chartData} books={orderedBooks} />
@@ -188,55 +238,51 @@ export default async function PerformancePage() {
 
       <Card className="rounded-2xl">
         <CardContent className="p-4 sm:p-6">
-          <p className="text-sm font-medium mb-3">Hit rate by signal source</p>
+          <p className="text-sm font-medium mb-1">Hit rate &amp; realized P&amp;L by book</p>
+          <p className="text-xs text-muted-foreground mb-3">
+            Each signal source runs as its own simulated book; the live Alpaca paper account mirrors the combined
+            signal with real orders. Win rate is the share of closed positions that were profitable; realized
+            excludes still-open positions.
+          </p>
           <div className="space-y-2">
             <div className="grid grid-cols-12 text-xs text-muted-foreground px-2">
-              <span className="col-span-5">Signal source</span>
+              <span className="col-span-5">Book</span>
               <span className="col-span-2 text-right">Closed</span>
               <span className="col-span-2 text-right">Open</span>
               <span className="col-span-1 text-right">Win</span>
               <span className="col-span-2 text-right">Realized</span>
             </div>
-            {ratedStrategies.map((strat) => {
-              const st = statsByStrategy.get(strat)!;
-              const hitRate = st.closed > 0 ? (st.wins / st.closed) * 100 : null;
+            {bookRows.map((row) => {
+              const hitRate = row.closed > 0 ? (row.wins / row.closed) * 100 : null;
               return (
-                <div
-                  key={strat}
-                  className="grid grid-cols-12 items-center text-sm px-2 py-2 rounded-lg odd:bg-muted/40"
-                >
+                <div key={row.key} className="grid grid-cols-12 items-center text-sm px-2 py-2 rounded-lg odd:bg-muted/40">
                   <span className="col-span-5 flex items-center gap-2">
-                    <span
-                      className="inline-block h-2 w-2 rounded-full"
-                      style={{ background: BOOK_META.find((b) => b.key === STRATEGY_BOOK[strat])!.color }}
-                    />
-                    {STRATEGY_LABEL[strat]}
+                    <span className="inline-block h-2 w-2 rounded-full" style={{ background: row.color }} />
+                    {row.label}
                   </span>
-                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">{st.closed}</span>
-                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">
-                    {openCountByStrategy.get(strat) ?? 0}
-                  </span>
+                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">{row.closed}</span>
+                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">{row.open}</span>
                   <span className="col-span-1 text-right tabular-nums font-medium">
                     {hitRate == null ? "—" : `${hitRate.toFixed(0)}%`}
                   </span>
                   <span
                     className={`col-span-2 text-right tabular-nums font-medium ${
-                      st.realized > 0 ? "text-emerald-600" : st.realized < 0 ? "text-rose-600" : "text-muted-foreground"
+                      row.realized > 0 ? "text-emerald-600" : row.realized < 0 ? "text-rose-600" : "text-muted-foreground"
                     }`}
                   >
-                    {fmtUsd(st.realized)}
+                    {fmtUsd(row.realized)}
                   </span>
                 </div>
               );
             })}
           </div>
-          <p className="text-xs text-muted-foreground mt-3">
-            Win rate is the share of closed positions that were profitable. Realized excludes open positions, which
-            are still marked-to-market in the equity curve above.
-          </p>
         </CardContent>
       </Card>
 
+      <SectionHeading
+        title="Simulated signal books"
+        desc="DB-only, marked-to-market against the daily close. These isolate which signal source predicts best — no real money or orders."
+      />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card className="rounded-2xl">
           <CardContent className="p-4 sm:p-6">
@@ -330,43 +376,115 @@ export default async function PerformancePage() {
         </Card>
       </div>
 
-      <Card className="rounded-2xl">
-        <CardContent className="p-4 sm:p-6">
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-sm font-medium">Recent paper orders</p>
-            {!alpacaConfigured && <span className="text-xs text-muted-foreground">Alpaca not configured</span>}
-          </div>
-          {recentOrders.length === 0 ? (
-            <p className="text-xs text-muted-foreground py-4 text-center">
-              No live orders yet — the combined book places real paper orders once Alpaca paper keys are set.
-            </p>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1.5">
-              {recentOrders.map((o) => (
-                <div key={o.id} className="flex items-center justify-between text-xs gap-2">
-                  <Link
-                    href={`/dashboard/stocks/${o.stock.ticker}`}
-                    title={o.stock.ticker}
-                    className="font-medium hover:underline truncate min-w-0"
-                  >
-                    {o.stock.name}
-                  </Link>
-                  <span className="flex items-center gap-2 shrink-0">
-                    <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
-                      {o.side}
-                    </span>
-                    {o.notional != null && <span className="tabular-nums text-muted-foreground">{fmtUsd(o.notional)}</span>}
-                    <Badge variant="outline" className="font-normal">
-                      {o.status}
-                    </Badge>
-                    <span className="text-muted-foreground/70">{formatDistanceToNow(o.submittedAt)}</span>
-                  </span>
-                </div>
-              ))}
+      <SectionHeading
+        title="Live paper account (Alpaca)"
+        desc="Real orders on a single shared Alpaca paper account, mirroring the combined signal. Realized P&amp;L is reconstructed from the account's fills."
+      />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card className="rounded-2xl">
+          <CardContent className="p-4 sm:p-6">
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-sm font-medium">Recent paper orders</p>
+              {!alpacaConfigured && <span className="text-xs text-muted-foreground">Alpaca not configured</span>}
             </div>
-          )}
-        </CardContent>
-      </Card>
+            {recentOrders.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">
+                No live orders yet — the combined book places real paper orders once Alpaca paper keys are set.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {recentOrders.map((o) => (
+                  <div key={o.id} className="flex items-center justify-between text-xs gap-2">
+                    <Link
+                      href={`/dashboard/stocks/${o.stock.ticker}`}
+                      title={o.stock.ticker}
+                      className="font-medium hover:underline truncate min-w-0"
+                    >
+                      {o.stock.name}
+                    </Link>
+                    <span className="flex items-center gap-2 shrink-0">
+                      <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
+                        {o.side}
+                      </span>
+                      {o.notional != null && <span className="tabular-nums text-muted-foreground">{fmtUsd(o.notional)}</span>}
+                      <Badge variant="outline" className="font-normal">
+                        {o.status}
+                      </Badge>
+                      <span className="text-muted-foreground/70">{formatDistanceToNow(o.submittedAt)}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl">
+          <CardContent className="p-4 sm:p-6">
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-sm font-medium">Closed Alpaca trades</p>
+              {alpacaClosed.trades.length > 0 && (
+                <span
+                  className={`text-xs font-medium tabular-nums ${
+                    alpacaClosed.totalRealized > 0
+                      ? "text-emerald-600"
+                      : alpacaClosed.totalRealized < 0
+                        ? "text-rose-600"
+                        : "text-muted-foreground"
+                  }`}
+                >
+                  {fmtUsd(alpacaClosed.totalRealized)} realized
+                </span>
+              )}
+            </div>
+            {!alpacaConfigured ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">Alpaca not configured.</p>
+            ) : alpacaClosed.trades.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">No closed Alpaca trades yet.</p>
+            ) : (
+              <div className="space-y-1.5">
+                {alpacaClosed.trades.slice(0, 12).map((t, i) => {
+                  const retPct = t.entryPrice !== 0 ? ((t.exitPrice - t.entryPrice) / t.entryPrice) * 100 : null;
+                  return (
+                    <div key={i} className="flex items-center justify-between text-xs gap-2">
+                      <Link
+                        href={`/dashboard/stocks/${t.symbol}`}
+                        title={t.symbol}
+                        className="font-medium hover:underline truncate min-w-0"
+                      >
+                        {alpacaNames.get(t.symbol) ?? t.symbol}
+                      </Link>
+                      <span className="flex items-center gap-2 shrink-0">
+                        <span className="tabular-nums text-muted-foreground">
+                          {Number.isInteger(t.qty) ? t.qty : t.qty.toFixed(2)} sh
+                        </span>
+                        <span className={`tabular-nums font-medium ${t.realizedPnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                          {fmtUsd(t.realizedPnl)}
+                        </span>
+                        {retPct != null && (
+                          <span className={`tabular-nums ${t.realizedPnl >= 0 ? "text-emerald-600/80" : "text-rose-600/80"}`}>
+                            {fmtPct(retPct)}
+                          </span>
+                        )}
+                        <span className="text-muted-foreground/70">{formatDistanceToNow(new Date(t.closedAt))}</span>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function SectionHeading({ title, desc }: { title: string; desc: string }) {
+  return (
+    <div className="pt-2">
+      <h2 className="text-base font-semibold">{title}</h2>
+      <p className="text-xs text-muted-foreground mt-0.5 max-w-2xl">{desc}</p>
     </div>
   );
 }

@@ -272,3 +272,23 @@ export async function getClock(): Promise<AlpacaClock> {
   const raw = await apiGet<{ is_open?: boolean; next_close?: string }>("/v2/clock");
   return { isOpen: Boolean(raw.is_open), nextClose: raw.next_close ?? null };
 }
+
+export type AlpacaFill = { symbol: string; side: "buy" | "sell"; qty: number; price: number; time: string };
+
+/**
+ * Recent FILL activities. Alpaca has no "closed position with realized P&L" endpoint,
+ * so this is the source for reconstructing realized P&L (FIFO-match sells vs buys —
+ * see realizedFromFills). `pageSize` caps at Alpaca's 100/page; newest first.
+ */
+export async function getAccountActivities(pageSize = 100): Promise<AlpacaFill[]> {
+  const raw = await apiGet<Array<{ symbol: string; side: string; qty?: string; price?: string; transaction_time?: string }>>(
+    `/v2/account/activities/FILL?direction=desc&page_size=${pageSize}`
+  );
+  return raw.map((a) => ({
+    symbol: a.symbol,
+    side: a.side === "sell" ? "sell" : "buy",
+    qty: num(a.qty) ?? 0,
+    price: num(a.price) ?? 0,
+    time: a.transaction_time ?? "",
+  }));
+}
