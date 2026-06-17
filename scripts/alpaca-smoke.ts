@@ -27,38 +27,51 @@ async function readOnly() {
   console.log("openOrders: ", open.length, JSON.stringify(open.slice(0, 8)));
 }
 
-async function orderRoundtrip(symbol: string, ref: number) {
-  const limitPrice = Math.round(ref * 1.005 * 100) / 100;
-  const stopPrice = Math.round(ref * 0.92 * 100) / 100;
-  console.log(`\n[order] ${symbol} qty=1 limit=${limitPrice} stop=${stopPrice}`);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const round2 = (v: number) => Math.round(v * 100) / 100;
 
+async function orderRoundtrip(symbol: string, cliRef: number) {
+  // Use the live current price of a HELD symbol so the limit is genuinely marketable
+  // and the stop is validly below market. Fall back to the CLI ref if not held.
+  const heldBefore = (await getPositions()).find((p) => p.symbol === symbol);
+  const qtyBefore = heldBefore?.qty ?? 0;
+  const ref = heldBefore?.currentPrice ?? cliRef;
+  const limitPrice = round2(ref * 1.005); // marketable: fills at market, capped here
+  const stopPrice = round2(ref * 0.92); // 8% below — comfortably under market
+
+  console.log(`\n[order] ${symbol} ref=${ref} buy 1 limit=${limitPrice} stop=${stopPrice} (qtyBefore=${qtyBefore})`);
+
+  // 1) entry + attached GTC stop (OTO)
   const entry = await submitEntryWithStop({ symbol, qty: 1, limitPrice, stopPrice });
-  console.log("  entry accepted:", entry.order.id, "status:", entry.order.status, "stopLeg:", entry.stopOrderId);
+  console.log("  ENTRY:", entry.order.id, entry.order.status, "stopLeg:", entry.stopOrderId);
+  await sleep(2500);
+  console.log("  resting sells after entry:", JSON.stringify((await getOpenOrders(symbol)).filter((o) => o.side === "sell")));
 
-  // small settle, then inspect the resting protective order Alpaca created
-  await new Promise((r) => setTimeout(r, 2000));
-  const resting = (await getOpenOrders(symbol)).filter((o) => o.side === "sell");
-  console.log("  resting sell orders:", JSON.stringify(resting));
+  // 2) standalone GTC stop-sell (the REPAIR payload)
+  const standalone = await submitStopSell({ symbol, qty: 1, stopPrice: round2(ref * 0.9) });
+  console.log("  STOP_SELL:", standalone.id, standalone.status);
 
-  // exercise the trailing + standalone-stop payloads too (then cancel them)
+  // 3) trailing stop (the ARM_TRAILING payload)
   const trail = await submitTrailingStop({ symbol, qty: 1, trailPercent: 12 });
-  console.log("  trailing accepted:", trail.id, trail.status);
-  await cancelOrder(trail.id);
+  console.log("  TRAILING:", trail.id, trail.status);
 
-  // clean up: cancel any resting stop/trailing, then flatten the 1-share position
+  // 4) cancel everything I placed (all sells; the account had 0 open orders before)
   for (const o of await getOpenOrders(symbol)) {
     if (o.side === "sell") await cancelOrder(o.id);
   }
-  await new Promise((r) => setTimeout(r, 1000));
-  const held = (await getPositions()).find((p) => p.symbol === symbol);
-  if (held && held.qty > 0) {
-    const close = await submitMarketOrder({ symbol, side: "sell", qty: Math.floor(held.qty) });
-    console.log("  flattened:", close.id, close.status);
+  console.log("  canceled all resting sells");
+
+  // flatten ONLY the shares I added — leave the pre-existing position untouched
+  await sleep(1500);
+  const qtyAfter = (await getPositions()).find((p) => p.symbol === symbol)?.qty ?? 0;
+  const delta = Math.round((qtyAfter - qtyBefore) * 1e6) / 1e6;
+  console.log(`  qtyAfter=${qtyAfter} delta=${delta}`);
+  if (delta > 0) {
+    const close = await submitMarketOrder({ symbol, side: "sell", qty: delta });
+    console.log("  FLATTENED my add:", close.id, close.status, "qty", delta);
   } else {
-    console.log("  no position to flatten");
+    console.log("  buy didn't fill / nothing to flatten");
   }
-  // silence unused-import lint when only the read path runs
-  void submitStopSell;
 }
 
 (async () => {
