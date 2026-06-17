@@ -96,7 +96,7 @@ export function PerformanceEquityChart({
             dataKey={b.key}
             name={b.label}
             stroke={b.color}
-            strokeWidth={b.key === "SIM_COMBINED" ? 2.5 : 1.8}
+            strokeWidth={b.key === "SIM_COMBINED" || b.key === "SIM_COMBINED_RM" ? 2.5 : 1.8}
             dot={false}
             activeDot={{ r: 4 }}
             connectNulls

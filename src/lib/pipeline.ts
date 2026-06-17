@@ -18,13 +18,21 @@ import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift, dete
 import { getCongressTrades, isCongressConfigured, isCongressEligible } from "@/lib/congress-trades";
 import {
   STRATEGIES,
+  RM_STRATEGIES,
   STRATEGY_BOOK,
-  deriveSignals,
+  STRATEGY_SOURCE,
+  STRATEGY_IS_RM,
   reconcilePosition,
+  reconcileRiskManaged,
+  riskConfig,
+  isRiskBooksEnabled,
+  utcDaysBetween,
   summarizeBook,
   confidenceNotional,
   isPaperTradeEligible,
   isEntrySignal,
+  type Strategy,
+  type PositionAction,
 } from "@/lib/paper-trading";
 import {
   isPaperTradingConfigured,
@@ -1081,11 +1089,16 @@ const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expir
 //
 // Acts on today's estimates with simulated long-only trades and tracks hypothetical
 // P&L per signal source — sentiment, quant, and the combined estimate — to measure
-// which predicts best (issue #14). Two layers:
-//   • SIM books (DB-only, always run): one mark-to-market book per strategy. Sizing
-//     is held constant (the estimate's confidence) so only the *signal* differs.
-//   • ALPACA book (only when paper keys are set): the combined signal is mirrored
-//     with REAL orders on the paper account, giving a fills-included reality check.
+// which predicts best (issue #14). Layers:
+//   • SIM books (DB-only, always run): one mark-to-market book per pure signal.
+//     Sizing is held constant (the estimate's confidence) so only the *signal* differs.
+//   • SIM *_RM books (when PAPER_RISK_BOOKS=1): the same signals with a price-aware
+//     exit overlay (stop-loss, trailing stop, confirmed-signal exit, min-hold,
+//     time-stop) + a stricter entry. They measure the marginal value of risk
+//     management without contaminating the pure attribution baseline.
+//   • ALPACA book (only when paper keys are set): the combined signal mirrored with
+//     REAL orders — the risk-managed combined decision when the flag is on, else the
+//     pure combined signal — a fills-included reality check.
 //
 // Idempotent per UTC day via the SIM_COMBINED equity snapshot: the 3-hourly
 // pipeline.yml calls this after `estimate`, but it only acts on the first call each
@@ -1137,29 +1150,91 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           where: { stockId: { in: stockIds }, price: { not: null } },
           orderBy: { date: "desc" },
           distinct: ["stockId"],
-          select: { stockId: true, price: true },
+          select: { stockId: true, price: true, atrPct: true },
         })
       : [];
   const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
+  // ATR% (volatility) per stock — lets the _RM books scale stops to each name's
+  // regime. Absent for new/illiquid names; the overlay falls back to fixed pcts.
+  const atrPctByStock = new Map(quantRows.map((q) => [q.stockId, q.atrPct]));
 
-  // ── Sim books (always run) ─────────────────────────────────────────────────
+  // ── Sim books ──────────────────────────────────────────────────────────────
+  // Pure books (signal-only) always run. The risk-managed (_RM) variants run only
+  // when PAPER_RISK_BOOKS=1; the same flag points the live Alpaca book at the
+  // risk-managed combined signal below (else it mirrors the pure combined signal).
+  const riskEnabled = isRiskBooksEnabled();
+  const cfg = riskConfig();
+  const activeStrategies: Strategy[] = riskEnabled ? [...STRATEGIES, ...RM_STRATEGIES] : STRATEGIES;
+
+  // The live Alpaca book mirrors the COMBINED_RM book's open/flat decision (when the
+  // flag is on), so the real fills track the same risk-managed signal the sim does.
+  const combinedRmLong = new Set<string>(); // stockIds long after this run
+  const combinedRmExit = new Map<string, string>(); // stockId → exit reason on close
+
   // Index open positions by (stock, strategy) for O(1) reconciliation.
   const openPositions = await db.simPosition.findMany({
     where: { status: "OPEN", stockId: { in: stockIds.length > 0 ? stockIds : ["__none__"] } },
-    select: { id: true, stockId: true, strategy: true, qty: true, entryPrice: true },
+    select: {
+      id: true,
+      stockId: true,
+      strategy: true,
+      qty: true,
+      entryPrice: true,
+      entryDate: true,
+      lastMarkDate: true,
+      peakPrice: true,
+      bearishStreak: true,
+    },
   });
   const openByKey = new Map(openPositions.map((p) => [`${p.stockId}|${p.strategy}`, p]));
 
   for (const est of estimates) {
     const price = priceByStock.get(est.stockId);
     if (price == null) continue;
-    const signals = deriveSignals(est);
+    const atrPct = atrPctByStock.get(est.stockId) ?? null;
+    const sourceScores = {
+      SENTIMENT: est.sentimentScore,
+      QUANT: est.quantScore,
+      COMBINED: est.combinedScore,
+    } as const;
 
-    for (const strategy of STRATEGIES) {
-      const signal = signals[strategy];
-      if (signal == null) continue; // e.g. QUANT with no quant score
+    for (const strategy of activeStrategies) {
+      const score = sourceScores[STRATEGY_SOURCE[strategy]];
+      if (score == null) continue; // e.g. QUANT/QUANT_RM with no quant score
+      const signal = scoreToSignal(score);
       const open = openByKey.get(`${est.stockId}|${strategy}`) ?? null;
-      const action = reconcilePosition(signal, price, est.confidence, open);
+
+      let action: PositionAction;
+      if (STRATEGY_IS_RM[strategy]) {
+        action = reconcileRiskManaged({
+          score,
+          signal,
+          price,
+          confidence: est.confidence,
+          atrPct,
+          runsSinceEntry: open ? utcDaysBetween(open.entryDate, todayUTC) : 0,
+          // First action today? The streak only advances on a new UTC day, so a
+          // same-day retry (after a partial failure) can't double-count it.
+          isNewRun: open ? startOfUtcDay(open.lastMarkDate) < todayUTC : true,
+          open: open
+            ? {
+                qty: open.qty,
+                entryPrice: open.entryPrice,
+                peakPrice: open.peakPrice ?? open.entryPrice,
+                bearishStreak: open.bearishStreak,
+              }
+            : null,
+          cfg,
+        });
+      } else {
+        action = reconcilePosition(signal, price, est.confidence, open);
+      }
+
+      // Capture the COMBINED_RM decision so the Alpaca book can mirror it.
+      if (strategy === "COMBINED_RM") {
+        if (action.type === "OPEN" || action.type === "MARK") combinedRmLong.add(est.stockId);
+        else if (action.type === "CLOSE" && action.reason) combinedRmExit.set(est.stockId, action.reason);
+      }
 
       try {
         if (action.type === "OPEN") {
@@ -1174,6 +1249,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               confidence: est.confidence,
               lastMarkDate: to,
               lastMarkPrice: action.price,
+              peakPrice: action.price,
             },
           });
           simOpened++;
@@ -1193,7 +1269,13 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         } else if (action.type === "MARK" && open) {
           await db.simPosition.update({
             where: { id: open.id },
-            data: { lastMarkDate: to, lastMarkPrice: action.price },
+            data: {
+              lastMarkDate: to,
+              lastMarkPrice: action.price,
+              // _RM marks carry updated trailing-peak + bearish-streak state.
+              ...(action.peakPrice != null ? { peakPrice: action.peakPrice } : {}),
+              ...(action.bearishStreak != null ? { bearishStreak: action.bearishStreak } : {}),
+            },
           });
         }
       } catch (e) {
@@ -1203,9 +1285,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   }
 
   // Per-book equity snapshot from the full position history (cumulative realized +
-  // current unrealized). Written last so the SIM_COMBINED row only lands once the
-  // day's reconciliation succeeded — keeping it honest as the idempotency marker.
-  for (const strategy of STRATEGIES) {
+  // current unrealized). The SIM_COMBINED row doubles as the idempotency marker, so
+  // it must land only once the day's reconciliation has succeeded.
+  const snapshotStrategy = async (strategy: Strategy) => {
     try {
       const [closed, open] = await Promise.all([
         db.simPosition.findMany({ where: { strategy, status: "CLOSED" }, select: { realizedPnl: true } }),
@@ -1230,7 +1312,11 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     } catch (e) {
       errors.push(`Equity snapshot failed for ${strategy}: ${String(e)}`);
     }
-  }
+  };
+  // _RM books first (when enabled), then the pure books — so SIM_COMBINED, the
+  // idempotency marker, is still written last.
+  if (riskEnabled) for (const strategy of RM_STRATEGIES) await snapshotStrategy(strategy);
+  for (const strategy of STRATEGIES) await snapshotStrategy(strategy);
 
   // ── Alpaca book (only when paper keys are configured) ──────────────────────
   if (isPaperTradingConfigured()) {
@@ -1260,7 +1346,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }
       }
 
-      // Desired state per stock: long when the combined signal is a buy, else flat.
+      // Desired state per stock. With risk books on, the live account mirrors the
+      // COMBINED_RM decision (so real fills carry the same stop/trail/confirmed-exit
+      // protection the sim models); otherwise it mirrors the pure combined signal.
       const positions = await getPositions();
       const posBySymbol = new Map(positions.map((p) => [p.symbol, p]));
 
@@ -1268,7 +1356,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         const ticker = est.stock.ticker;
         const combinedSignal = scoreToSignal(est.combinedScore);
         const held = posBySymbol.get(ticker);
-        const wantLong = isEntrySignal(combinedSignal);
+        const wantLong = riskEnabled ? combinedRmLong.has(est.stockId) : isEntrySignal(combinedSignal);
+        // Label a sell with the risk-managed exit reason (STOP/TRAIL/…) when present.
+        const sellSignal = riskEnabled ? combinedRmExit.get(est.stockId) ?? combinedSignal : combinedSignal;
         try {
           if (wantLong && !held) {
             const notional = confidenceNotional(est.confidence);
@@ -1291,7 +1381,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               data: {
                 stockId: est.stockId,
                 side: "SELL",
-                signal: combinedSignal,
+                signal: sellSignal,
                 qty,
                 alpacaOrderId: order.id,
                 status: order.status,

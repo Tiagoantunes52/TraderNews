@@ -6,7 +6,7 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
 import { formatDistanceToNow } from "@/lib/format-date";
-import { SIM_STARTING_EQUITY, STRATEGIES, STRATEGY_BOOK, type Strategy } from "@/lib/paper-trading";
+import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, type Strategy } from "@/lib/paper-trading";
 import { PerformanceEquityChart } from "@/components/performance-equity-chart";
 import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
 
@@ -16,6 +16,9 @@ const STRATEGY_LABEL: Record<Strategy, string> = {
   COMBINED: "Combined estimate",
   SENTIMENT: "Sentiment only",
   QUANT: "Quant only",
+  COMBINED_RM: "Combined (risk-managed)",
+  SENTIMENT_RM: "Sentiment (risk-managed)",
+  QUANT_RM: "Quant (risk-managed)",
 };
 
 function fmtUsd(v: number): string {
@@ -50,13 +53,13 @@ export default async function PerformancePage() {
         entryPrice: true,
         lastMarkPrice: true,
         entryDate: true,
-        stock: { select: { ticker: true } },
+        stock: { select: { ticker: true, name: true } },
       },
     }),
     db.paperOrder.findMany({
       orderBy: { submittedAt: "desc" },
       take: 12,
-      include: { stock: { select: { ticker: true } } },
+      include: { stock: { select: { ticker: true, name: true } } },
     }),
   ]);
 
@@ -98,7 +101,7 @@ export default async function PerformancePage() {
 
   // Hit-rate + realized P&L per strategy from closed positions.
   const statsByStrategy = new Map<Strategy, { closed: number; wins: number; realized: number }>();
-  for (const strat of STRATEGIES) statsByStrategy.set(strat, { closed: 0, wins: 0, realized: 0 });
+  for (const strat of ALL_STRATEGIES) statsByStrategy.set(strat, { closed: 0, wins: 0, realized: 0 });
   for (const p of closedPositions) {
     const st = statsByStrategy.get(p.strategy as Strategy);
     if (!st) continue;
@@ -107,10 +110,13 @@ export default async function PerformancePage() {
     if ((p.realizedPnl ?? 0) > 0) st.wins++;
   }
   const openCountByStrategy = new Map<Strategy, number>();
-  for (const strat of STRATEGIES) openCountByStrategy.set(strat, 0);
+  for (const strat of ALL_STRATEGIES) openCountByStrategy.set(strat, 0);
   for (const p of openPositions) {
     openCountByStrategy.set(p.strategy as Strategy, (openCountByStrategy.get(p.strategy as Strategy) ?? 0) + 1);
   }
+  // Only rate strategies whose book has data — keeps the risk-managed rows hidden
+  // until PAPER_RISK_BOOKS=1 has produced snapshots for them.
+  const ratedStrategies = ALL_STRATEGIES.filter((s) => booksPresent.has(STRATEGY_BOOK[s]));
 
   const cards = orderedBooks.map((key) => {
     const meta = BOOK_META.find((b) => b.key === key)!;
@@ -175,7 +181,7 @@ export default async function PerformancePage() {
               <span className="col-span-1 text-right">Win</span>
               <span className="col-span-2 text-right">Realized</span>
             </div>
-            {STRATEGIES.map((strat) => {
+            {ratedStrategies.map((strat) => {
               const st = statsByStrategy.get(strat)!;
               const hitRate = st.closed > 0 ? (st.wins / st.closed) * 100 : null;
               return (
@@ -232,8 +238,12 @@ export default async function PerformancePage() {
                     const upnl = p.qty * (mark - p.entryPrice);
                     return (
                       <div key={i} className="flex items-center justify-between text-xs gap-2">
-                        <Link href={`/dashboard/stocks/${p.stock.ticker}`} className="font-medium hover:underline">
-                          {p.stock.ticker}
+                        <Link
+                          href={`/dashboard/stocks/${p.stock.ticker}`}
+                          title={p.stock.ticker}
+                          className="font-medium hover:underline truncate min-w-0"
+                        >
+                          {p.stock.name}
                         </Link>
                         <span className="flex items-center gap-2 shrink-0">
                           <Badge variant="outline" className="font-normal">
@@ -268,8 +278,12 @@ export default async function PerformancePage() {
               <div className="space-y-1.5">
                 {recentOrders.map((o) => (
                   <div key={o.id} className="flex items-center justify-between text-xs gap-2">
-                    <Link href={`/dashboard/stocks/${o.stock.ticker}`} className="font-medium hover:underline">
-                      {o.stock.ticker}
+                    <Link
+                      href={`/dashboard/stocks/${o.stock.ticker}`}
+                      title={o.stock.ticker}
+                      className="font-medium hover:underline truncate min-w-0"
+                    >
+                      {o.stock.name}
                     </Link>
                     <span className="flex items-center gap-2 shrink-0">
                       <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
