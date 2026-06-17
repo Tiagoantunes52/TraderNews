@@ -10,6 +10,7 @@ import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
 import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
 import { CongressTradeList } from "@/components/congress-trade-list";
 import { mood } from "@/lib/mood";
+import { safeExternalHref } from "@/lib/normalize";
 import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
 
 export default async function StockDetailPage({ params }: PageProps<"/dashboard/stocks/[ticker]">) {
@@ -399,7 +400,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                 <CardContent className="py-3 px-4">
                   <div className="flex flex-col-reverse sm:flex-row sm:items-start sm:justify-between gap-2 sm:gap-3">
                     <a
-                      href={article.url}
+                      href={safeExternalHref(article.url)}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="font-medium text-sm leading-snug hover:underline"

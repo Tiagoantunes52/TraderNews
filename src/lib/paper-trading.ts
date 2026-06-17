@@ -486,3 +486,62 @@ export function summarizeBook(
     hitRate: closed.length > 0 ? wins / closed.length : null,
   };
 }
+
+// ── Realized P&L for the live Alpaca book ────────────────────────────────────
+// Alpaca exposes open positions (with unrealized P&L) and a flat order/fill history,
+// but no "closed position with realized P&L". So reconstruct realized P&L by
+// FIFO-matching each sell fill against the prior buy fills for that symbol. Pure +
+// unit-tested; the page feeds it /v2/account/activities (see getAccountActivities).
+export type Fill = { symbol: string; side: "buy" | "sell"; qty: number; price: number; time: string };
+export type ClosedTrade = {
+  symbol: string;
+  qty: number;
+  entryPrice: number; // weighted-average buy price of the matched lots
+  exitPrice: number;
+  realizedPnl: number;
+  closedAt: string;
+};
+
+export function realizedFromFills(fills: Fill[]): { trades: ClosedTrade[]; totalRealized: number } {
+  const bySymbol = new Map<string, Fill[]>();
+  for (const f of fills) {
+    const arr = bySymbol.get(f.symbol);
+    if (arr) arr.push(f);
+    else bySymbol.set(f.symbol, [f]);
+  }
+
+  const trades: ClosedTrade[] = [];
+  let totalRealized = 0;
+  for (const [symbol, arr] of bySymbol) {
+    const chrono = [...arr].sort((a, b) => a.time.localeCompare(b.time));
+    const lots: { qty: number; price: number }[] = []; // open buy lots, FIFO
+    for (const f of chrono) {
+      if (f.side === "buy") {
+        lots.push({ qty: f.qty, price: f.price });
+        continue;
+      }
+      // Sell → consume buy lots front-to-back, accumulating cost basis.
+      let remaining = f.qty;
+      let matchedQty = 0;
+      let costBasis = 0;
+      while (remaining > 1e-9 && lots.length > 0) {
+        const lot = lots[0];
+        const take = Math.min(remaining, lot.qty);
+        costBasis += take * lot.price;
+        matchedQty += take;
+        lot.qty -= take;
+        remaining -= take;
+        if (lot.qty <= 1e-9) lots.shift();
+      }
+      if (matchedQty > 1e-9) {
+        const realizedPnl = matchedQty * f.price - costBasis;
+        trades.push({ symbol, qty: matchedQty, entryPrice: costBasis / matchedQty, exitPrice: f.price, realizedPnl, closedAt: f.time });
+        totalRealized += realizedPnl;
+      }
+      // A sell with no matching buy (its entry predates the fetched window) is left
+      // unmatched — its realized P&L just isn't shown.
+    }
+  }
+  trades.sort((a, b) => b.closedAt.localeCompare(a.closedAt)); // newest first
+  return { trades, totalRealized };
+}

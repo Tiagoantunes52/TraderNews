@@ -13,6 +13,7 @@ import {
   reconcileRiskManaged,
   planBrokerAction,
   isBrokerStopsEnabled,
+  realizedFromFills,
   utcDaysBetween,
   summarizeBook,
   STRATEGY_BOOK,
@@ -504,5 +505,52 @@ describe("planBrokerAction()", () => {
       if (prev === undefined) delete process.env.PAPER_BROKER_STOPS;
       else process.env.PAPER_BROKER_STOPS = prev;
     }
+  });
+});
+
+describe("realizedFromFills()", () => {
+  const buy = (symbol: string, qty: number, price: number, time: string) => ({ symbol, side: "buy" as const, qty, price, time });
+  const sell = (symbol: string, qty: number, price: number, time: string) => ({ symbol, side: "sell" as const, qty, price, time });
+
+  it("realizes a simple round-trip", () => {
+    const { trades, totalRealized } = realizedFromFills([buy("AAPL", 10, 50, "2026-06-10T14:00:00Z"), sell("AAPL", 10, 55, "2026-06-12T14:00:00Z")]);
+    expect(trades).toEqual([
+      { symbol: "AAPL", qty: 10, entryPrice: 50, exitPrice: 55, realizedPnl: 50, closedAt: "2026-06-12T14:00:00Z" },
+    ]);
+    expect(totalRealized).toBe(50);
+  });
+
+  it("handles a partial close, leaving the rest open", () => {
+    const { trades } = realizedFromFills([buy("AAPL", 10, 50, "t1"), sell("AAPL", 4, 55, "t2")]);
+    expect(trades).toEqual([{ symbol: "AAPL", qty: 4, entryPrice: 50, exitPrice: 55, realizedPnl: 20, closedAt: "t2" }]);
+  });
+
+  it("FIFO-matches a sell across multiple buy lots (weighted entry)", () => {
+    // buy 5@50, buy 5@60, sell 8@70 → cost basis 5×50 + 3×60 = 430; realized 8×70 − 430 = 130.
+    const { trades, totalRealized } = realizedFromFills([buy("MSFT", 5, 50, "t1"), buy("MSFT", 5, 60, "t2"), sell("MSFT", 8, 70, "t3")]);
+    expect(trades).toEqual([{ symbol: "MSFT", qty: 8, entryPrice: 53.75, exitPrice: 70, realizedPnl: 130, closedAt: "t3" }]);
+    expect(totalRealized).toBe(130);
+  });
+
+  it("ignores a sell with no matching buy (entry predates the window)", () => {
+    const { trades, totalRealized } = realizedFromFills([sell("NVDA", 5, 40, "t1")]);
+    expect(trades).toEqual([]);
+    expect(totalRealized).toBe(0);
+  });
+
+  it("sums across symbols and returns trades newest-first", () => {
+    const { trades, totalRealized } = realizedFromFills([
+      buy("AAPL", 10, 50, "2026-06-10T00:00:00Z"),
+      sell("AAPL", 10, 45, "2026-06-11T00:00:00Z"), // −50
+      buy("MSFT", 2, 100, "2026-06-12T00:00:00Z"),
+      sell("MSFT", 2, 130, "2026-06-13T00:00:00Z"), // +60
+    ]);
+    expect(trades.map((t) => t.symbol)).toEqual(["MSFT", "AAPL"]); // newest first
+    expect(totalRealized).toBe(10);
+  });
+
+  it("handles fractional quantities", () => {
+    const { totalRealized } = realizedFromFills([buy("F", 1.5, 10, "t1"), sell("F", 1.5, 12, "t2")]);
+    expect(totalRealized).toBeCloseTo(3);
   });
 });

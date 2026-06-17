@@ -5,6 +5,7 @@ import Link from "next/link";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
+import { safeExternalHref } from "@/lib/normalize";
 import { NewsFilterBar } from "./news-filter-bar";
 import { LoadMoreButton } from "./load-more-button";
 import type { Prisma } from "@/generated/prisma/client";
@@ -157,7 +158,7 @@ export default async function NewsFeedPage({
                 <div className="flex flex-col-reverse sm:flex-row sm:items-start sm:justify-between gap-2 sm:gap-4">
                   <CardTitle className="text-base font-medium leading-snug">
                     <a
-                      href={article.url}
+                      href={safeExternalHref(article.url)}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="hover:underline"
