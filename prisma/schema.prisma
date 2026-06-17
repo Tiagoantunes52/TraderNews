@@ -323,7 +323,7 @@ model SimPosition {
   stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
   stockId String
 
-  strategy     String // SENTIMENT | QUANT | COMBINED
+  strategy     String // SENTIMENT | QUANT | COMBINED (+ *_RM risk-managed variants)
   status       String // OPEN | CLOSED
   qty          Float
   entryDate    DateTime
@@ -334,6 +334,10 @@ model SimPosition {
   exitDate     DateTime?
   exitPrice    Float?
   realizedPnl  Float?
+
+  // Risk-managed (_RM) overlay state; null/0 on the pure books that don't use it.
+  peakPrice     Float? // running max since entry — drives the trailing stop
+  bearishStreak Int    @default(0) // consecutive bearish runs — confirmed-signal exit
 
   createdAt DateTime @default(now())
 
