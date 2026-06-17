@@ -1,0 +1,31 @@
+# Dependency update automation (issue #22).
+# Dependabot opens PRs for outdated/vulnerable deps; it never auto-merges, so every
+# bump is reviewed. Minor/patch updates are batched into one PR to cut noise; majors
+# come as individual PRs (notably Next.js — see AGENTS.md, this is a customized build,
+# so framework majors get a deliberate review).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: chore

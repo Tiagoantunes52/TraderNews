@@ -20,6 +20,21 @@ jobs:
       - run: npx prisma generate
       - run: npm test
 
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install
+      # Gate on PRODUCTION deps at HIGH severity+. Moderate/dev advisories don't block
+      # CI (they're tracked + PR'd by Dependabot); a new high/critical in a shipped dep
+      # fails the build. See issue #22.
+      - run: npm audit --omit=dev --audit-level=high
+
   e2e:
     name: E2E tests
     runs-on: ubuntu-latest
