@@ -2,8 +2,13 @@ name: News Pipeline
 
 on:
   schedule:
-    - cron: "0 */3 * * *"  # every 3 hours
-  workflow_dispatch:       # allow manual trigger from GitHub Actions UI
+    - cron: "0 */3 * * *"     # every 3h: signal generation (news → … → estimate)
+    # Near-close trade windows — only matter when PAPER_TRADE_NEAR_CLOSE=1, which
+    # makes the paper stage no-op until the final minutes before the US close.
+    # ~30 min before the close: 20:00 UTC (EDT) / 21:00 UTC (EST), weekdays.
+    - cron: "30 19 * * 1-5"
+    - cron: "30 20 * * 1-5"
+  workflow_dispatch:          # allow manual trigger from GitHub Actions UI
 
 # Never let two pipeline runs overlap: the stages are idempotent per day, but
 # concurrent runs would waste API budget re-attempting the same stocks.

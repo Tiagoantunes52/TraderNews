@@ -11,6 +11,8 @@ import {
   isPaperTradeEligible,
   reconcilePosition,
   reconcileRiskManaged,
+  planBrokerAction,
+  isBrokerStopsEnabled,
   utcDaysBetween,
   summarizeBook,
   STRATEGY_BOOK,
@@ -401,5 +403,106 @@ describe("reconcileRiskManaged()", () => {
       type: "MARK",
       peakPrice: 130, // a pullback doesn't lower the peak
     });
+  });
+});
+
+describe("planBrokerAction()", () => {
+  const base = {
+    opened: false,
+    stillLong: true,
+    exitReason: null as string | null,
+    held: false,
+    avgEntryPrice: null as number | null,
+    currentPrice: null as number | null,
+    restingProtectiveType: null as "stop" | "trailing_stop" | null,
+    price: 100,
+    atrPct: null as number | null,
+    confidence: 0.6,
+    cfg: DEFAULT_RISK_CONFIG,
+    base: 1000,
+    entryLimitBufferPct: 0.005,
+  };
+  const plan = (o: Partial<typeof base>) => planBrokerAction({ ...base, ...o });
+
+  describe("entry (whole-share, marketable-limit + ATR stop)", () => {
+    it("enters on a fresh sim OPEN when flat, flooring to whole shares", () => {
+      // notional 1000×0.6 = $600; floor(600/100) = 6 shares; stop 100×0.92 = 92.
+      expect(plan({ opened: true })).toEqual({ type: "ENTER", qty: 6, limitPrice: 100.5, stopPrice: 92 });
+    });
+
+    it("skips a name when the confidence-weighted budget is under one share", () => {
+      // $600 budget, $700 price → floor = 0 → no live order (sim book still covers it).
+      expect(plan({ opened: true, price: 700 })).toEqual({ type: "NONE" });
+    });
+
+    it("widens the stop with ATR when available", () => {
+      // atrPct 4% × 2.5 = 10% → stop 100×0.90 = 90.
+      expect(plan({ opened: true, atrPct: 4 })).toMatchObject({ type: "ENTER", stopPrice: 90 });
+    });
+
+    it("does NOT re-enter a name the broker stopped out while the sim is still long", () => {
+      // flat (broker stop fired) + sim still long but NOT a fresh open → re-entry guard.
+      expect(plan({ opened: false, stillLong: true, held: false })).toEqual({ type: "NONE" });
+    });
+  });
+
+  describe("exits", () => {
+    it("exits on an info exit (signal flip / time stop)", () => {
+      expect(plan({ held: true, exitReason: "SIGNAL" })).toEqual({ type: "EXIT", reason: "SIGNAL" });
+      expect(plan({ held: true, exitReason: "TIME" })).toEqual({ type: "EXIT", reason: "TIME" });
+    });
+
+    it("does NOT app-exit on a price exit — the broker already enforces STOP/TRAIL", () => {
+      expect(plan({ held: true, stillLong: false, exitReason: "STOP" })).toEqual({ type: "NONE" });
+      expect(plan({ held: true, stillLong: false, exitReason: "TRAIL" })).toEqual({ type: "NONE" });
+    });
+  });
+
+  describe("managing the resting protective order", () => {
+    it("arms the trailing stop once up the activation threshold", () => {
+      // gain (110−100)/100 = 10% ≥ 8% activate, resting fixed stop → trail 12%.
+      expect(
+        plan({ held: true, restingProtectiveType: "stop", avgEntryPrice: 100, currentPrice: 110 })
+      ).toEqual({ type: "ARM_TRAILING", trailPercent: 12 });
+    });
+
+    it("does not arm before the activation gain", () => {
+      expect(
+        plan({ held: true, restingProtectiveType: "stop", avgEntryPrice: 100, currentPrice: 105 })
+      ).toEqual({ type: "NONE" });
+    });
+
+    it("does not re-arm a position already on a trailing stop", () => {
+      expect(
+        plan({ held: true, restingProtectiveType: "trailing_stop", avgEntryPrice: 100, currentPrice: 130 })
+      ).toEqual({ type: "NONE" });
+    });
+
+    it("repairs a missing protective order off the avg entry price", () => {
+      expect(plan({ held: true, restingProtectiveType: null, avgEntryPrice: 100 })).toEqual({
+        type: "REPAIR_STOP",
+        stopPrice: 92,
+      });
+    });
+
+    it("falls back to the reference price when there is no avg entry yet", () => {
+      expect(plan({ held: true, restingProtectiveType: null, avgEntryPrice: null, price: 50 })).toEqual({
+        type: "REPAIR_STOP",
+        stopPrice: 46,
+      });
+    });
+  });
+
+  it("isBrokerStopsEnabled() is gated on PAPER_BROKER_STOPS=1", () => {
+    const prev = process.env.PAPER_BROKER_STOPS;
+    try {
+      delete process.env.PAPER_BROKER_STOPS;
+      expect(isBrokerStopsEnabled()).toBe(false);
+      process.env.PAPER_BROKER_STOPS = "1";
+      expect(isBrokerStopsEnabled()).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PAPER_BROKER_STOPS;
+      else process.env.PAPER_BROKER_STOPS = prev;
+    }
   });
 });
