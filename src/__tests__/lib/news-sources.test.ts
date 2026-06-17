@@ -71,6 +71,18 @@ describe("mergeArticles", () => {
     ]);
     expect(merged[0].provider).toBe("Yahoo RSS");
   });
+
+  it("drops non-http(s) URLs from untrusted feeds (#18)", () => {
+    const merged = mergeArticles([
+      mk({ url: "https://x.com/ok" }),
+      mk({ url: "javascript:alert(1)" }),
+      mk({ url: "\tJavaScript:alert(2)" }), // obfuscated scheme
+      mk({ url: "data:text/html,<script>1</script>" }),
+      mk({ url: "not-a-url" }),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].url).toBe("https://x.com/ok");
+  });
 });
 
 describe("DEFAULT_SOURCES", () => {

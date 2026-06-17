@@ -14,7 +14,7 @@ import { getTiingoNews, toTiingoTicker } from "@/lib/tiingo";
 import { getAlpacaNews } from "@/lib/alpaca";
 import { getYahooRssNews } from "@/lib/yahoo-rss";
 import { getGoogleNews } from "@/lib/google-news";
-import { normalizeUrl } from "@/lib/normalize";
+import { normalizeUrl, isHttpUrl } from "@/lib/normalize";
 
 // `name` (company name) is needed by name-keyed sources like Google News; it's
 // optional so ticker-only callers/tests keep working.
@@ -394,6 +394,9 @@ export const DEFAULT_SOURCES: NewsSource[] = [
 export function mergeArticles(all: AggregatedArticle[]): AggregatedArticle[] {
   const byUrl = new Map<string, AggregatedArticle>();
   for (const a of all) {
+    // Drop anything that isn't an http(s) link before it can be stored/rendered —
+    // an untrusted feed could inject a javascript:/data: URL (#18).
+    if (!isHttpUrl(a.url)) continue;
     const key = normalizeUrl(a.url);
     const existing = byUrl.get(key);
     if (!existing) {
