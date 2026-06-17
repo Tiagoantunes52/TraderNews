@@ -42,9 +42,23 @@ export default async function PerformancePage() {
 
   // Signal performance is a global property of the app's signals (not per-user), so
   // these books span the whole watched universe.
-  const [snapshots, closedPositions, openPositions, recentOrders] = await Promise.all([
+  const [snapshots, closedPositions, recentClosed, openPositions, recentOrders] = await Promise.all([
     db.paperEquitySnapshot.findMany({ orderBy: { date: "asc" } }),
     db.simPosition.findMany({ where: { status: "CLOSED" }, select: { strategy: true, realizedPnl: true } }),
+    db.simPosition.findMany({
+      where: { status: "CLOSED" },
+      orderBy: { exitDate: "desc" },
+      take: 12,
+      select: {
+        strategy: true,
+        qty: true,
+        entryPrice: true,
+        exitPrice: true,
+        exitDate: true,
+        realizedPnl: true,
+        stock: { select: { ticker: true, name: true } },
+      },
+    }),
     db.simPosition.findMany({
       where: { status: "OPEN" },
       select: {
@@ -114,6 +128,8 @@ export default async function PerformancePage() {
   for (const p of openPositions) {
     openCountByStrategy.set(p.strategy as Strategy, (openCountByStrategy.get(p.strategy as Strategy) ?? 0) + 1);
   }
+  // Total realized P&L across every closed sim position (all books).
+  const totalRealized = closedPositions.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
   // Only rate strategies whose book has data — keeps the risk-managed rows hidden
   // until PAPER_RISK_BOOKS=1 has produced snapshots for them.
   const ratedStrategies = ALL_STRATEGIES.filter((s) => booksPresent.has(STRATEGY_BOOK[s]));
@@ -265,43 +281,92 @@ export default async function PerformancePage() {
         <Card className="rounded-2xl">
           <CardContent className="p-4 sm:p-6">
             <div className="flex items-center justify-between mb-3">
-              <p className="text-sm font-medium">Recent paper orders</p>
-              {!alpacaConfigured && (
-                <span className="text-xs text-muted-foreground">Alpaca not configured</span>
-              )}
+              <p className="text-sm font-medium">Closed positions</p>
+              <span
+                className={`text-xs font-medium tabular-nums ${
+                  totalRealized > 0 ? "text-emerald-600" : totalRealized < 0 ? "text-rose-600" : "text-muted-foreground"
+                }`}
+              >
+                {fmtUsd(totalRealized)} realized
+              </span>
             </div>
-            {recentOrders.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-4 text-center">
-                No live orders yet — the combined book places real paper orders once Alpaca paper keys are set.
-              </p>
+            {recentClosed.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">No closed positions yet.</p>
             ) : (
               <div className="space-y-1.5">
-                {recentOrders.map((o) => (
-                  <div key={o.id} className="flex items-center justify-between text-xs gap-2">
-                    <Link
-                      href={`/dashboard/stocks/${o.stock.ticker}`}
-                      title={o.stock.ticker}
-                      className="font-medium hover:underline truncate min-w-0"
-                    >
-                      {o.stock.name}
-                    </Link>
-                    <span className="flex items-center gap-2 shrink-0">
-                      <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
-                        {o.side}
+                {recentClosed.map((p, i) => {
+                  const pnl = p.realizedPnl ?? 0;
+                  const cost = p.qty * p.entryPrice;
+                  const retPct = cost !== 0 ? (pnl / cost) * 100 : null;
+                  return (
+                    <div key={i} className="flex items-center justify-between text-xs gap-2">
+                      <Link
+                        href={`/dashboard/stocks/${p.stock.ticker}`}
+                        title={p.stock.ticker}
+                        className="font-medium hover:underline truncate min-w-0"
+                      >
+                        {p.stock.name}
+                      </Link>
+                      <span className="flex items-center gap-2 shrink-0">
+                        <Badge variant="outline" className="font-normal">
+                          {STRATEGY_LABEL[p.strategy as Strategy]}
+                        </Badge>
+                        <span className={`tabular-nums font-medium ${pnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                          {fmtUsd(pnl)}
+                        </span>
+                        {retPct != null && (
+                          <span className={`tabular-nums ${pnl >= 0 ? "text-emerald-600/80" : "text-rose-600/80"}`}>
+                            {fmtPct(retPct)}
+                          </span>
+                        )}
+                        {p.exitDate && <span className="text-muted-foreground/70">{formatDistanceToNow(p.exitDate)}</span>}
                       </span>
-                      {o.notional != null && <span className="tabular-nums text-muted-foreground">{fmtUsd(o.notional)}</span>}
-                      <Badge variant="outline" className="font-normal">
-                        {o.status}
-                      </Badge>
-                      <span className="text-muted-foreground/70">{formatDistanceToNow(o.submittedAt)}</span>
-                    </span>
-                  </div>
-                ))}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </CardContent>
         </Card>
       </div>
+
+      <Card className="rounded-2xl">
+        <CardContent className="p-4 sm:p-6">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm font-medium">Recent paper orders</p>
+            {!alpacaConfigured && <span className="text-xs text-muted-foreground">Alpaca not configured</span>}
+          </div>
+          {recentOrders.length === 0 ? (
+            <p className="text-xs text-muted-foreground py-4 text-center">
+              No live orders yet — the combined book places real paper orders once Alpaca paper keys are set.
+            </p>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1.5">
+              {recentOrders.map((o) => (
+                <div key={o.id} className="flex items-center justify-between text-xs gap-2">
+                  <Link
+                    href={`/dashboard/stocks/${o.stock.ticker}`}
+                    title={o.stock.ticker}
+                    className="font-medium hover:underline truncate min-w-0"
+                  >
+                    {o.stock.name}
+                  </Link>
+                  <span className="flex items-center gap-2 shrink-0">
+                    <span className={`font-medium ${o.side === "BUY" ? "text-emerald-600" : "text-rose-600"}`}>
+                      {o.side}
+                    </span>
+                    {o.notional != null && <span className="tabular-nums text-muted-foreground">{fmtUsd(o.notional)}</span>}
+                    <Badge variant="outline" className="font-normal">
+                      {o.status}
+                    </Badge>
+                    <span className="text-muted-foreground/70">{formatDistanceToNow(o.submittedAt)}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
