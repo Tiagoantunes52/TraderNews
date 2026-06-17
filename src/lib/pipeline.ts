@@ -1475,20 +1475,27 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               });
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
-              await cancelOrder(protective.id);
-              const qty = Math.abs(held.qty);
-              const order = await submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
-              });
-              ordersSubmitted++;
+              // Protective (stop/trailing) orders must be whole-share — Alpaca rejects
+              // them on fractional qty. Floor; skip if under one share (a legacy
+              // fractional position keeps its market-sell exit, just no broker stop).
+              const qty = Math.floor(Math.abs(held.qty));
+              if (qty >= 1) {
+                await cancelOrder(protective.id);
+                const order = await submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent });
+                await db.paperOrder.create({
+                  data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
+                });
+                ordersSubmitted++;
+              }
             } else if (action.type === "REPAIR_STOP" && held) {
-              const qty = Math.abs(held.qty);
-              const order = await submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-              });
-              ordersSubmitted++;
+              const qty = Math.floor(Math.abs(held.qty));
+              if (qty >= 1) {
+                const order = await submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice });
+                await db.paperOrder.create({
+                  data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
+                });
+                ordersSubmitted++;
+              }
             }
           } catch (e) {
             errors.push(`Alpaca broker action failed for ${ticker}: ${String(e)}`);
