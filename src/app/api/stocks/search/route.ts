@@ -25,8 +25,12 @@ export const GET = withRoute("stocks/search", async (req: Request) => {
   if (limited) return limited;
 
   const { searchParams } = new URL(req.url);
-  const q = searchParams.get("q");
-  if (!q || q.length < 1) return NextResponse.json([]);
+  const raw = searchParams.get("q");
+  if (!raw) return NextResponse.json([]);
+  // Cap the query length — a real ticker/name is short; anything longer is wasted
+  // Finnhub calls + a wider DB scan, and bounds the abuse surface here (#17).
+  const q = raw.trim().slice(0, 50);
+  if (!q) return NextResponse.json([]);
 
   // 1. Local DB first — covers everything we've seeded (crypto, ETFs, and the
   //    international listings Finnhub's symbol search filters out).
@@ -56,9 +60,12 @@ export const GET = withRoute("stocks/search", async (req: Request) => {
     for (const s of candidates) {
       const market = await inferMarket(s.symbol);
       if (!market) continue;
+      // Create-only: never mutate a shared Stock row from a search. The old `update`
+      // branch let any user's typeahead overwrite the name/market that everyone sees
+      // (shared-data pollution, #17). New tickers are still discovered and inserted.
       const stock = await db.stock.upsert({
         where: { ticker: s.symbol },
-        update: { name: s.description, marketId: market.id },
+        update: {},
         create: { ticker: s.symbol, name: s.description, marketId: market.id },
       });
       if (!byTicker.has(stock.ticker)) {
