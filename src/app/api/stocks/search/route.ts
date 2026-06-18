@@ -4,6 +4,7 @@ import { searchStocks } from "@/lib/finnhub";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { marketNamesForTicker } from "@/lib/market-utils";
 import { withRoute } from "@/lib/observability";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 async function inferMarket(ticker: string) {
   const names = marketNamesForTicker(ticker);
@@ -18,6 +19,10 @@ type SearchStock = { id: string; ticker: string; name: string };
 export const GET = withRoute("stocks/search", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  // Search hits Finnhub + upserts per keystroke — the hottest path, rate-limited first.
+  const limited = await enforceRateLimit("search", user.id);
+  if (limited) return limited;
 
   const { searchParams } = new URL(req.url);
   const q = searchParams.get("q");
