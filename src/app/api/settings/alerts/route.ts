@@ -2,10 +2,14 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { withRoute } from "@/lib/observability";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 export const POST = withRoute("settings/alerts", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const limited = await enforceRateLimit("mutation", user.id);
+  if (limited) return limited;
 
   let body: unknown;
   try {

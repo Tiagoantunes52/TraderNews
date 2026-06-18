@@ -3,10 +3,14 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { getWatchlistLimit } from "@/lib/settings";
 import { withRoute } from "@/lib/observability";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 export const POST = withRoute("watchlist", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const limited = await enforceRateLimit("mutation", user.id);
+  if (limited) return limited;
 
   let body: unknown;
   try {
@@ -49,6 +53,9 @@ export const POST = withRoute("watchlist", async (req: Request) => {
 export const DELETE = withRoute("watchlist", async (req: Request) => {
   const user = await getOrCreateUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const limited = await enforceRateLimit("mutation", user.id);
+  if (limited) return limited;
 
   let body: unknown;
   try {
