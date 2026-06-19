@@ -38,7 +38,11 @@ const HINTS = {
   reliability:
     "Does the confidence field mean what it says? For each confidence bin, the empirical hit-rate should match the bin's confidence. The Brier score must beat the base-rate benchmark, or confidence carries no usable information and sizing should be equal-weight.",
   sharpe:
-    "Risk-adjusted return of the gated book, annualized, computed from its daily equity curve. A backtested Sharpe above ~1.2 on this little data should be assumed overfit.",
+    "Risk-adjusted return of the gated book, annualized, computed from its daily equity curve. A backtested Sharpe above ~1.2 on this little data should be assumed overfit. Note: the sim equity is gross — the gate judges edge on the net-of-cost per-trade measure instead.",
+  edge:
+    "Mean NET forward return of the trades the book actually takes (BUY/STRONG_BUY entries) at the gate horizon, with a one-sample t-stat over the non-overlapping subset. This — not the gross equity Sharpe — is the gate's risk-adjusted edge: it's genuinely net of modeled costs and is re-checked at 2× cost.",
+  alphaT:
+    "t-statistic of the regression alpha vs SPY, using Newey-West (HAC) standard errors so autocorrelated daily returns don't overstate significance. The gate wants ≥ 2.",
   netOfCost:
     "Every forward return is measured from the bar AFTER the signal (T+1, never the signal's own bar) and is net of a modeled round-trip transaction cost. This is what stops a backtest from manufacturing fake edge.",
 } as const;
@@ -310,12 +314,27 @@ export default async function CalibrationPage() {
             <Metric label="SPY return" value={report.spy.available ? pct(report.spy.totalReturn, 1) : "n/a"} valueClass={tone(report.spy.totalReturn)} />
             <Metric label="Alpha (ann.)" value={report.alpha ? pct(report.alpha.alphaAnnualized, 1) : "n/a"} valueClass={tone(report.alpha?.alphaAnnualized ?? null)} />
           </div>
-          {report.alpha && (
-            <p className="text-xs text-muted-foreground mt-3">
-              Beta to SPY {num(report.alpha.beta)}. Alpha t-stat and the 2× cost-stress re-run aren’t
-              computed yet, so the gate treats them as unconfirmed.
-            </p>
-          )}
+          <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm border-t pt-3">
+            <Metric label="Net-of-cost edge" hint={HINTS.edge} value={pct(report.edge.meanNet, 2)} valueClass={tone(report.edge.meanNet)} />
+            <Metric label="Edge t-stat" value={num(report.edge.tStat)} valueClass={tone(report.edge.tStat)} />
+            <Metric label="Edge @ 2× cost" value={pct(report.edge.meanNetStressed, 2)} valueClass={tone(report.edge.meanNetStressed)} />
+            <Metric label="Alpha t-stat" hint={HINTS.alphaT} value={num(report.alpha?.alphaT ?? null)} valueClass={tone(report.alpha?.alphaT ?? null)} />
+          </div>
+          <p className="text-xs text-muted-foreground mt-3">
+            Edge over {report.edge.n} non-overlapping {PRIMARY_HORIZON}-day entry trades
+            {report.alpha != null && <> · beta to SPY {num(report.alpha.beta)}</>}
+            {report.watchlistReturn != null && (
+              <> · watchlist equal-weight {pct(report.watchlistReturn, 1)}</>
+            )}
+            {report.breadth.effectiveBets != null && (
+              <>
+                {" "}
+                · {report.breadth.stocks} names ≈ {report.breadth.effectiveBets.toFixed(1)} independent
+                bets (avg ρ {num(report.breadth.avgCorrelation, 2)})
+              </>
+            )}
+            .
+          </p>
         </CardContent>
       </Card>
 

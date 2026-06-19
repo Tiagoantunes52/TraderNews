@@ -72,3 +72,4 @@ jobs:
           run_stage quant
           run_stage estimate
           run_stage paper
+          run_stage calibrate

@@ -26,6 +26,7 @@ import {
   brierScore,
   baseRateBrier,
   linearRegression,
+  tStatOneSample,
 } from "@/lib/stats";
 
 /** Buckets ordered from most bearish to most bullish — for monotonicity checks. */
@@ -233,6 +234,27 @@ export function informationCoefficient(
   return spearman(xs, ys, minPairs);
 }
 
+/**
+ * Net-of-cost edge of the trades the book actually takes: the entry-signal
+ * (BUY/STRONG_BUY) observations. Returns the mean net return, its one-sample
+ * t-stat, and N. Pass the non-overlapping subset so the t-stat is a valid
+ * significance test. This — not the gross sim equity Sharpe — is the gate's
+ * risk-adjusted edge measure, because it's genuinely net of modeled costs.
+ */
+export function entrySignalEdge(obs: Observation[]): {
+  n: number;
+  meanNet: number | null;
+  tStat: number | null;
+} {
+  const rets = obs.filter((o) => o.signal === "BUY" || o.signal === "STRONG_BUY").map((o) => o.netReturn);
+  if (rets.length === 0) return { n: 0, meanNet: null, tStat: null };
+  return {
+    n: rets.length,
+    meanNet: rets.reduce((s, v) => s + v, 0) / rets.length,
+    tStat: tStatOneSample(rets),
+  };
+}
+
 // ── Transaction-cost model ────────────────────────────────────────────────────
 // Per-side cost in basis points, by asset class, ATR-scaled. Commission-free
 // fills still pay the spread; thin names and crypto pay much more, and wider
@@ -395,6 +417,18 @@ export function alphaBeta(
   return { alpha: fit.alpha, beta: fit.beta, alphaAnnualized: fit.alpha * periodsPerYear };
 }
 
+/**
+ * Effective number of independent bets given `n` positions with average pairwise
+ * correlation `avgCorr`: `n / (1 + (n−1)·ρ)`. A watchlist of co-moving tech names
+ * (or several crypto positions) collapses to far fewer real bets than its count —
+ * so "diversified across 8 names" can be one beta bet wearing eight hats.
+ */
+export function effectiveBets(n: number, avgCorr: number): number {
+  if (n <= 1) return n;
+  const rho = Math.max(0, Math.min(1, avgCorr));
+  return n / (1 + (n - 1) * rho);
+}
+
 // ── Go-live gate ──────────────────────────────────────────────────────────────
 // Pre-registered, out-of-sample, net-of-cost. Defaults to INSUFFICIENT_DATA until
 // there's enough history to certify anything — which, given how little has
@@ -403,7 +437,7 @@ export function alphaBeta(
 export const GATE_THRESHOLDS = {
   minMonths: 6,
   minTrades: 30, // non-overlapping round-trips in the gated book
-  minSharpe: 0.5,
+  minEdgeTStat: 2, // net-of-cost per-trade edge must be positive and significant
   minAlphaTStat: 2,
   maxDrawdownVsSpy: 1.5, // book maxDD must be ≤ this × SPY maxDD
 } as const;
@@ -412,7 +446,8 @@ export type GateInput = {
   monthsCoverage: number;
   effectiveTrades: number;
   hadSpyDrawdown: boolean;
-  sharpeNetOfCost: number | null;
+  edgeMean: number | null; // net-of-cost mean return of entry-signal trades
+  edgeTStat: number | null;
   alphaTStat: number | null;
   maxDrawdown: number | null;
   spyMaxDrawdown: number | null;
@@ -461,9 +496,15 @@ export function evaluateGate(g: GateInput): GateResult {
     detail: g.hadSpyDrawdown ? "≥1 non-bull stretch observed" : "only bull regime so far",
   });
   checks.push({
-    label: `Net-of-cost Sharpe ≥ ${t.minSharpe}`,
-    pass: g.sharpeNetOfCost == null ? null : g.sharpeNetOfCost >= t.minSharpe,
-    detail: g.sharpeNetOfCost == null ? "not computed" : g.sharpeNetOfCost.toFixed(2),
+    label: `Net-of-cost edge t-stat ≥ ${t.minEdgeTStat}`,
+    pass:
+      g.edgeMean == null || g.edgeTStat == null
+        ? null
+        : g.edgeMean > 0 && g.edgeTStat >= t.minEdgeTStat,
+    detail:
+      g.edgeTStat == null || g.edgeMean == null
+        ? "not computed"
+        : `mean ${(g.edgeMean * 100).toFixed(2)}%, t=${g.edgeTStat.toFixed(2)}`,
   });
   checks.push({
     label: `Alpha vs SPY t-stat ≥ ${t.minAlphaTStat}`,

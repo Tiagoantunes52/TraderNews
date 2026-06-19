@@ -393,3 +393,24 @@ model AppSetting {
   value     String
   updatedAt DateTime @updatedAt
 }
+
+// Daily snapshot of the signal-calibration harness (issue #55). One row per UTC
+// day (the `calibrate` stage upserts it — idempotent like the other stages). A few
+// columns are promoted for querying gate-status history / alerts; the full report
+// is kept as JSON so the admin page can render a past day without recomputing.
+model CalibrationSnapshot {
+  id             String   @id @default(cuid())
+  date           DateTime // UTC day
+  gateStatus     String // GO | NO_GO | INSUFFICIENT_DATA
+  gatedBook      String
+  monthsCoverage Float
+  closedTrades   Int
+  edgeMean       Float?
+  edgeTStat      Float?
+  alphaTStat     Float?
+  combinedIc     Float? // combined-score IC at the gate horizon
+  report         Json // full CalibrationReport
+  createdAt      DateTime @default(now())
+
+  @@unique([date])
+}

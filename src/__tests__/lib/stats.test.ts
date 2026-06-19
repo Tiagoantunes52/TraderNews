@@ -12,6 +12,8 @@ import {
   sortino,
   maxDrawdown,
   linearRegression,
+  tStatOneSample,
+  neweyWestRegression,
 } from "@/lib/stats";
 
 describe("pearson", () => {
@@ -182,5 +184,40 @@ describe("linearRegression", () => {
   it("returns null when x has zero variance or too few points", () => {
     expect(linearRegression([1, 1, 1, 1, 1], [1, 2, 3, 4, 5])).toBeNull();
     expect(linearRegression([1, 2], [1, 2])).toBeNull();
+  });
+});
+
+describe("tStatOneSample", () => {
+  it("computes mean / standard error", () => {
+    // mean 2, sd 1, n 3 → 2 / (1/√3) = 2√3
+    expect(tStatOneSample([1, 2, 3])).toBeCloseTo(2 * Math.sqrt(3), 8);
+  });
+  it("returns null with zero variance or too few points", () => {
+    expect(tStatOneSample([5, 5, 5])).toBeNull();
+    expect(tStatOneSample([5])).toBeNull();
+  });
+});
+
+describe("neweyWestRegression", () => {
+  it("point estimates equal ordinary OLS", () => {
+    const xs = [1, 2, 3, 4, 5];
+    const ys = [2, 4, 5, 4, 5];
+    const nw = neweyWestRegression(xs, ys)!;
+    const ols = linearRegression(xs, ys)!;
+    expect(nw.beta).toBeCloseTo(0.6, 10);
+    expect(nw.alpha).toBeCloseTo(2.2, 10);
+    expect(nw.beta).toBeCloseTo(ols.beta, 10);
+    expect(nw.alpha).toBeCloseTo(ols.alpha, 10);
+  });
+  it("yields a large t-stat for a strong relationship", () => {
+    const xs = Array.from({ length: 10 }, (_, i) => i + 1);
+    const ys = xs.map((x) => 2 * x + (x % 2 === 0 ? 0.3 : -0.3));
+    const nw = neweyWestRegression(xs, ys)!;
+    expect(nw.beta).toBeCloseTo(2, 1);
+    expect(Math.abs(nw.betaT!)).toBeGreaterThan(3);
+  });
+  it("returns null below minPairs or with zero x-variance", () => {
+    expect(neweyWestRegression([1, 2], [1, 2])).toBeNull();
+    expect(neweyWestRegression([3, 3, 3, 3, 3], [1, 2, 3, 4, 5])).toBeNull();
   });
 });

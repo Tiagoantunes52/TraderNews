@@ -7,6 +7,8 @@ import {
   bucketStats,
   isMonotonic,
   informationCoefficient,
+  entrySignalEdge,
+  effectiveBets,
   costBpsForStock,
   reliabilityDiagram,
   equityCurveReturns,
@@ -183,6 +185,52 @@ describe("informationCoefficient", () => {
   });
 });
 
+describe("entrySignalEdge", () => {
+  const mk = (signal: string, netReturn: number): Observation => ({
+    stockId: "s",
+    decisionDate: "2026-03-01",
+    entryDate: "2026-03-02",
+    exitDate: "2026-03-03",
+    entryIndex: 0,
+    rawReturn: netReturn,
+    netReturn,
+    signal,
+    sentimentScore: 0,
+    quantScore: 0,
+    combinedScore: 0,
+    confidence: 0.5,
+  });
+
+  it("averages only the entry-signal (BUY/STRONG_BUY) trades", () => {
+    const obs = [mk("BUY", 0.04), mk("STRONG_BUY", 0.06), mk("SELL", -0.99), mk("NEUTRAL", 0.5)];
+    const e = entrySignalEdge(obs);
+    expect(e.n).toBe(2);
+    expect(e.meanNet).toBeCloseTo(0.05, 10);
+    expect(e.tStat).not.toBeNull();
+  });
+
+  it("returns nulls when there are no entry signals", () => {
+    const e = entrySignalEdge([mk("SELL", -0.02)]);
+    expect(e.n).toBe(0);
+    expect(e.meanNet).toBeNull();
+    expect(e.tStat).toBeNull();
+  });
+});
+
+describe("effectiveBets", () => {
+  it("equals N when uncorrelated and 1 when perfectly correlated", () => {
+    expect(effectiveBets(5, 0)).toBe(5);
+    expect(effectiveBets(5, 1)).toBe(1);
+  });
+  it("shrinks with partial correlation", () => {
+    expect(effectiveBets(4, 0.5)).toBeCloseTo(1.6, 10);
+  });
+  it("passes through trivial sizes", () => {
+    expect(effectiveBets(1, 0.9)).toBe(1);
+    expect(effectiveBets(0, 0.5)).toBe(0);
+  });
+});
+
 describe("costBpsForStock", () => {
   it("uses the mid equity tier by default", () => {
     expect(costBpsForStock({})).toBe(20);
@@ -274,7 +322,8 @@ describe("evaluateGate", () => {
     monthsCoverage: 8,
     effectiveTrades: 40,
     hadSpyDrawdown: true,
-    sharpeNetOfCost: 0.8,
+    edgeMean: 0.02,
+    edgeTStat: 2.5,
     alphaTStat: 2.5,
     maxDrawdown: 0.15,
     spyMaxDrawdown: 0.12,

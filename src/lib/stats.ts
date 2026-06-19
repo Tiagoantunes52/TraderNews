@@ -204,6 +204,110 @@ export function linearRegression(
 }
 
 /**
+ * One-sample t-statistic for H0: mean = `mu0`. Valid significance test when the
+ * inputs are independent — so feed it the non-overlapping observation subset. Null
+ * below 2 points or with zero variance.
+ */
+export function tStatOneSample(xs: number[], mu0 = 0): number | null {
+  const n = xs.length;
+  if (n < 2) return null;
+  const m = xs.reduce((s, v) => s + v, 0) / n;
+  const sd = sampleStdev(xs);
+  if (sd == null || sd === 0) return null;
+  return (m - mu0) / (sd / Math.sqrt(n));
+}
+
+/**
+ * Simple linear regression with Newey-West (HAC) standard errors — the right SEs
+ * when residuals are autocorrelated (as overlapping or daily strategy returns are),
+ * so the alpha/beta t-stats aren't overstated. Bartlett kernel; `lag` defaults to
+ * `floor(n^¼)`. Point estimates equal ordinary OLS; only the SEs differ. Null below
+ * `minPairs` or when `xs` has zero variance / a degenerate covariance.
+ */
+export function neweyWestRegression(
+  xs: number[],
+  ys: number[],
+  lag?: number,
+  minPairs = 5
+): { alpha: number; beta: number; alphaT: number | null; betaT: number | null } | null {
+  const n = Math.min(xs.length, ys.length);
+  if (n < minPairs) return null;
+
+  let Sx = 0;
+  let Sy = 0;
+  let Sxx = 0;
+  let Sxy = 0;
+  for (let i = 0; i < n; i++) {
+    Sx += xs[i];
+    Sy += ys[i];
+    Sxx += xs[i] * xs[i];
+    Sxy += xs[i] * ys[i];
+  }
+  const det = n * Sxx - Sx * Sx;
+  if (det === 0) return null;
+
+  const beta = (n * Sxy - Sx * Sy) / det;
+  const alpha = (Sy - beta * Sx) / n;
+
+  // bread = (Z'Z)^{-1} for the design [1, x] (symmetric).
+  const b00 = Sxx / det;
+  const b01 = -Sx / det;
+  const b11 = n / det;
+
+  // Score contributions u_i = [e_i, x_i·e_i].
+  const u0 = new Array<number>(n);
+  const u1 = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    const e = ys[i] - alpha - beta * xs[i];
+    u0[i] = e;
+    u1[i] = xs[i] * e;
+  }
+
+  const L = lag ?? Math.max(1, Math.floor(Math.pow(n, 0.25)));
+  // meat S = Γ0 + Σ_{h≥1} w_h (Γh + Γh'), Bartlett weights w_h = 1 − h/(L+1).
+  let S00 = 0;
+  let S01 = 0;
+  let S11 = 0;
+  for (let i = 0; i < n; i++) {
+    S00 += u0[i] * u0[i];
+    S01 += u0[i] * u1[i];
+    S11 += u1[i] * u1[i];
+  }
+  for (let h = 1; h <= L && h < n; h++) {
+    const w = 1 - h / (L + 1);
+    let g00 = 0;
+    let g01 = 0;
+    let g10 = 0;
+    let g11 = 0;
+    for (let i = h; i < n; i++) {
+      g00 += u0[i] * u0[i - h];
+      g01 += u0[i] * u1[i - h];
+      g10 += u1[i] * u0[i - h];
+      g11 += u1[i] * u1[i - h];
+    }
+    S00 += w * (g00 + g00);
+    S01 += w * (g01 + g10);
+    S11 += w * (g11 + g11);
+  }
+  const S10 = S01;
+
+  // Vcov = bread · S · bread (bread symmetric).
+  const M00 = b00 * S00 + b01 * S10;
+  const M01 = b00 * S01 + b01 * S11;
+  const M10 = b01 * S00 + b11 * S10;
+  const M11 = b01 * S01 + b11 * S11;
+  const varAlpha = M00 * b00 + M01 * b01;
+  const varBeta = M10 * b01 + M11 * b11;
+
+  return {
+    alpha,
+    beta,
+    alphaT: varAlpha > 0 ? alpha / Math.sqrt(varAlpha) : null,
+    betaT: varBeta > 0 ? beta / Math.sqrt(varBeta) : null,
+  };
+}
+
+/**
  * Maximum drawdown of an equity curve, as a positive fraction (0.25 = a 25% peak-
  * to-trough decline). 0 for a monotonically rising curve; null for an empty curve.
  */
