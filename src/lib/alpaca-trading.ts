@@ -55,6 +55,106 @@ export async function getAccount(): Promise<AlpacaAccount> {
   return { equity: num(raw.equity), cash: num(raw.cash) };
 }
 
+// ── Holdings views (Portfolio page) ──────────────────────────────────────────
+// Richer reads of the same paper account for the operator-facing Portfolio page:
+// the full account summary, per-position detail, and the equity time series Alpaca
+// computes from live/historical prices. Kept separate from the trading-path reads
+// above so changing display fields can never affect the paper stage's logic.
+
+export type AlpacaAccountSummary = {
+  equity: number | null; // current total account value (live when the market is open)
+  lastEquity: number | null; // equity at the previous close — for today's change
+  cash: number | null;
+  buyingPower: number | null;
+  longMarketValue: number | null; // value of long positions (equity − cash, roughly)
+};
+
+/** Full account summary for the Portfolio header cards. */
+export async function getAccountSummary(): Promise<AlpacaAccountSummary> {
+  const raw = await apiGet<{
+    equity?: string;
+    last_equity?: string;
+    cash?: string;
+    buying_power?: string;
+    long_market_value?: string;
+  }>("/v2/account");
+  return {
+    equity: num(raw.equity),
+    lastEquity: num(raw.last_equity),
+    cash: num(raw.cash),
+    buyingPower: num(raw.buying_power),
+    longMarketValue: num(raw.long_market_value),
+  };
+}
+
+export type AlpacaPortfolioPosition = {
+  symbol: string;
+  qty: number;
+  avgEntryPrice: number | null;
+  currentPrice: number | null;
+  marketValue: number | null;
+  costBasis: number | null;
+  unrealizedPl: number | null;
+  unrealizedPlpc: number | null; // fraction: 0.05 = +5% since entry
+  unrealizedIntradayPl: number | null; // today's $ P&L on the position
+  changeToday: number | null; // fraction: the asset's price change today
+};
+
+/** Open positions with full P&L detail for the holdings table. */
+export async function getPortfolioPositions(): Promise<AlpacaPortfolioPosition[]> {
+  const raw = await apiGet<
+    Array<{
+      symbol: string;
+      qty?: string;
+      avg_entry_price?: string;
+      current_price?: string;
+      market_value?: string;
+      cost_basis?: string;
+      unrealized_pl?: string;
+      unrealized_plpc?: string;
+      unrealized_intraday_pl?: string;
+      change_today?: string;
+    }>
+  >("/v2/positions");
+  return raw.map((p) => ({
+    symbol: p.symbol,
+    qty: num(p.qty) ?? 0,
+    avgEntryPrice: num(p.avg_entry_price),
+    currentPrice: num(p.current_price),
+    marketValue: num(p.market_value),
+    costBasis: num(p.cost_basis),
+    unrealizedPl: num(p.unrealized_pl),
+    unrealizedPlpc: num(p.unrealized_plpc),
+    unrealizedIntradayPl: num(p.unrealized_intraday_pl),
+    changeToday: num(p.change_today),
+  }));
+}
+
+export type AlpacaEquityPoint = { t: string; equity: number };
+
+/**
+ * Account equity time series from Alpaca's portfolio-history endpoint (it values
+ * each point from real market prices). Drops null points Alpaca emits for gaps.
+ * Defaults to a month of daily closes; the latest point reflects live equity.
+ */
+export async function getPortfolioHistory(
+  period = "1M",
+  timeframe = "1D"
+): Promise<{ points: AlpacaEquityPoint[]; baseValue: number | null }> {
+  const raw = await apiGet<{ timestamp?: number[]; equity?: (number | null)[]; base_value?: number }>(
+    `/v2/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}`
+  );
+  const ts = raw.timestamp ?? [];
+  const eq = raw.equity ?? [];
+  const points: AlpacaEquityPoint[] = [];
+  for (let i = 0; i < ts.length; i++) {
+    const e = eq[i];
+    if (e == null) continue;
+    points.push({ t: new Date(ts[i] * 1000).toISOString(), equity: e });
+  }
+  return { points, baseValue: raw.base_value ?? null };
+}
+
 export type AlpacaPosition = {
   symbol: string;
   qty: number;

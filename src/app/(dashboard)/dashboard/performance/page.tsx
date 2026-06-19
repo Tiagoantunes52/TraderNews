@@ -9,7 +9,27 @@ import { formatDistanceToNow } from "@/lib/format-date";
 import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, realizedFromFills, type Strategy, type ClosedTrade } from "@/lib/paper-trading";
 import { isPaperTradingConfigured, getAccountActivities } from "@/lib/alpaca-trading";
 import { PerformanceEquityChart } from "@/components/performance-equity-chart";
+import { RefreshCountdown } from "@/components/refresh-countdown";
+import { Hint, HINT_TEXT } from "@/components/hint";
 import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
+
+// Plain-language glosses for the denser performance terms.
+const PERF_HINTS = {
+  book:
+    "A self-contained simulated portfolio for one signal source. Each book starts from the same cash, sizes positions by the estimate's confidence, and is marked to market at each daily close — so the equity curves are directly comparable. '_RM' books add a price-aware risk overlay (stop-loss, trailing stop, time-stop).",
+  equityCurve:
+    "Each book's total account value over time. A rising curve means that signal's picks made money.",
+  closed:
+    "Positions that have been fully exited. Their profit/loss is locked in (realized).",
+  open:
+    "Positions still held. Their gain/loss is on paper (unrealized) and moves with the price until exit.",
+  win:
+    "Win rate — the share of closed positions that ended profitable.",
+  realized:
+    "Total profit/loss locked in from closed positions only; still-open positions aren't counted.",
+  returnPct:
+    "Change in the book's equity since it started, as a %.",
+} as const;
 
 export const metadata = { title: "Signal Performance — TraderNews" };
 
@@ -213,7 +233,7 @@ export default async function PerformancePage() {
                   returnPct == null ? "text-muted-foreground" : returnPct >= 0 ? "text-emerald-600" : "text-rose-600"
                 }`}
               >
-                {fmtPct(returnPct)} return
+                {fmtPct(returnPct)} <Hint text={PERF_HINTS.returnPct} className={HINT_TEXT}>return</Hint>
               </p>
               <p className="text-xs text-muted-foreground mt-1">
                 {latest.openPositions} open · updated {formatDistanceToNow(latest.date)}
@@ -226,7 +246,9 @@ export default async function PerformancePage() {
       <Card className="rounded-2xl">
         <CardContent className="p-4 sm:p-6">
           <div className="mb-3">
-            <p className="text-sm font-medium">Equity curves</p>
+            <p className="text-sm font-medium">
+              <Hint text={PERF_HINTS.equityCurve} className={HINT_TEXT}>Equity curves</Hint>
+            </p>
             <p className="text-xs text-muted-foreground mt-0.5">
               Each book&apos;s equity over time — the simulated signal books (sized by estimate confidence, starting
               from {fmtUsd(SIM_STARTING_EQUITY)}) and the live Alpaca paper account.
@@ -246,11 +268,11 @@ export default async function PerformancePage() {
           </p>
           <div className="space-y-2">
             <div className="grid grid-cols-12 text-xs text-muted-foreground px-2">
-              <span className="col-span-5">Book</span>
-              <span className="col-span-2 text-right">Closed</span>
-              <span className="col-span-2 text-right">Open</span>
-              <span className="col-span-1 text-right">Win</span>
-              <span className="col-span-2 text-right">Realized</span>
+              <span className="col-span-5"><Hint text={PERF_HINTS.book} className={HINT_TEXT}>Book</Hint></span>
+              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.closed} className={HINT_TEXT}>Closed</Hint></span>
+              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.open} className={HINT_TEXT}>Open</Hint></span>
+              <span className="col-span-1 text-right"><Hint text={PERF_HINTS.win} className={HINT_TEXT}>Win</Hint></span>
+              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.realized} className={HINT_TEXT}>Realized</Hint></span>
             </div>
             {bookRows.map((row) => {
               const hitRate = row.closed > 0 ? (row.wins / row.closed) * 100 : null;
@@ -491,13 +513,16 @@ function SectionHeading({ title, desc }: { title: string; desc: string }) {
 
 function PageHeader() {
   return (
-    <div>
-      <h1 className="text-2xl font-bold">Signal Performance</h1>
-      <p className="text-muted-foreground text-sm mt-1">
-        How predictive are our signals? Each book trades the app&apos;s own daily signals — sentiment, quant, and
-        the combined estimate — long-only and confidence-weighted, so the equity curves show which source picks
-        best.
-      </p>
+    <div className="flex items-start justify-between gap-4">
+      <div>
+        <h1 className="text-2xl font-bold">Signal Performance</h1>
+        <p className="text-muted-foreground text-sm mt-1">
+          How predictive are our signals? Each book trades the app&apos;s own daily signals — sentiment, quant, and
+          the combined estimate — long-only and confidence-weighted, so the equity curves show which source picks
+          best.
+        </p>
+      </div>
+      <RefreshCountdown kind="marketClose" className="mt-1 shrink-0" />
     </div>
   );
 }

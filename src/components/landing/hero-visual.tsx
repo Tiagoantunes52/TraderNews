@@ -59,7 +59,7 @@ export function HeroVisual() {
             <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
               <Activity className="h-4 w-4" />
             </span>
-            <p className="text-sm font-semibold">Portfolio Mood</p>
+            <p className="text-sm font-semibold">Watchlist Mood</p>
           </div>
           <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
             Live

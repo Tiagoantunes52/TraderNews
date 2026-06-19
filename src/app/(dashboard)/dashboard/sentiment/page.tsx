@@ -7,6 +7,7 @@ import { formatDistanceToNow } from "@/lib/format-date";
 import { mood } from "@/lib/mood";
 import { isEtf } from "@/lib/etf";
 import { SentimentSparkline } from "@/components/sentiment-sparkline";
+import { RefreshCountdown } from "@/components/refresh-countdown";
 
 export const metadata = { title: "Sentiment — TraderNews" };
 
@@ -76,11 +77,14 @@ export default async function SentimentPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Sentiment</h1>
-        <p className="text-muted-foreground text-sm mt-1">
-          How the market feels about your stocks right now
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold">Sentiment</h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            How the market feels about your stocks right now
+          </p>
+        </div>
+        <RefreshCountdown kind="daily" className="mt-1 shrink-0" />
       </div>
 
       {stocks.length === 0 ? (

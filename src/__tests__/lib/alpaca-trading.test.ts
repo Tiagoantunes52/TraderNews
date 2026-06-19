@@ -11,6 +11,9 @@ import {
   cancelOrder,
   getOpenOrders,
   getClock,
+  getAccountSummary,
+  getPortfolioPositions,
+  getPortfolioHistory,
 } from "@/lib/alpaca-trading";
 
 function jsonResponse(body: unknown) {
@@ -228,6 +231,104 @@ describe("alpaca-trading client", () => {
     it("getClock parses is_open + next_close", async () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ is_open: true, next_close: "2026-06-17T20:00:00Z" })));
       expect(await getClock()).toEqual({ isOpen: true, nextClose: "2026-06-17T20:00:00Z" });
+    });
+  });
+
+  describe("holdings views (Portfolio page)", () => {
+    it("getAccountSummary parses the full account snapshot", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          jsonResponse({
+            equity: "101234.56",
+            last_equity: "100000",
+            cash: "5000",
+            buying_power: "20000",
+            long_market_value: "96234.56",
+          })
+        )
+      );
+      expect(await getAccountSummary()).toEqual({
+        equity: 101234.56,
+        lastEquity: 100000,
+        cash: 5000,
+        buyingPower: 20000,
+        longMarketValue: 96234.56,
+      });
+    });
+
+    it("getPortfolioPositions maps detail fields incl. fractional P&L", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          jsonResponse([
+            {
+              symbol: "AAPL",
+              qty: "3",
+              avg_entry_price: "100",
+              current_price: "110",
+              market_value: "330",
+              cost_basis: "300",
+              unrealized_pl: "30",
+              unrealized_plpc: "0.1",
+              unrealized_intraday_pl: "5",
+              change_today: "0.015",
+            },
+          ])
+        )
+      );
+      expect(await getPortfolioPositions()).toEqual([
+        {
+          symbol: "AAPL",
+          qty: 3,
+          avgEntryPrice: 100,
+          currentPrice: 110,
+          marketValue: 330,
+          costBasis: 300,
+          unrealizedPl: 30,
+          unrealizedPlpc: 0.1,
+          unrealizedIntradayPl: 5,
+          changeToday: 0.015,
+        },
+      ]);
+    });
+
+    it("getPortfolioHistory hits the right URL and converts timestamps", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        jsonResponse({ timestamp: [1700000000, 1700086400], equity: [100000, 100500], base_value: 100000 })
+      );
+      vi.stubGlobal("fetch", mockFetch);
+      const { points, baseValue } = await getPortfolioHistory();
+      expect(mockFetch.mock.calls[0][0]).toBe(
+        "https://paper-api.alpaca.markets/v2/account/portfolio/history?period=1M&timeframe=1D"
+      );
+      expect(baseValue).toBe(100000);
+      expect(points).toEqual([
+        { t: new Date(1700000000 * 1000).toISOString(), equity: 100000 },
+        { t: new Date(1700086400 * 1000).toISOString(), equity: 100500 },
+      ]);
+    });
+
+    it("getPortfolioHistory drops null-equity gap points", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          jsonResponse({ timestamp: [1700000000, 1700086400, 1700172800], equity: [100000, null, 100500], base_value: 100000 })
+        )
+      );
+      const { points } = await getPortfolioHistory();
+      expect(points.map((p) => p.equity)).toEqual([100000, 100500]);
+    });
+
+    it("getPortfolioHistory honours custom period + timeframe", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ timestamp: [], equity: [] }));
+      vi.stubGlobal("fetch", mockFetch);
+      const { points, baseValue } = await getPortfolioHistory("1A", "1H");
+      expect(mockFetch.mock.calls[0][0]).toBe(
+        "https://paper-api.alpaca.markets/v2/account/portfolio/history?period=1A&timeframe=1H"
+      );
+      expect(points).toEqual([]);
+      expect(baseValue).toBeNull();
     });
   });
 });
