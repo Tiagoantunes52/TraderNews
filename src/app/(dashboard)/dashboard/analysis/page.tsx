@@ -6,7 +6,9 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { mood } from "@/lib/mood";
-import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
+import { classifyRsi, isBollingerSqueeze, INDICATOR_HINTS } from "@/lib/signals";
+import { RefreshCountdown } from "@/components/refresh-countdown";
+import { Hint, HINT_TEXT } from "@/components/hint";
 
 export const metadata = { title: "Analysis — TraderNews" };
 export const dynamic = "force-dynamic";
@@ -29,11 +31,13 @@ function ChangePill({ value, label }: { value: number | null | undefined; label:
   );
 }
 
-function ScoreBar({ label, score, color }: { label: string; score: number; color: string }) {
+function ScoreBar({ label, score, color, hint }: { label: string; score: number; color: string; hint: string }) {
   const pct = Math.round(((score + 1) / 2) * 100);
   return (
     <div className="flex items-center gap-2 text-xs">
-      <span className="text-muted-foreground w-20 shrink-0">{label}</span>
+      <Hint text={hint} className={cn(HINT_TEXT, "text-muted-foreground w-20 shrink-0 text-left")}>
+        {label}
+      </Hint>
       <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
         <div className="h-full rounded-full" style={{ width: `${pct}%`, backgroundColor: color }} />
       </div>
@@ -94,11 +98,14 @@ export default async function AnalysisPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Analysis</h1>
-        <p className="text-muted-foreground text-sm mt-1">
-          Combined sentiment and quantitative estimate for your watchlist
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold">Analysis</h1>
+          <p className="text-muted-foreground text-sm mt-1">
+            Combined sentiment and quantitative estimate for your watchlist
+          </p>
+        </div>
+        <RefreshCountdown kind="daily" className="mt-1 shrink-0" />
       </div>
 
       {stocks.length === 0 || stocks.every((s) => !s.estimate) ? (
@@ -163,29 +170,39 @@ export default async function AnalysisPage() {
                   {/* RSI + SMA + new signals row */}
                   {q?.rsi14 != null && (
                     <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
-                      <span>RSI {q.rsi14.toFixed(0)}</span>
+                      <Hint text={INDICATOR_HINTS.rsi} className={HINT_TEXT}>
+                        RSI {q.rsi14.toFixed(0)}
+                      </Hint>
                       <RsiBadge rsi={q.rsi14} />
                       {q.sma20 != null && q.price != null && (
-                        <span
-                          className={
+                        <Hint
+                          text={INDICATOR_HINTS.sma20}
+                          className={cn(
+                            HINT_TEXT,
                             q.price > q.sma20
                               ? "text-green-600 dark:text-green-400"
                               : "text-red-500 dark:text-red-400"
-                          }
+                          )}
                         >
                           {q.price > q.sma20 ? "↑" : "↓"} SMA20
-                        </span>
+                        </Hint>
                       )}
                       {isBollingerSqueeze(q.bollingerWidth) && (
-                        <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">BB squeeze</Badge>
+                        <Hint text={INDICATOR_HINTS.bollingerSqueeze}>
+                          <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 cursor-help">BB squeeze</Badge>
+                        </Hint>
                       )}
                       {q.atrPct != null && (
-                        <span>{q.atrPct.toFixed(1)}% ATR</span>
+                        <Hint text={INDICATOR_HINTS.atr} className={HINT_TEXT}>
+                          {q.atrPct.toFixed(1)}% ATR
+                        </Hint>
                       )}
                       {q.daysToEarnings != null && q.daysToEarnings <= 7 && (
-                        <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
-                          Earnings in {q.daysToEarnings}d
-                        </Badge>
+                        <Hint text={INDICATOR_HINTS.earnings}>
+                          <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 cursor-help">
+                            Earnings in {q.daysToEarnings}d
+                          </Badge>
+                        </Hint>
                       )}
                     </div>
                   )}
@@ -193,11 +210,11 @@ export default async function AnalysisPage() {
                   {/* Score bars */}
                   {stock.estimate && (
                     <div className="space-y-1.5 pt-1">
-                      <ScoreBar label="Sentiment" score={stock.estimate.sentimentScore} color="#3b82f6" />
+                      <ScoreBar label="Sentiment" score={stock.estimate.sentimentScore} color="#3b82f6" hint={INDICATOR_HINTS.sentimentScore} />
                       {stock.estimate.quantScore != null && (
-                        <ScoreBar label="Quant" score={stock.estimate.quantScore} color="#8b5cf6" />
+                        <ScoreBar label="Quant" score={stock.estimate.quantScore} color="#8b5cf6" hint={INDICATOR_HINTS.quantScore} />
                       )}
-                      <ScoreBar label="Combined" score={stock.estimate.combinedScore} color={m.chartColor} />
+                      <ScoreBar label="Combined" score={stock.estimate.combinedScore} color={m.chartColor} hint={INDICATOR_HINTS.combinedScore} />
                     </div>
                   )}
 

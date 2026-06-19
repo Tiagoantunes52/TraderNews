@@ -6,6 +6,7 @@ import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { isInsiderEligible } from "@/lib/insider-sources";
 import { CongressTradeList, type CongressTradeView } from "@/components/congress-trade-list";
+import { Hint, HINT_TEXT } from "@/components/hint";
 
 export const metadata = { title: "Insider Trades — TraderNews" };
 
@@ -19,6 +20,30 @@ const TXN_LABELS: Record<string, string> = {
   CONVERSION: "Converted",
   OTHER: "Other",
 };
+
+// What each Form 4 transaction type means and how strong a signal it is.
+const TXN_HINTS: Record<string, string> = {
+  OPEN_MARKET_BUY: "Insider bought shares on the open market with their own money — the strongest bullish insider signal.",
+  OPEN_MARKET_SELL: "Insider sold shares on the open market. Often routine (diversification, taxes), so a weaker signal than a buy.",
+  GRANT: "Shares awarded as compensation, not bought — no directional signal.",
+  OPTION_EXERCISE: "Insider converted stock options into shares. Mechanical, usually not a market view.",
+  TAX_WITHHOLDING: "Shares withheld to cover taxes on vesting/grants — administrative, not a sell decision.",
+  GIFT: "Shares gifted away — no market view.",
+  CONVERSION: "Shares converted from another security class — mechanical, no signal.",
+  OTHER: "Other Form 4 transaction type.",
+};
+
+// What each detected insider signal flags. Falls back to the badge's own detail text.
+const SIGNAL_HINTS: Record<string, string> = {
+  CLUSTER_BUY: "Three or more different insiders bought on the open market within 14 days — clustered buying is a strong conviction signal.",
+  CSUITE_BUY: "A CEO/CFO/COO bought a sizeable amount ($100k+) on the open market in the last 14 days — the highest-signal insider buy.",
+  LARGE_BUY: "An insider materially grew their personal stake.",
+  NET_BUYING: "Insiders bought more than they sold over the last 90 days (net dollars).",
+  NET_SELLING: "Insiders sold more than they bought over the last 90 days (net dollars).",
+};
+
+const MSPR_HINT =
+  "Monthly Share Purchase Ratio (Finnhub), −100 to +100. Positive means insider buying dominated recent months; negative means selling. It feeds the conviction ranking.";
 
 function fmtUsd(v: number): string {
   const abs = Math.abs(v);
@@ -261,26 +286,31 @@ function InsiderCard({ row }: { row: InsiderRow }) {
               <Badge variant="outline">
                 {s.distinctSellers90d} seller{s.distinctSellers90d === 1 ? "" : "s"} · {s.sellCount90d} sells
               </Badge>
-              {s.mspr != null && <Badge variant="outline">MSPR {s.mspr.toFixed(0)}</Badge>}
+              {s.mspr != null && (
+                <Hint text={MSPR_HINT}>
+                  <Badge variant="outline" className="cursor-help">MSPR {s.mspr.toFixed(0)}</Badge>
+                </Hint>
+              )}
             </div>
 
             {s.signals.length > 0 && (
               <div className="flex flex-wrap gap-2">
                 {s.signals.map((sig, i) => (
-                  <Badge
-                    key={i}
-                    className={
-                      sig.type === "CSUITE_BUY"
-                        ? "bg-emerald-600 text-white hover:bg-emerald-600"
-                        : sig.type === "CLUSTER_BUY" || sig.type === "LARGE_BUY" || sig.type === "NET_BUYING"
-                          ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-100"
-                          : sig.type === "NET_SELLING"
-                            ? "bg-rose-100 text-rose-800 hover:bg-rose-100"
-                            : ""
-                    }
-                  >
-                    {sig.detail}
-                  </Badge>
+                  <Hint key={i} text={SIGNAL_HINTS[sig.type] ?? sig.detail}>
+                    <Badge
+                      className={`cursor-help ${
+                        sig.type === "CSUITE_BUY"
+                          ? "bg-emerald-600 text-white hover:bg-emerald-600"
+                          : sig.type === "CLUSTER_BUY" || sig.type === "LARGE_BUY" || sig.type === "NET_BUYING"
+                            ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-100"
+                            : sig.type === "NET_SELLING"
+                              ? "bg-rose-100 text-rose-800 hover:bg-rose-100"
+                              : ""
+                      }`}
+                    >
+                      {sig.detail}
+                    </Badge>
+                  </Hint>
                 ))}
               </div>
             )}
@@ -302,9 +332,12 @@ function InsiderCard({ row }: { row: InsiderRow }) {
                         {role && <span className="text-muted-foreground/60"> · {role}</span>}
                       </span>
                       <span className="flex items-center gap-2 shrink-0">
-                        <span className={`font-medium ${txTone}`}>
+                        <Hint
+                          text={TXN_HINTS[t.txnType] ?? "Form 4 transaction."}
+                          className={`${HINT_TEXT} font-medium ${txTone}`}
+                        >
                           {TXN_LABELS[t.txnType] ?? t.txnType}
-                        </span>
+                        </Hint>
                         <span className="tabular-nums text-muted-foreground">{fmtShares(t.shares)}</span>
                         {t.value != null && (
                           <span className="tabular-nums text-muted-foreground">{fmtUsd(t.value)}</span>

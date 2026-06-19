@@ -30,3 +30,297 @@ export function pearson(xs: number[], ys: number[], minPairs = 5): number | null
   if (vx === 0 || vy === 0) return null;
   return cov / Math.sqrt(vx * vy);
 }
+
+// ── Calibration primitives (issue #55) ───────────────────────────────────────
+// Pure, deterministic building blocks for the signal-validation harness. The
+// Model QA review flagged these as the parts that "must be right or the whole
+// exercise is worthless", so each is small, single-purpose, and unit-tested.
+
+/** Arithmetic mean, or null for an empty series. */
+export function mean(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  return xs.reduce((s, v) => s + v, 0) / xs.length;
+}
+
+/** Sample standard deviation (n−1 denominator). Null below 2 points. */
+export function sampleStdev(xs: number[]): number | null {
+  const n = xs.length;
+  if (n < 2) return null;
+  const m = xs.reduce((s, v) => s + v, 0) / n;
+  const ss = xs.reduce((s, v) => s + (v - m) * (v - m), 0);
+  return Math.sqrt(ss / (n - 1));
+}
+
+/**
+ * Fractional (1-based) ranks with tied values sharing their average rank — the
+ * standard tie handling for Spearman. `[1, 2, 2, 3]` → `[1, 2.5, 2.5, 4]`.
+ */
+export function ranks(xs: number[]): number[] {
+  const order = xs.map((v, i) => [v, i] as const).sort((a, b) => a[0] - b[0]);
+  const out = new Array<number>(xs.length);
+  let i = 0;
+  while (i < order.length) {
+    let j = i;
+    while (j + 1 < order.length && order[j + 1][0] === order[i][0]) j++;
+    const avgRank = (i + j + 2) / 2; // mean of 1-based ranks (i+1)…(j+1)
+    for (let k = i; k <= j; k++) out[order[k][1]] = avgRank;
+    i = j + 1;
+  }
+  return out;
+}
+
+/**
+ * Spearman rank correlation — Pearson on the rank-transformed series. Measures
+ * monotonic (not just linear) association, which is what we want for "does a
+ * higher score rank a higher forward return?". Null below `minPairs` or when a
+ * series is all ties (zero rank variance).
+ */
+export function spearman(xs: number[], ys: number[], minPairs = 5): number | null {
+  const n = Math.min(xs.length, ys.length);
+  if (n < minPairs) return null;
+  return pearson(ranks(xs.slice(0, n)), ranks(ys.slice(0, n)), minPairs);
+}
+
+/**
+ * Wilson score interval for a binomial proportion — the right CI for hit-rate at
+ * small N (unlike the normal approximation, it stays within [0, 1] and doesn't
+ * collapse to a point at 0% / 100%). Returns the point estimate and bounds, or
+ * null for n ≤ 0 / out-of-range successes.
+ */
+export function wilsonInterval(
+  successes: number,
+  n: number,
+  z = 1.96
+): { p: number; lo: number; hi: number } | null {
+  if (n <= 0 || successes < 0 || successes > n) return null;
+  const p = successes / n;
+  const z2 = z * z;
+  const denom = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / denom;
+  const margin = (z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n))) / denom;
+  return { p, lo: Math.max(0, center - margin), hi: Math.min(1, center + margin) };
+}
+
+/**
+ * Brier score: mean squared error of probabilistic predictions against 0/1
+ * outcomes. Lower is better; 0 is perfect. Null for an empty/length-0 series.
+ */
+export function brierScore(probs: number[], outcomes: (number | boolean)[]): number | null {
+  const n = Math.min(probs.length, outcomes.length);
+  if (n === 0) return null;
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    const o = outcomes[i] ? 1 : 0;
+    const d = probs[i] - o;
+    s += d * d;
+  }
+  return s / n;
+}
+
+/**
+ * Brier score of the no-skill predictor that always forecasts the base rate.
+ * Equals p̄(1−p̄). A confidence field only carries information if its Brier score
+ * beats this benchmark — otherwise position-sizing on it is sizing on noise.
+ */
+export function baseRateBrier(outcomes: (number | boolean)[]): number | null {
+  const n = outcomes.length;
+  if (n === 0) return null;
+  const pbar = outcomes.reduce<number>((s, o) => s + (o ? 1 : 0), 0) / n;
+  return pbar * (1 - pbar);
+}
+
+/**
+ * Annualized Sharpe ratio from a series of per-period returns (fractions).
+ * `periodsPerYear` defaults to 252 (trading days). Uses sample stdev; null below
+ * 2 points or with zero volatility (Sharpe undefined).
+ */
+export function sharpe(
+  returns: number[],
+  periodsPerYear = 252,
+  riskFreePerPeriod = 0
+): number | null {
+  if (returns.length < 2) return null;
+  const excess = returns.map((r) => r - riskFreePerPeriod);
+  const m = excess.reduce((s, v) => s + v, 0) / excess.length;
+  const sd = sampleStdev(excess);
+  if (sd == null || sd === 0) return null;
+  return (m / sd) * Math.sqrt(periodsPerYear);
+}
+
+/**
+ * Annualized Sortino ratio — like Sharpe but penalizing only downside deviation
+ * (RMS of below-target returns, full-n denominator). Null below 2 points or when
+ * no return falls below target (no downside ⇒ undefined).
+ */
+export function sortino(
+  returns: number[],
+  periodsPerYear = 252,
+  targetPerPeriod = 0
+): number | null {
+  const n = returns.length;
+  if (n < 2) return null;
+  const m = returns.reduce((s, v) => s + v, 0) / n - targetPerPeriod;
+  let downsideSq = 0;
+  for (const r of returns) {
+    const d = Math.min(0, r - targetPerPeriod);
+    downsideSq += d * d;
+  }
+  const dd = Math.sqrt(downsideSq / n);
+  if (dd === 0) return null;
+  return (m / dd) * Math.sqrt(periodsPerYear);
+}
+
+/**
+ * Ordinary least-squares fit of `ys` on `xs` → slope (beta) and intercept (alpha).
+ * Used to regress a book's returns on the benchmark's: beta is market exposure,
+ * alpha is the per-period excess the market doesn't explain. Null below `minPairs`
+ * or when `xs` has zero variance.
+ */
+export function linearRegression(
+  xs: number[],
+  ys: number[],
+  minPairs = 5
+): { alpha: number; beta: number } | null {
+  const n = Math.min(xs.length, ys.length);
+  if (n < minPairs) return null;
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i];
+    sy += ys[i];
+  }
+  const mx = sx / n;
+  const my = sy / n;
+  let cov = 0;
+  let vx = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx;
+    cov += dx * (ys[i] - my);
+    vx += dx * dx;
+  }
+  if (vx === 0) return null;
+  const beta = cov / vx;
+  return { beta, alpha: my - beta * mx };
+}
+
+/**
+ * One-sample t-statistic for H0: mean = `mu0`. Valid significance test when the
+ * inputs are independent — so feed it the non-overlapping observation subset. Null
+ * below 2 points or with zero variance.
+ */
+export function tStatOneSample(xs: number[], mu0 = 0): number | null {
+  const n = xs.length;
+  if (n < 2) return null;
+  const m = xs.reduce((s, v) => s + v, 0) / n;
+  const sd = sampleStdev(xs);
+  if (sd == null || sd === 0) return null;
+  return (m - mu0) / (sd / Math.sqrt(n));
+}
+
+/**
+ * Simple linear regression with Newey-West (HAC) standard errors — the right SEs
+ * when residuals are autocorrelated (as overlapping or daily strategy returns are),
+ * so the alpha/beta t-stats aren't overstated. Bartlett kernel; `lag` defaults to
+ * `floor(n^¼)`. Point estimates equal ordinary OLS; only the SEs differ. Null below
+ * `minPairs` or when `xs` has zero variance / a degenerate covariance.
+ */
+export function neweyWestRegression(
+  xs: number[],
+  ys: number[],
+  lag?: number,
+  minPairs = 5
+): { alpha: number; beta: number; alphaT: number | null; betaT: number | null } | null {
+  const n = Math.min(xs.length, ys.length);
+  if (n < minPairs) return null;
+
+  let Sx = 0;
+  let Sy = 0;
+  let Sxx = 0;
+  let Sxy = 0;
+  for (let i = 0; i < n; i++) {
+    Sx += xs[i];
+    Sy += ys[i];
+    Sxx += xs[i] * xs[i];
+    Sxy += xs[i] * ys[i];
+  }
+  const det = n * Sxx - Sx * Sx;
+  if (det === 0) return null;
+
+  const beta = (n * Sxy - Sx * Sy) / det;
+  const alpha = (Sy - beta * Sx) / n;
+
+  // bread = (Z'Z)^{-1} for the design [1, x] (symmetric).
+  const b00 = Sxx / det;
+  const b01 = -Sx / det;
+  const b11 = n / det;
+
+  // Score contributions u_i = [e_i, x_i·e_i].
+  const u0 = new Array<number>(n);
+  const u1 = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    const e = ys[i] - alpha - beta * xs[i];
+    u0[i] = e;
+    u1[i] = xs[i] * e;
+  }
+
+  const L = lag ?? Math.max(1, Math.floor(Math.pow(n, 0.25)));
+  // meat S = Γ0 + Σ_{h≥1} w_h (Γh + Γh'), Bartlett weights w_h = 1 − h/(L+1).
+  let S00 = 0;
+  let S01 = 0;
+  let S11 = 0;
+  for (let i = 0; i < n; i++) {
+    S00 += u0[i] * u0[i];
+    S01 += u0[i] * u1[i];
+    S11 += u1[i] * u1[i];
+  }
+  for (let h = 1; h <= L && h < n; h++) {
+    const w = 1 - h / (L + 1);
+    let g00 = 0;
+    let g01 = 0;
+    let g10 = 0;
+    let g11 = 0;
+    for (let i = h; i < n; i++) {
+      g00 += u0[i] * u0[i - h];
+      g01 += u0[i] * u1[i - h];
+      g10 += u1[i] * u0[i - h];
+      g11 += u1[i] * u1[i - h];
+    }
+    S00 += w * (g00 + g00);
+    S01 += w * (g01 + g10);
+    S11 += w * (g11 + g11);
+  }
+  const S10 = S01;
+
+  // Vcov = bread · S · bread (bread symmetric).
+  const M00 = b00 * S00 + b01 * S10;
+  const M01 = b00 * S01 + b01 * S11;
+  const M10 = b01 * S00 + b11 * S10;
+  const M11 = b01 * S01 + b11 * S11;
+  const varAlpha = M00 * b00 + M01 * b01;
+  const varBeta = M10 * b01 + M11 * b11;
+
+  return {
+    alpha,
+    beta,
+    alphaT: varAlpha > 0 ? alpha / Math.sqrt(varAlpha) : null,
+    betaT: varBeta > 0 ? beta / Math.sqrt(varBeta) : null,
+  };
+}
+
+/**
+ * Maximum drawdown of an equity curve, as a positive fraction (0.25 = a 25% peak-
+ * to-trough decline). 0 for a monotonically rising curve; null for an empty curve.
+ */
+export function maxDrawdown(equity: number[]): number | null {
+  if (equity.length === 0) return null;
+  let peak = equity[0];
+  let maxDd = 0;
+  for (const v of equity) {
+    if (v > peak) peak = v;
+    if (peak > 0) {
+      const dd = (peak - v) / peak;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
+  return maxDd;
+}

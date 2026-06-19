@@ -12,7 +12,7 @@ import {
   SidebarHeader,
   SidebarFooter,
 } from "@/components/ui/sidebar";
-import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Briefcase, UserSearch, LineChart } from "lucide-react";
+import { BarChart2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Compass, UserSearch, LineChart, Briefcase, Gauge } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -39,16 +39,20 @@ const navSections: NavSection[] = [
     ],
   },
   {
-    label: "Signals & Portfolio",
+    label: "Signals",
     items: [
       { label: "Analysis", href: "/dashboard/analysis", icon: Calculator },
-      { label: "Portfolio", href: "/dashboard/portfolio", icon: Briefcase },
+      { label: "Watchlist Insights", href: "/dashboard/insights", icon: Compass },
     ],
   },
   {
-    label: "Trading",
+    label: "Automated Trading",
     adminOnly: true,
-    items: [{ label: "Performance", href: "/dashboard/performance", icon: LineChart }],
+    items: [
+      { label: "Portfolio", href: "/dashboard/portfolio", icon: Briefcase },
+      { label: "Performance", href: "/dashboard/performance", icon: LineChart },
+      { label: "Calibration", href: "/dashboard/calibration", icon: Gauge },
+    ],
   },
   {
     label: "Account",

@@ -1,6 +1,6 @@
 // Ticker → sector ETF map, plus ETF → human-readable sector name.
 // Shared by the quant pipeline (sector-relative strength) and the
-// portfolio page (sector concentration).
+// watchlist-insights page (sector concentration).
 
 export const SECTOR_ETF: Record<string, string> = {
   // Technology

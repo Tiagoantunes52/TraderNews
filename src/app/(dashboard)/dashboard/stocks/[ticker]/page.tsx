@@ -9,9 +9,21 @@ import { formatDistanceToNow } from "@/lib/format-date";
 import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
 import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
 import { CongressTradeList } from "@/components/congress-trade-list";
+import { Hint, HINT_TEXT } from "@/components/hint";
+import { cn } from "@/lib/utils";
 import { mood } from "@/lib/mood";
 import { safeExternalHref } from "@/lib/normalize";
-import { classifyRsi, isBollingerSqueeze } from "@/lib/signals";
+import { classifyRsi, isBollingerSqueeze, INDICATOR_HINTS } from "@/lib/signals";
+
+// ETF fundamentals shown on this page — glossed for non-experts.
+const ETF_HINTS = {
+  expenseRatio:
+    "The fund's annual fee as a % of assets — e.g. 0.20% is about $2 a year per $1,000 invested. Lower is cheaper to hold.",
+  dividendYield:
+    "Dividends paid over the trailing year as a % of the fund's price.",
+  netAssets:
+    "Total market value of everything the fund holds (assets under management). Larger funds tend to be more liquid.",
+} as const;
 
 export default async function StockDetailPage({ params }: PageProps<"/dashboard/stocks/[ticker]">) {
   const { ticker } = await params;
@@ -151,7 +163,9 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
 
             {quant?.rsi14 != null && (
               <div className="flex items-center gap-3 text-sm flex-wrap">
-                <span className="text-muted-foreground">RSI {quant.rsi14.toFixed(0)}</span>
+                <Hint text={INDICATOR_HINTS.rsi} className={cn(HINT_TEXT, "text-muted-foreground")}>
+                  RSI {quant.rsi14.toFixed(0)}
+                </Hint>
                 {classifyRsi(quant.rsi14) === "bullish" && (
                   <Badge className="bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400">Oversold</Badge>
                 )}
@@ -159,32 +173,42 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400">Overbought</Badge>
                 )}
                 {quant.sma20 != null && quant.price != null && (
-                  <span className={`text-xs ${quant.price > quant.sma20 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                  <Hint
+                    text={INDICATOR_HINTS.sma20}
+                    className={cn(HINT_TEXT, "text-xs", quant.price > quant.sma20 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400")}
+                  >
                     {quant.price > quant.sma20 ? "↑ Above" : "↓ Below"} SMA20
-                  </span>
+                  </Hint>
                 )}
                 {quant.sma50 != null && quant.price != null && (
-                  <span className={`text-xs ${quant.price > quant.sma50 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}>
+                  <Hint
+                    text={INDICATOR_HINTS.sma50}
+                    className={cn(HINT_TEXT, "text-xs", quant.price > quant.sma50 ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400")}
+                  >
                     {quant.price > quant.sma50 ? "↑ Above" : "↓ Below"} SMA50
-                  </span>
+                  </Hint>
                 )}
                 {quant.bollingerPctB != null && (
-                  <span className="text-xs text-muted-foreground">
+                  <Hint text={INDICATOR_HINTS.pctB} className={cn(HINT_TEXT, "text-xs text-muted-foreground")}>
                     %B {(quant.bollingerPctB * 100).toFixed(0)}
-                  </span>
+                  </Hint>
                 )}
                 {isBollingerSqueeze(quant.bollingerWidth) && (
-                  <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400">BB squeeze</Badge>
+                  <Hint text={INDICATOR_HINTS.bollingerSqueeze}>
+                    <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 cursor-help">BB squeeze</Badge>
+                  </Hint>
                 )}
                 {quant.atrPct != null && (
-                  <span className="text-xs text-muted-foreground">
+                  <Hint text={INDICATOR_HINTS.atr} className={cn(HINT_TEXT, "text-xs text-muted-foreground")}>
                     ATR {quant.atrPct.toFixed(1)}%
-                  </span>
+                  </Hint>
                 )}
                 {quant.daysToEarnings != null && quant.daysToEarnings <= 7 && (
-                  <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
-                    Earnings in {quant.daysToEarnings}d
-                  </Badge>
+                  <Hint text={INDICATOR_HINTS.earnings}>
+                    <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 cursor-help">
+                      Earnings in {quant.daysToEarnings}d
+                    </Badge>
+                  </Hint>
                 )}
               </div>
             )}
@@ -201,7 +225,9 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   </div>
                 )}
                 <div className="flex items-center gap-2 text-xs">
-                  <span className="text-muted-foreground w-20 shrink-0">Sentiment</span>
+                  <Hint text={INDICATOR_HINTS.sentimentScore} className={cn(HINT_TEXT, "text-muted-foreground w-20 shrink-0")}>
+                    Sentiment
+                  </Hint>
                   <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
                     <div className="h-full rounded-full bg-blue-500" style={{ width: `${Math.round(((estimate.sentimentScore + 1) / 2) * 100)}%` }} />
                   </div>
@@ -211,7 +237,9 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                 </div>
                 {estimate.quantScore != null && (
                   <div className="flex items-center gap-2 text-xs">
-                    <span className="text-muted-foreground w-20 shrink-0">Quant</span>
+                    <Hint text={INDICATOR_HINTS.quantScore} className={cn(HINT_TEXT, "text-muted-foreground w-20 shrink-0")}>
+                      Quant
+                    </Hint>
                     <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
                       <div className="h-full rounded-full bg-violet-500" style={{ width: `${Math.round(((estimate.quantScore + 1) / 2) * 100)}%` }} />
                     </div>
@@ -221,7 +249,9 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   </div>
                 )}
                 <div className="flex items-center gap-2 text-xs">
-                  <span className="text-muted-foreground w-20 shrink-0 font-medium">Combined</span>
+                  <Hint text={INDICATOR_HINTS.combinedScore} className={cn(HINT_TEXT, "text-muted-foreground w-20 shrink-0 font-medium")}>
+                    Combined
+                  </Hint>
                   <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
                     <div className="h-full rounded-full" style={{ width: `${Math.round(((estimate.combinedScore + 1) / 2) * 100)}%`, backgroundColor: mood(estimate.combinedScore).chartColor }} />
                   </div>
@@ -230,7 +260,8 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
                   </span>
                 </div>
                 <p className="text-xs text-muted-foreground pt-1">
-                  Signal: <span className="font-medium text-foreground">{estimate.signal.replace("_", " ")}</span>
+                  <Hint text={INDICATOR_HINTS.signal} className={HINT_TEXT}>Signal</Hint>:{" "}
+                  <span className="font-medium text-foreground">{estimate.signal.replace("_", " ")}</span>
                   {estimate.quantScore == null && " (sentiment only — no price data)"}
                 </p>
               </div>
@@ -248,13 +279,13 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
           <CardContent className="space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
               {etf.expenseRatio != null && (
-                <EtfStat label="Expense ratio" value={`${asPct(etf.expenseRatio).toFixed(2)}%`} />
+                <EtfStat label="Expense ratio" value={`${asPct(etf.expenseRatio).toFixed(2)}%`} hint={ETF_HINTS.expenseRatio} />
               )}
               {etf.dividendYield != null && (
-                <EtfStat label="Dividend yield" value={`${asPct(etf.dividendYield).toFixed(2)}%`} />
+                <EtfStat label="Dividend yield" value={`${asPct(etf.dividendYield).toFixed(2)}%`} hint={ETF_HINTS.dividendYield} />
               )}
               {etf.netAssets != null && (
-                <EtfStat label="Net assets" value={formatLargeUsd(etf.netAssets)} />
+                <EtfStat label="Net assets" value={formatLargeUsd(etf.netAssets)} hint={ETF_HINTS.netAssets} />
               )}
             </div>
 
@@ -305,9 +336,11 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
             <div className="flex items-center justify-between gap-2">
               <CardTitle className="text-sm">Latest summary</CardTitle>
               {latest.confidence != null && (
-                <Badge variant="outline" className="text-xs shrink-0">
-                  {Math.round(latest.confidence * 100)}% confidence
-                </Badge>
+                <Hint text={INDICATOR_HINTS.confidence}>
+                  <Badge variant="outline" className="text-xs shrink-0 cursor-help">
+                    {Math.round(latest.confidence * 100)}% confidence
+                  </Badge>
+                </Hint>
               )}
             </div>
           </CardHeader>
@@ -315,11 +348,17 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
             <p className="text-sm leading-relaxed text-muted-foreground">{latest.summary}</p>
             {latest.keyDriver && (
               <p className="text-xs text-muted-foreground">
-                <span className="font-medium text-foreground">Key driver:</span> {latest.keyDriver}
+                <Hint text={INDICATOR_HINTS.keyDriver} className={cn(HINT_TEXT, "font-medium text-foreground")}>
+                  Key driver
+                </Hint>
+                : {latest.keyDriver}
               </p>
             )}
             {latestAspects.length > 0 && (
               <div className="space-y-1.5 pt-1">
+                <Hint text={INDICATOR_HINTS.aspects} className={cn(HINT_TEXT, "text-xs font-medium text-muted-foreground")}>
+                  Sentiment by aspect
+                </Hint>
                 {latestAspects.map(([key, a]) => (
                   <div key={key} className="flex items-center gap-2 text-xs">
                     <span className="text-muted-foreground w-32 shrink-0 capitalize">
@@ -498,10 +537,16 @@ function formatLargeUsd(value: number): string {
   return `$${value.toLocaleString()}`;
 }
 
-function EtfStat({ label, value }: { label: string; value: string }) {
+function EtfStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div>
-      <p className="text-xs text-muted-foreground">{label}</p>
+      {hint ? (
+        <Hint text={hint} className={cn(HINT_TEXT, "text-xs text-muted-foreground")}>
+          {label}
+        </Hint>
+      ) : (
+        <p className="text-xs text-muted-foreground">{label}</p>
+      )}
       <p className="font-semibold tabular-nums">{value}</p>
     </div>
   );

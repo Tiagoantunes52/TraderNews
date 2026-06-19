@@ -69,7 +69,7 @@ export default async function OverviewPage() {
       <div>
         <h1 className="text-2xl font-bold">Overview</h1>
         <p className="text-muted-foreground text-sm mt-1">
-          A snapshot of your portfolio mood and the latest signals
+          A snapshot of your watchlist mood and the latest signals
         </p>
       </div>
 
@@ -83,7 +83,7 @@ export default async function OverviewPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="rounded-2xl overflow-hidden border-0 shadow-sm">
           <div className={`bg-gradient-to-br ${portfolioMood?.gradient ?? "from-slate-200 to-slate-300"} p-6`}>
-            <p className="text-white/80 text-sm font-medium">Portfolio Mood</p>
+            <p className="text-white/80 text-sm font-medium">Watchlist Mood</p>
             <div className="mt-2 flex items-end justify-between">
               <div>
                 <p className="text-white text-5xl font-bold tabular-nums">
