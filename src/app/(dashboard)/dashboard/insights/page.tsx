@@ -229,7 +229,9 @@ export default async function WatchlistInsightsPage() {
               </CardHeader>
               <CardContent className="space-y-2">
                 {recentAlerts.map((a) => {
-                  const ticker = tickerById.get(a.stockId);
+                  // stockId is non-null here (the query filters to watched stocks),
+                  // but it's now nullable on the model for account-health alerts.
+                  const ticker = a.stockId ? tickerById.get(a.stockId) : undefined;
                   return (
                     <div key={a.id} className="flex items-start justify-between gap-3 text-sm">
                       <div className="min-w-0">

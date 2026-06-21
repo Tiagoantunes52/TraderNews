@@ -8,7 +8,12 @@ export type AlertType =
   | "RSI_EXTREME"
   | "INSIDER_CLUSTER_BUY"
   | "INSIDER_FLOW_SHIFT"
-  | "INSIDER_CSUITE_BUY";
+  | "INSIDER_CSUITE_BUY"
+  // Account / trading-health alerts (issue #56) — not tied to a single stock.
+  | "ACCOUNT_DRAWDOWN"
+  | "ORDER_FAILURES"
+  | "BROKER_UNREACHABLE"
+  | "STALE_PIPELINE";
 
 export type AlertDraft = {
   type: AlertType;
@@ -109,4 +114,76 @@ export function detectRsiCross(
     };
   }
   return null;
+}
+
+// ── Account / trading-health alerts (issue #56) ──────────────────────────────
+// These watch the *trading account*, not a stock: drawdown breaches, order
+// rejections / fill failures, broker reachability, and pipeline freshness. They
+// carry no ticker (the Alert row's stockId is null) and notify admins, not the
+// per-stock watchers. Pure builders so the pipeline stays a thin persistence layer.
+
+const pct = (frac: number): string => `${(frac * 100).toFixed(1)}%`;
+
+/**
+ * Fires when a book's drawdown from its peak equity meets/exceeds `threshold`
+ * (the kill-switch level) — capital protection has tripped and new buys are halted.
+ */
+export function detectDrawdownBreach(
+  book: string,
+  drawdown: number,
+  threshold: number
+): AlertDraft | null {
+  if (!Number.isFinite(drawdown) || drawdown < threshold) return null;
+  return {
+    type: "ACCOUNT_DRAWDOWN",
+    title: `${book} drawdown ${pct(drawdown)}`,
+    message: `🛑 ${book} is down ${pct(drawdown)} from its peak (kill-switch at ${pct(
+      threshold
+    )}). New buys are halted until it recovers.`,
+    value: drawdown,
+  };
+}
+
+/**
+ * Fires when one or more broker orders failed to submit / fill this run — order
+ * rejections, fractional-stop rejects, or partial-fill failures the stage logged.
+ */
+export function detectOrderFailures(failures: number, threshold = 1): AlertDraft | null {
+  if (!Number.isFinite(failures) || failures < threshold) return null;
+  return {
+    type: "ORDER_FAILURES",
+    title: `${failures} order failure${failures === 1 ? "" : "s"}`,
+    message: `⚠️ ${failures} broker order${failures === 1 ? "" : "s"} failed this run (rejections / fill failures). Check the trading account.`,
+    value: failures,
+  };
+}
+
+/** Fires when the broker (Alpaca) is unreachable — the trading path is blind. */
+export function detectBrokerUnreachable(book = "Alpaca"): AlertDraft {
+  return {
+    type: "BROKER_UNREACHABLE",
+    title: `${book} unreachable`,
+    message: `📡 Could not reach ${book} this run — orders, fills and account equity may be stale.`,
+    value: null,
+  };
+}
+
+/**
+ * Fires when the freshest pipeline data is older than `maxAgeHours` (or missing) —
+ * a stalled cron / data source means signals and equity marks are stale.
+ */
+export function detectStalePipeline(
+  latestDataAt: Date | null | undefined,
+  now: Date,
+  maxAgeHours: number
+): AlertDraft | null {
+  const ageHours = latestDataAt == null ? Infinity : (now.getTime() - latestDataAt.getTime()) / 3_600_000;
+  if (ageHours < maxAgeHours) return null;
+  const ageLabel = Number.isFinite(ageHours) ? `${Math.floor(ageHours)}h old` : "missing";
+  return {
+    type: "STALE_PIPELINE",
+    title: `Pipeline data ${ageLabel}`,
+    message: `🕒 The freshest signal data is ${ageLabel} (threshold ${maxAgeHours}h). The pipeline may have stalled.`,
+    value: Number.isFinite(ageHours) ? ageHours : null,
+  };
 }

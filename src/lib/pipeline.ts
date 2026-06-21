@@ -10,7 +10,16 @@ import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQu
 import { SECTOR_ETF } from "@/lib/sectors";
 import { normalizeUrl, normalizeHeadline } from "@/lib/normalize";
 import { aggregateNews } from "@/lib/news-sources";
-import { detectSignalChange, detectVelocitySpike, detectRsiCross, type AlertDraft } from "@/lib/alerts";
+import {
+  detectSignalChange,
+  detectVelocitySpike,
+  detectRsiCross,
+  detectDrawdownBreach,
+  detectOrderFailures,
+  detectBrokerUnreachable,
+  detectStalePipeline,
+  type AlertDraft,
+} from "@/lib/alerts";
 import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 import { processWithBudget } from "@/lib/concurrency";
 import { getInsiderTxns, isInsiderEligible } from "@/lib/insider-sources";
@@ -33,9 +42,18 @@ import {
   confidenceNotional,
   isPaperTradeEligible,
   isEntrySignal,
+  SIM_STARTING_EQUITY,
   type Strategy,
   type PositionAction,
 } from "@/lib/paper-trading";
+import {
+  isRiskLimitsEnabled,
+  riskLimits,
+  evaluateBuy,
+  correlationClusters,
+  clusterKeyFor,
+  type BookExposure,
+} from "@/lib/portfolio-risk";
 import {
   isPaperTradingConfigured,
   getAccount,
@@ -159,6 +177,34 @@ async function processAlerts(pending: PendingAlert[]): Promise<{ count: number; 
   }
 
   return { count: pending.length, errors };
+}
+
+/**
+ * Persist account / trading-health alerts (issue #56) and notify admins. These
+ * carry no ticker (stockId null) and aren't tied to any user's watchlist, so they
+ * go to admins with alert emails on — operators, not per-stock watchers.
+ */
+async function processAccountAlerts(drafts: AlertDraft[]): Promise<{ count: number; errors: string[] }> {
+  const errors: string[] = [];
+  if (drafts.length === 0) return { count: 0, errors };
+
+  await db.alert.createMany({
+    data: drafts.map((d) => ({ stockId: null, type: d.type, title: d.title, message: d.message, value: d.value })),
+  });
+
+  if (!isEmailConfigured()) return { count: drafts.length, errors };
+
+  const admins = await db.user.findMany({
+    where: { role: "ADMIN", alertEmails: true, email: { not: null } },
+    select: { email: true },
+  });
+  const { subject, html, text } = buildAlertEmail(drafts);
+  for (const a of admins) {
+    if (!a.email) continue;
+    const res = await sendEmail({ to: a.email, subject, html, text });
+    if (!res.ok) errors.push(`Account alert email to ${a.email} failed: ${res.error}`);
+  }
+  return { count: drafts.length, errors };
 }
 
 function dateStr(date: Date): string {
@@ -1160,6 +1206,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   let ordersSubmitted = 0;
   let simOpened = 0;
   let simClosed = 0;
+  // Account / trading-health alerts (issue #56) accumulated across the run, then
+  // persisted + emailed to admins once at the end (the daily guard fires them once).
+  const accountAlerts: AlertDraft[] = [];
 
   const to = new Date();
   const todayUTC = startOfUtcDay(to);
@@ -1245,6 +1294,107 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   });
   const openByKey = new Map(openPositions.map((p) => [`${p.stockId}|${p.strategy}`, p]));
 
+  // ── Portfolio-level risk controls (issue #56; ship-dark: PAPER_RISK_LIMITS=1) ──
+  // Per-position stops protect each name; these caps + the drawdown kill-switch
+  // protect the *book* from a correlated blow-up that gaps through every stop at
+  // once. They gate fresh opens in the risk-managed (_RM) sim books and the live
+  // Alpaca buys below; the pure books stay the unconstrained attribution baseline.
+  const riskLimitsOn = isRiskLimitsEnabled();
+  const limits = riskLimits();
+  const tickerByStock = new Map(estimates.map((e) => [e.stockId, e.stock.ticker]));
+
+  // Stale-pipeline health check: the freshest estimate anywhere vs now.
+  if (riskLimitsOn) {
+    try {
+      const fresh = await db.stockEstimate.findFirst({ orderBy: { date: "desc" }, select: { date: true } });
+      const staleHours = Number(process.env.PAPER_STALE_DATA_HOURS) || 48;
+      const a = detectStalePipeline(fresh?.date ?? null, to, staleHours);
+      if (a) accountAlerts.push(a);
+    } catch (e) {
+      errors.push(`Stale-pipeline check failed: ${String(e)}`);
+    }
+  }
+
+  // Correlation clusters across the watchlist (crypto = one bucket) so the cluster
+  // cap limits *correlated* exposure, not just per-ticker. Built from recent closes.
+  let clusterByTicker = new Map<string, string>();
+  if (riskLimitsOn && stockIds.length > 0) {
+    try {
+      const since = new Date(todayUTC.getTime() - 45 * 86_400_000);
+      const hist = await db.quantAnalysis.findMany({
+        where: { stockId: { in: stockIds }, price: { not: null }, date: { gte: since } },
+        orderBy: { date: "asc" },
+        select: { stockId: true, date: true, price: true },
+      });
+      const pricesByStock = new Map<string, { date: string; price: number }[]>();
+      for (const r of hist) {
+        const arr = pricesByStock.get(r.stockId) ?? [];
+        arr.push({ date: dateStr(r.date), price: r.price! });
+        pricesByStock.set(r.stockId, arr);
+      }
+      const returnsByTicker = new Map<string, Map<string, number>>();
+      for (const [sid, rows] of pricesByStock) {
+        const ticker = tickerByStock.get(sid);
+        if (!ticker) continue;
+        const rets = new Map<string, number>();
+        for (let i = 1; i < rows.length; i++) {
+          const prev = rows[i - 1].price;
+          if (prev > 0) rets.set(rows[i].date, rows[i].price / prev - 1);
+        }
+        if (rets.size > 0) returnsByTicker.set(ticker, rets);
+      }
+      clusterByTicker = correlationClusters(returnsByTicker);
+    } catch (e) {
+      errors.push(`Risk cluster build failed: ${String(e)}`);
+    }
+  }
+
+  // Seed per-_RM-book exposure (open positions + equity + peak) so evaluateBuy can
+  // gate fresh opens, and flag a simulated drawdown breach on the gated book.
+  const bookRisk = new Map<Strategy, BookExposure>();
+  if (riskLimitsOn && riskEnabled) {
+    try {
+      const [rmOpen, rmClosedSum, snapMax] = await Promise.all([
+        db.simPosition.findMany({
+          where: { status: "OPEN", strategy: { in: RM_STRATEGIES } },
+          select: { strategy: true, qty: true, entryPrice: true, lastMarkPrice: true, stock: { select: { ticker: true } } },
+        }),
+        db.simPosition.groupBy({
+          by: ["strategy"],
+          where: { status: "CLOSED", strategy: { in: RM_STRATEGIES } },
+          _sum: { realizedPnl: true },
+        }),
+        db.paperEquitySnapshot.groupBy({
+          by: ["book"],
+          where: { book: { in: RM_STRATEGIES.map((s) => STRATEGY_BOOK[s]) } },
+          _max: { equity: true },
+        }),
+      ]);
+      const realizedByStrategy = new Map(rmClosedSum.map((r) => [r.strategy as Strategy, r._sum.realizedPnl ?? 0]));
+      const peakByBook = new Map(snapMax.map((r) => [r.book, r._max.equity ?? 0]));
+      for (const strategy of RM_STRATEGIES) {
+        const positions = rmOpen
+          .filter((p) => p.strategy === strategy)
+          .map((p) => {
+            const mark = p.lastMarkPrice ?? p.entryPrice;
+            return { cluster: clusterKeyFor(p.stock.ticker, clusterByTicker), notional: p.qty * mark, unrealized: p.qty * (mark - p.entryPrice) };
+          });
+        const unrealized = positions.reduce((s, p) => s + p.unrealized, 0);
+        const equity = SIM_STARTING_EQUITY + (realizedByStrategy.get(strategy) ?? 0) + unrealized;
+        const peakEquity = Math.max(peakByBook.get(STRATEGY_BOOK[strategy]) ?? 0, equity);
+        bookRisk.set(strategy, { equity, peakEquity, positions: positions.map((p) => ({ cluster: p.cluster, notional: p.notional })) });
+      }
+      const gated = bookRisk.get("COMBINED_RM");
+      if (gated && gated.peakEquity > 0) {
+        const dd = Math.max(0, (gated.peakEquity - gated.equity) / gated.peakEquity);
+        const a = detectDrawdownBreach("SIM_COMBINED_RM", dd, limits.killSwitchDrawdownPct);
+        if (a) accountAlerts.push(a);
+      }
+    } catch (e) {
+      errors.push(`Risk book seeding failed: ${String(e)}`);
+    }
+  }
+
   for (const est of estimates) {
     const price = priceByStock.get(est.stockId);
     if (price == null) continue;
@@ -1285,6 +1435,21 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         });
       } else {
         action = reconcilePosition(signal, price, est.confidence, open);
+      }
+
+      // Portfolio-level gate: block a fresh _RM open that would breach a cap or the
+      // drawdown kill-switch. Must run before the COMBINED_RM capture so a blocked
+      // open isn't mirrored to the live Alpaca book either. Pure books are unaffected.
+      if (riskLimitsOn && action.type === "OPEN" && STRATEGY_IS_RM[strategy]) {
+        const br = bookRisk.get(strategy);
+        if (br) {
+          const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
+          if (evaluateBuy(br, candidate, limits).allowed) {
+            br.positions.push(candidate); // reserve so later opens this run see it
+          } else {
+            action = { type: "NONE" };
+          }
+        }
       }
 
       // Capture the COMBINED_RM decision so the Alpaca book can mirror it.
@@ -1415,6 +1580,43 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const positions = await getPositions();
       const posBySymbol = new Map(positions.map((p) => [p.symbol, p]));
 
+      // Live-account risk context for the buy gate + drawdown alert (ship-dark).
+      let alpacaRisk: BookExposure | null = null;
+      let alpacaOrderFailures = 0;
+      if (riskLimitsOn) {
+        try {
+          const [acct, snap] = await Promise.all([
+            getAccount(),
+            db.paperEquitySnapshot.aggregate({ where: { book: "ALPACA" }, _max: { equity: true } }),
+          ]);
+          const equity = acct.equity ?? 0;
+          const peakEquity = Math.max(snap._max.equity ?? 0, equity);
+          alpacaRisk = {
+            equity,
+            peakEquity,
+            positions: positions.map((p) => ({
+              cluster: clusterKeyFor(p.symbol, clusterByTicker),
+              notional: Math.abs(p.qty) * (p.currentPrice ?? p.avgEntryPrice ?? 0),
+            })),
+          };
+          if (peakEquity > 0) {
+            const a = detectDrawdownBreach("ALPACA", Math.max(0, (peakEquity - equity) / peakEquity), limits.killSwitchDrawdownPct);
+            if (a) accountAlerts.push(a);
+          }
+        } catch (e) {
+          errors.push(`Alpaca risk context failed: ${String(e)}`);
+        }
+      }
+      // Gate a live buy through the portfolio caps + kill-switch, reserving exposure
+      // when allowed. A no-op (always allows) when the risk limits are off.
+      const gateAlpacaBuy = (symbol: string, notional: number): boolean => {
+        if (!riskLimitsOn || !alpacaRisk) return true;
+        const candidate = { cluster: clusterKeyFor(symbol, clusterByTicker), notional };
+        if (!evaluateBuy(alpacaRisk, candidate, limits).allowed) return false;
+        alpacaRisk.positions.push(candidate);
+        return true;
+      };
+
       if (brokerStops) {
         // One pass over the broker's resting orders → the protective order per symbol.
         let openOrders: AlpacaOpenOrder[] = [];
@@ -1448,7 +1650,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             cfg,
           });
           try {
-            if (action.type === "ENTER") {
+            if (action.type === "ENTER" && gateAlpacaBuy(ticker, action.qty * price)) {
               const { order, stopOrderId } = await submitEntryWithStop({
                 symbol: ticker,
                 qty: action.qty,
@@ -1498,6 +1700,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               }
             }
           } catch (e) {
+            alpacaOrderFailures++;
             errors.push(`Alpaca broker action failed for ${ticker}: ${String(e)}`);
           }
         }
@@ -1512,11 +1715,13 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           try {
             if (wantLong && !held) {
               const notional = confidenceNotional(est.confidence);
-              const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional, alpacaOrderId: order.id, status: order.status },
-              });
-              ordersSubmitted++;
+              if (gateAlpacaBuy(ticker, notional)) {
+                const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
+                await db.paperOrder.create({
+                  data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional, alpacaOrderId: order.id, status: order.status },
+                });
+                ordersSubmitted++;
+              }
             } else if (!wantLong && held && held.qty > 0) {
               const qty = Math.abs(held.qty);
               const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
@@ -1526,10 +1731,15 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               ordersSubmitted++;
             }
           } catch (e) {
+            alpacaOrderFailures++;
             errors.push(`Alpaca order failed for ${ticker}: ${String(e)}`);
           }
         }
       }
+
+      // Order rejections / fill failures this run → an account-health alert.
+      const ordersAlert = detectOrderFailures(alpacaOrderFailures);
+      if (ordersAlert) accountAlerts.push(ordersAlert);
 
       // Equity straight from the paper account; unrealized rolled up from positions.
       const account = await getAccount();
@@ -1548,6 +1758,18 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     } catch (e) {
       errors.push(`Alpaca book failed: ${String(e)}`);
       reportError("paper_alpaca_book_failed", e, { stage: "paper" });
+      if (riskLimitsOn) accountAlerts.push(detectBrokerUnreachable());
+    }
+  }
+
+  // Persist + notify on any account/trading-health alerts raised this run.
+  if (accountAlerts.length > 0) {
+    try {
+      const r = await processAccountAlerts(accountAlerts);
+      errors.push(...r.errors);
+    } catch (e) {
+      errors.push(`Account alert processing failed: ${String(e)}`);
+      reportError("account_alert_processing_failed", e, { stage: "paper" });
     }
   }
 
