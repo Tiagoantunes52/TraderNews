@@ -69,7 +69,6 @@ import {
   type AlpacaOpenOrder,
 } from "@/lib/alpaca-trading";
 import { reportError } from "@/lib/observability";
-import { SUPPORTED_EXCHANGE_SUFFIXES } from "@/lib/market-utils";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -327,21 +326,24 @@ function watchedStocksWhere() {
 }
 
 /**
- * The full data-coverage universe: every *supported* stock we track, watchlisted or
- * not. The core signal stages (news → sentiment → quant → estimate → paper) run over
- * all of them so we accumulate price/news history and trade ideas beyond what users
- * hold. Insider & Congress deliberately stay watchlist-scoped (`watchedStocksWhere`)
- * to respect the Finnhub (60/min) and AInvest (hard-throttle) free-tier limits.
- *
- * Scoped to supported exchanges only: US equities + crypto carry no dot, the seeded
- * European listings end in a known suffix. This excludes the unsupported foreign
- * tickers the search typeahead accumulated (no coverage → wasted pipeline budget).
+ * The data-coverage universe for the core signal stages (news → sentiment → quant →
+ * estimate → paper). The automated trader is **US-equity only**, so coverage is
+ * tiered for efficiency:
+ *   • US equities (no exchange suffix, not crypto) are analysed in full — watched or
+ *     not — because they're what we trade and want the most history on;
+ *   • everything else (European listings, crypto) is analysed only when a user
+ *     watches it — no point spending pipeline budget on non-tradable names nobody
+ *     follows.
+ * Insider & Congress stay fully watchlist-scoped (`watchedStocksWhere`) to respect
+ * the Finnhub (60/min) and AInvest (hard-throttle) free-tier limits.
  */
 function universeWhere() {
   return {
     OR: [
-      { NOT: { ticker: { contains: "." } } }, // US equities + crypto (-USD): no dot
-      ...SUPPORTED_EXCHANGE_SUFFIXES.map((suffix) => ({ ticker: { endsWith: suffix } })),
+      // US equities: no dot (excludes European .XX listings) and not crypto (-USD).
+      { AND: [{ NOT: { ticker: { contains: "." } } }, { NOT: { ticker: { endsWith: "-USD" } } }] },
+      // Non-US (European listings, crypto): only when at least one user watches it.
+      { userStocks: { some: {} } },
     ],
   };
 }
