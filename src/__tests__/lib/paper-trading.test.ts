@@ -276,6 +276,16 @@ describe("reconcileRiskManaged()", () => {
         bearishStreak: 0,
       });
     });
+
+    it("fills a gap-down at the gapped price, NOT the stop level (issue #56)", () => {
+      // Stop sits at 92 (entry 100, 8% fixed). The name gaps to 80 — the close is
+      // well below the stop. We must realize the gapped 80, not pretend we got 92,
+      // so the equity-curve drawdown isn't understated.
+      const action = rm({ price: 80, runsSinceEntry: 0, signal: "BUY", open: long() });
+      expect(action).toEqual({ type: "CLOSE", price: 80, realizedPnl: -200, reason: "STOP" });
+      // The gapped loss (−200) is strictly worse than a fill-at-the-stop (−80).
+      expect((action as { realizedPnl: number }).realizedPnl).toBeLessThan(-80);
+    });
   });
 
   describe("trailing stop", () => {

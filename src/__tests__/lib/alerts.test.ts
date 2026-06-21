@@ -3,6 +3,10 @@ import {
   detectSignalChange,
   detectVelocitySpike,
   detectRsiCross,
+  detectDrawdownBreach,
+  detectOrderFailures,
+  detectBrokerUnreachable,
+  detectStalePipeline,
   humanizeSignal,
 } from "@/lib/alerts";
 
@@ -102,5 +106,65 @@ describe("detectRsiCross", () => {
   it("requires both previous and new readings", () => {
     expect(detectRsiCross("NVDA", null, 28)).toBeNull();
     expect(detectRsiCross("NVDA", 32, null)).toBeNull();
+  });
+});
+
+describe("account-health alerts (issue #56)", () => {
+  describe("detectDrawdownBreach", () => {
+    it("fires at/above the kill-switch threshold and carries the drawdown", () => {
+      const a = detectDrawdownBreach("ALPACA", 0.22, 0.2);
+      expect(a).not.toBeNull();
+      expect(a!.type).toBe("ACCOUNT_DRAWDOWN");
+      expect(a!.title).toContain("22.0%");
+      expect(a!.value).toBe(0.22);
+    });
+    it("does not fire below the threshold", () => {
+      expect(detectDrawdownBreach("ALPACA", 0.19, 0.2)).toBeNull();
+    });
+    it("ignores non-finite drawdown", () => {
+      expect(detectDrawdownBreach("ALPACA", NaN, 0.2)).toBeNull();
+    });
+  });
+
+  describe("detectOrderFailures", () => {
+    it("fires once one or more orders failed", () => {
+      const a = detectOrderFailures(1);
+      expect(a!.type).toBe("ORDER_FAILURES");
+      expect(a!.value).toBe(1);
+      expect(a!.title).toContain("1 order failure");
+    });
+    it("pluralizes and respects a custom threshold", () => {
+      expect(detectOrderFailures(3)!.title).toContain("3 order failures");
+      expect(detectOrderFailures(0)).toBeNull();
+      expect(detectOrderFailures(1, 2)).toBeNull();
+    });
+  });
+
+  describe("detectBrokerUnreachable", () => {
+    it("always returns a draft (only called on a thrown error)", () => {
+      const a = detectBrokerUnreachable();
+      expect(a.type).toBe("BROKER_UNREACHABLE");
+      expect(a.value).toBeNull();
+    });
+  });
+
+  describe("detectStalePipeline", () => {
+    const now = new Date("2026-06-21T12:00:00.000Z");
+    it("fires when the freshest data is older than the threshold", () => {
+      const old = new Date("2026-06-18T12:00:00.000Z"); // 72h old
+      const a = detectStalePipeline(old, now, 48);
+      expect(a!.type).toBe("STALE_PIPELINE");
+      expect(a!.value).toBeCloseTo(72, 0);
+    });
+    it("fires when there is no data at all", () => {
+      const a = detectStalePipeline(null, now, 48);
+      expect(a).not.toBeNull();
+      expect(a!.value).toBeNull();
+      expect(a!.title).toContain("missing");
+    });
+    it("does not fire when data is fresh", () => {
+      const recent = new Date("2026-06-21T06:00:00.000Z"); // 6h old
+      expect(detectStalePipeline(recent, now, 48)).toBeNull();
+    });
   });
 });

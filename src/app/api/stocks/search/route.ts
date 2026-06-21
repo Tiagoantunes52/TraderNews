@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { searchStocks } from "@/lib/finnhub";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
-import { marketNamesForTicker } from "@/lib/market-utils";
+import { marketNamesForTicker, isSupportedTicker } from "@/lib/market-utils";
 import { withRoute } from "@/lib/observability";
 import { enforceRateLimit } from "@/lib/rate-limit";
 
@@ -54,6 +54,11 @@ export const GET = withRoute("stocks/search", async (req: Request) => {
     const seen = new Set<string>();
     const candidates = result.result
       .filter((s) => s.type === "Common Stock" && s.symbol && !seen.has(s.symbol) && seen.add(s.symbol))
+      // Only persist tickers the app actually supports. Finnhub's symbol search is
+      // global and returns foreign listings (Shanghai .SS, Tokyo .T, Toronto .TO, …)
+      // with no price/news coverage; inserting them silently polluted the Stock table
+      // (and, once the pipeline went full-universe, would waste budget on dead names).
+      .filter((s) => isSupportedTicker(s.symbol))
       .filter((s) => !byTicker.has(s.symbol))
       .slice(0, 10);
 

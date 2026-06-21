@@ -331,6 +331,10 @@ export function reconcileRiskManaged(args: {
     });
 
     // 1. Hard stop-loss — never suppressed (capital protection comes first).
+    // Gapping fill: we close at `price` (the next available close), NOT the stop
+    // level, so a name that gaps straight through its stop realizes the worse,
+    // gapped price — keeping realized P&L and the equity-curve drawdown honest
+    // rather than pretending we always got out exactly at the stop (issue #56).
     const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
     if (price <= entryPrice * (1 - stopPct)) return close("STOP");
 
