@@ -69,6 +69,7 @@ import {
   type AlpacaOpenOrder,
 } from "@/lib/alpaca-trading";
 import { reportError } from "@/lib/observability";
+import { SUPPORTED_EXCHANGE_SUFFIXES } from "@/lib/market-utils";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -110,7 +111,9 @@ export type NewsStageResult = {
   articles: { fetched: number; saved: number };
   tags: number;
   errors: string[];
-  done: true;
+  // News now walks the full universe in budget-bounded chunks, so it can defer the
+  // tail to a later invocation just like the per-stock stages (done:false → resume).
+  done: boolean;
 };
 
 /**
@@ -323,6 +326,47 @@ function watchedStocksWhere() {
   return { userStocks: { some: {} } } as const;
 }
 
+/**
+ * The full data-coverage universe: every *supported* stock we track, watchlisted or
+ * not. The core signal stages (news → sentiment → quant → estimate → paper) run over
+ * all of them so we accumulate price/news history and trade ideas beyond what users
+ * hold. Insider & Congress deliberately stay watchlist-scoped (`watchedStocksWhere`)
+ * to respect the Finnhub (60/min) and AInvest (hard-throttle) free-tier limits.
+ *
+ * Scoped to supported exchanges only: US equities + crypto carry no dot, the seeded
+ * European listings end in a known suffix. This excludes the unsupported foreign
+ * tickers the search typeahead accumulated (no coverage → wasted pipeline budget).
+ */
+function universeWhere() {
+  return {
+    OR: [
+      { NOT: { ticker: { contains: "." } } }, // US equities + crypto (-USD): no dot
+      ...SUPPORTED_EXCHANGE_SUFFIXES.map((suffix) => ({ ticker: { endsWith: suffix } })),
+    ],
+  };
+}
+
+// News walks the universe in chunks from a persisted cursor so it resumes across
+// invocations (the universe can be hundreds of names; a single pass mustn't exceed
+// the serverless budget). The cursor is a stable-order offset, stored in AppSetting.
+const NEWS_CURSOR_KEY = "newsCursor";
+const NEWS_CHUNK = Number(process.env.PIPELINE_NEWS_CHUNK) || 25;
+
+async function getNewsCursor(): Promise<number> {
+  const row = await db.appSetting.findUnique({ where: { key: NEWS_CURSOR_KEY } });
+  const n = row ? Number.parseInt(row.value, 10) : 0;
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+async function setNewsCursor(value: number): Promise<void> {
+  const v = String(Math.max(0, Math.floor(value)));
+  await db.appSetting.upsert({
+    where: { key: NEWS_CURSOR_KEY },
+    update: { value: v },
+    create: { key: NEWS_CURSOR_KEY, value: v },
+  });
+}
+
 // ── Stage 1: News ───────────────────────────────────────────────────────────
 //
 // Fetch general market news + stock-specific news across every configured
@@ -331,7 +375,7 @@ function watchedStocksWhere() {
 // stage can reconstruct the relevance-weighted blend). Cheap enough to finish in
 // one invocation now that Polygon's 12s/req pacing is gone and sources run
 // concurrently, so this stage is always single-shot (`done: true`).
-export async function runNewsStage(): Promise<NewsStageResult> {
+export async function runNewsStage(opts: StageOptions = {}): Promise<NewsStageResult> {
   const errors: string[] = [];
   let fetched = 0;
   let saved = 0;
@@ -339,6 +383,7 @@ export async function runNewsStage(): Promise<NewsStageResult> {
 
   const to = new Date();
   const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const deadline = Date.now() + (opts.budgetMs ?? STAGE_BUDGET_MS);
 
   // 1. General market news (for the news feed, not linked to stocks)
   try {
@@ -362,61 +407,100 @@ export async function runNewsStage(): Promise<NewsStageResult> {
     reportError("news_general_fetch_failed", e, { stage: "news" });
   }
 
-  // 2. Stock-specific news for watched stocks — one centralised concurrent pass.
-  const stocks = await db.stock.findMany({
+  // 2. Stock-specific news over the FULL universe, budget-bounded + resumable.
+  //    The universe can be hundreds of names, so we walk it in chunks from a
+  //    persisted cursor and stop when the time budget elapses; the orchestrator
+  //    re-invokes us and we resume where we left off. One full pass ⇒ done.
+  const universe = await db.stock.findMany({
     select: { id: true, ticker: true, name: true },
-    where: watchedStocksWhere(),
+    where: universeWhere(),
+    orderBy: { id: "asc" }, // stable order so the cursor stays meaningful run-to-run
   });
 
-  if (stocks.length > 0) {
-    const tickerToStock = new Map(stocks.map((s) => [s.ticker, s]));
-    const agg = await aggregateNews(stocks, from);
-    fetched += agg.fetched;
-    errors.push(...agg.errors);
+  let done = true;
+  if (universe.length > 0) {
+    const tickerToStock = new Map(universe.map((s) => [s.ticker, s]));
+    let cursor = await getNewsCursor();
+    if (cursor >= universe.length) cursor = 0; // universe shrank → restart the walk
+    let processed = 0;
 
-    const r = await saveArticlesWithDedup(agg.articles, from);
-    saved += r.saved;
-    const urlToId = r.urlToId;
-
-    const plainLinks: Array<{ articleId: string; stockId: string }> = [];
-    const sentimentLinks: Array<{ articleId: string; stockId: string; score: number; relevance: number }> = [];
-
-    for (const art of agg.articles) {
-      const articleId = urlToId.get(art.url);
-      if (!articleId) continue;
-
-      // Links carrying a precomputed per-article sentiment score (Alpha Vantage)
-      const scored = new Set<string>();
-      for (const s of art.sentiment) {
-        const stock = tickerToStock.get(s.ticker);
-        if (!stock) continue;
-        sentimentLinks.push({ articleId, stockId: stock.id, score: s.score, relevance: s.relevance });
-        scored.add(s.ticker);
+    while (processed < universe.length) {
+      if (Date.now() > deadline) {
+        done = false; // budget hit mid-pass; resume from the cursor next invocation
+        break;
+      }
+      const chunk: typeof universe = [];
+      while (chunk.length < NEWS_CHUNK && processed < universe.length) {
+        chunk.push(universe[cursor]);
+        cursor = (cursor + 1) % universe.length;
+        processed++;
       }
 
-      // Plain links for the remaining linked tickers
-      for (const ticker of art.stockTickers) {
-        if (scored.has(ticker)) continue;
-        const stock = tickerToStock.get(ticker);
-        if (stock) plainLinks.push({ articleId, stockId: stock.id });
-      }
-    }
+      const agg = await aggregateNews(chunk, from);
+      fetched += agg.fetched;
+      errors.push(...agg.errors);
+      const r = await saveArticlesWithDedup(agg.articles, from);
+      saved += r.saved;
+      tags += await linkArticlesToStocks(agg.articles, r.urlToId, tickerToStock);
 
-    if (plainLinks.length > 0) {
-      await db.articleStock.createMany({ data: plainLinks, skipDuplicates: true });
-      tags += plainLinks.length;
+      await setNewsCursor(cursor);
     }
-    for (const { articleId, stockId, score, relevance } of sentimentLinks) {
-      await db.articleStock.upsert({
-        where: { articleId_stockId: { articleId, stockId } },
-        create: { articleId, stockId, sentimentScore: score, sentimentRelevance: relevance },
-        update: { sentimentScore: score, sentimentRelevance: relevance },
-      });
-    }
-    tags += sentimentLinks.length;
   }
 
-  return { stage: "news", articles: { fetched, saved }, tags, errors, done: true };
+  return { stage: "news", articles: { fetched, saved }, tags, errors, done };
+}
+
+/** Article type produced by the news aggregator (derived to avoid a named import). */
+type AggregatedArticles = Awaited<ReturnType<typeof aggregateNews>>["articles"];
+
+/**
+ * Link saved articles to the stocks they mention, carrying Alpha Vantage's
+ * per-(article,stock) sentiment score/relevance where present (upserted) and plain
+ * links otherwise (createMany, skipDuplicates). Returns the number of links written.
+ */
+async function linkArticlesToStocks(
+  articles: AggregatedArticles,
+  urlToId: Map<string, string>,
+  tickerToStock: Map<string, { id: string }>
+): Promise<number> {
+  let tags = 0;
+  const plainLinks: Array<{ articleId: string; stockId: string }> = [];
+  const sentimentLinks: Array<{ articleId: string; stockId: string; score: number; relevance: number }> = [];
+
+  for (const art of articles) {
+    const articleId = urlToId.get(art.url);
+    if (!articleId) continue;
+
+    // Links carrying a precomputed per-article sentiment score (Alpha Vantage)
+    const scored = new Set<string>();
+    for (const s of art.sentiment) {
+      const stock = tickerToStock.get(s.ticker);
+      if (!stock) continue;
+      sentimentLinks.push({ articleId, stockId: stock.id, score: s.score, relevance: s.relevance });
+      scored.add(s.ticker);
+    }
+
+    // Plain links for the remaining linked tickers
+    for (const ticker of art.stockTickers) {
+      if (scored.has(ticker)) continue;
+      const stock = tickerToStock.get(ticker);
+      if (stock) plainLinks.push({ articleId, stockId: stock.id });
+    }
+  }
+
+  if (plainLinks.length > 0) {
+    await db.articleStock.createMany({ data: plainLinks, skipDuplicates: true });
+    tags += plainLinks.length;
+  }
+  for (const { articleId, stockId, score, relevance } of sentimentLinks) {
+    await db.articleStock.upsert({
+      where: { articleId_stockId: { articleId, stockId } },
+      create: { articleId, stockId, sentimentScore: score, sentimentRelevance: relevance },
+      update: { sentimentScore: score, sentimentRelevance: relevance },
+    });
+  }
+  tags += sentimentLinks.length;
+  return tags;
 }
 
 // ── Stage 2: Sentiment ──────────────────────────────────────────────────────
@@ -442,7 +526,7 @@ export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchS
   }
 
   const worklist = await db.stock.findMany({
-    where: { ...watchedStocksWhere(), sentiments: { none: { date: { gte: todayUTC } } } },
+    where: { ...universeWhere(), sentiments: { none: { date: { gte: todayUTC } } } },
     select: { id: true, ticker: true },
   });
 
@@ -557,8 +641,8 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
   const from60 = new Date(to.getTime() - 60 * 24 * 60 * 60 * 1000);
   const deadline = Date.now() + (opts.budgetMs ?? STAGE_BUDGET_MS);
 
-  // All watched stocks (for benchmark/sector setup), and the US subset.
-  const stocks = await db.stock.findMany({ where: watchedStocksWhere(), select: { id: true, ticker: true } });
+  // The full universe (for benchmark/sector setup), and the US subset.
+  const stocks = await db.stock.findMany({ where: universeWhere(), select: { id: true, ticker: true } });
   const usStocks = stocks.filter((s) => !s.ticker.includes(".") && !s.ticker.endsWith("-USD"));
 
   // SPY benchmark for relative strength
@@ -604,7 +688,7 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
   }
 
   const worklist = await db.stock.findMany({
-    where: { ...watchedStocksWhere(), quantAnalyses: { none: { date: { gte: todayUTC } } } },
+    where: { ...universeWhere(), quantAnalyses: { none: { date: { gte: todayUTC } } } },
     select: { id: true, ticker: true },
   });
 
@@ -740,27 +824,27 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
   const sevenDaysAgo = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
   const yesterday = new Date(to.getTime() - 86_400_000);
 
-  // Watched stocks whose today estimate is missing or stale. "Stale" = a sentiment
-  // newer than the estimate's last computation has landed. The estimate snapshots
-  // the sentiment score, so it must be recomputed when sentiment moves — otherwise
-  // a delayed sentiment leaves the day's estimate (and the signal the paper book
-  // trades on) frozen on the prior day's read.
-  const watched = await db.stock.findMany({
-    where: watchedStocksWhere(),
+  // Every stock in the universe whose today estimate is missing or stale. "Stale" =
+  // a sentiment newer than the estimate's last computation has landed. The estimate
+  // snapshots the sentiment score, so it must be recomputed when sentiment moves —
+  // otherwise a delayed sentiment leaves the day's estimate (and the signal the
+  // paper book trades on) frozen on the prior day's read.
+  const universe = await db.stock.findMany({
+    where: universeWhere(),
     select: { id: true, ticker: true },
   });
-  const watchedIds = watched.map((s) => s.id);
+  const universeIds = universe.map((s) => s.id);
   const [sentMax, estToday] = await Promise.all([
-    db.sentiment.groupBy({ by: ["stockId"], where: { stockId: { in: watchedIds } }, _max: { date: true } }),
+    db.sentiment.groupBy({ by: ["stockId"], where: { stockId: { in: universeIds } }, _max: { date: true } }),
     db.stockEstimate.groupBy({
       by: ["stockId"],
-      where: { stockId: { in: watchedIds }, date: { gte: todayUTC } },
+      where: { stockId: { in: universeIds }, date: { gte: todayUTC } },
       _max: { date: true },
     }),
   ]);
   const latestSentimentAt = new Map(sentMax.map((r) => [r.stockId, r._max.date]));
   const todayEstimateAt = new Map(estToday.map((r) => [r.stockId, r._max.date]));
-  const worklist = watched.filter((s) => {
+  const worklist = universe.filter((s) => {
     const sAt = latestSentimentAt.get(s.id);
     if (!sAt) return false; // no sentiment yet → nothing to estimate from
     const eAt = todayEstimateAt.get(s.id);
@@ -1231,7 +1315,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
 
   // Today's estimates for watched stocks, newest first; dedupe to one per stock.
   const estimateRows = await db.stockEstimate.findMany({
-    where: { date: { gte: todayUTC }, stock: watchedStocksWhere() },
+    where: { date: { gte: todayUTC }, stock: universeWhere() },
     orderBy: { date: "desc" },
     select: {
       stockId: true,
@@ -1807,10 +1891,16 @@ async function runStageToCompletion(
 export async function runPipeline(): Promise<PipelineResult> {
   const result: PipelineResult = { articles: { fetched: 0, saved: 0 }, tags: 0, sentiments: 0, quants: 0, estimates: 0, insider: 0, alerts: 0, errors: [] };
 
-  const news = await runNewsStage();
-  result.articles = news.articles;
-  result.tags += news.tags;
-  result.errors.push(...news.errors);
+  // News now walks the universe in budget-bounded chunks, so loop it to completion
+  // (like the per-stock stages) instead of a single pass.
+  for (let i = 0; i < 50; i++) {
+    const news = await runNewsStage();
+    result.articles.fetched += news.articles.fetched;
+    result.articles.saved += news.articles.saved;
+    result.tags += news.tags;
+    result.errors.push(...news.errors);
+    if (news.done) break;
+  }
 
   const sentiment = await runStageToCompletion(runSentimentStage);
   result.sentiments = sentiment.created;
