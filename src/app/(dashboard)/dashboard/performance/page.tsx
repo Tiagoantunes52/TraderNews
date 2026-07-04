@@ -27,6 +27,8 @@ const PERF_HINTS = {
     "Win rate — the share of closed positions that ended profitable.",
   realized:
     "Total profit/loss locked in from closed positions only; still-open positions aren't counted.",
+  unrealized:
+    "Paper profit/loss on still-open positions at the latest mark. This is the bridge to the cards: card equity = starting cash + realized + unrealized.",
   returnPct:
     "Change in the book's equity since it started, as a %.",
 } as const;
@@ -145,9 +147,16 @@ export default async function PerformancePage() {
     if ((p.realizedPnl ?? 0) > 0) st.wins++;
   }
   const openCountByStrategy = new Map<Strategy, number>();
-  for (const strat of ALL_STRATEGIES) openCountByStrategy.set(strat, 0);
+  const unrealizedByStrategy = new Map<Strategy, number>();
+  for (const strat of ALL_STRATEGIES) {
+    openCountByStrategy.set(strat, 0);
+    unrealizedByStrategy.set(strat, 0);
+  }
   for (const p of openPositions) {
-    openCountByStrategy.set(p.strategy as Strategy, (openCountByStrategy.get(p.strategy as Strategy) ?? 0) + 1);
+    const strat = p.strategy as Strategy;
+    openCountByStrategy.set(strat, (openCountByStrategy.get(strat) ?? 0) + 1);
+    const mark = p.lastMarkPrice ?? p.entryPrice;
+    unrealizedByStrategy.set(strat, (unrealizedByStrategy.get(strat) ?? 0) + p.qty * (mark - p.entryPrice));
   }
   // Total realized P&L across every closed sim position (all books).
   const totalRealized = closedPositions.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
@@ -189,7 +198,7 @@ export default async function PerformancePage() {
   );
 
   // Unified per-book performance rows: each simulated signal source + the live Alpaca book.
-  type BookRow = { key: string; label: string; color: string; closed: number; open: number; wins: number; realized: number };
+  type BookRow = { key: string; label: string; color: string; closed: number; open: number; wins: number; realized: number; unrealized: number };
   const bookRows: BookRow[] = ratedStrategies.map((strat) => {
     const st = statsByStrategy.get(strat)!;
     return {
@@ -200,6 +209,7 @@ export default async function PerformancePage() {
       open: openCountByStrategy.get(strat) ?? 0,
       wins: st.wins,
       realized: st.realized,
+      unrealized: unrealizedByStrategy.get(strat) ?? 0,
     };
   });
   if (alpacaConfigured && (booksPresent.has("ALPACA") || alpacaClosed.trades.length > 0)) {
@@ -212,6 +222,7 @@ export default async function PerformancePage() {
       open: latestByBook.get("ALPACA")?.openPositions ?? 0,
       wins: alpacaClosed.trades.filter((t) => t.realizedPnl > 0).length,
       realized: alpacaClosed.totalRealized,
+      unrealized: latestByBook.get("ALPACA")?.unrealizedPnl ?? 0,
     });
   }
 
@@ -260,31 +271,32 @@ export default async function PerformancePage() {
 
       <Card className="rounded-2xl">
         <CardContent className="p-4 sm:p-6">
-          <p className="text-sm font-medium mb-1">Hit rate &amp; realized P&amp;L by book</p>
+          <p className="text-sm font-medium mb-1">Hit rate &amp; P&amp;L by book</p>
           <p className="text-xs text-muted-foreground mb-3">
             Each signal source runs as its own simulated book; the live Alpaca paper account mirrors the combined
-            signal with real orders. Win rate is the share of closed positions that were profitable; realized
-            excludes still-open positions.
+            signal with real orders. Win rate is the share of closed positions that were profitable. Realized +
+            unrealized together explain the equity cards above: card equity = starting cash + realized + unrealized.
           </p>
           <div className="space-y-2">
             <div className="grid grid-cols-12 text-xs text-muted-foreground px-2">
-              <span className="col-span-5"><Hint text={PERF_HINTS.book} className={HINT_TEXT}>Book</Hint></span>
-              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.closed} className={HINT_TEXT}>Closed</Hint></span>
-              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.open} className={HINT_TEXT}>Open</Hint></span>
-              <span className="col-span-1 text-right"><Hint text={PERF_HINTS.win} className={HINT_TEXT}>Win</Hint></span>
+              <span className="col-span-4"><Hint text={PERF_HINTS.book} className={HINT_TEXT}>Book</Hint></span>
+              <span className="col-span-1 text-right"><Hint text={PERF_HINTS.closed} className={HINT_TEXT}>Closed</Hint></span>
+              <span className="col-span-1 text-right"><Hint text={PERF_HINTS.open} className={HINT_TEXT}>Open</Hint></span>
+              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.win} className={HINT_TEXT}>Win</Hint></span>
               <span className="col-span-2 text-right"><Hint text={PERF_HINTS.realized} className={HINT_TEXT}>Realized</Hint></span>
+              <span className="col-span-2 text-right"><Hint text={PERF_HINTS.unrealized} className={HINT_TEXT}>Unrealized</Hint></span>
             </div>
             {bookRows.map((row) => {
               const hitRate = row.closed > 0 ? (row.wins / row.closed) * 100 : null;
               return (
                 <div key={row.key} className="grid grid-cols-12 items-center text-sm px-2 py-2 rounded-lg odd:bg-muted/40">
-                  <span className="col-span-5 flex items-center gap-2">
+                  <span className="col-span-4 flex items-center gap-2">
                     <span className="inline-block h-2 w-2 rounded-full" style={{ background: row.color }} />
                     {row.label}
                   </span>
-                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">{row.closed}</span>
-                  <span className="col-span-2 text-right tabular-nums text-muted-foreground">{row.open}</span>
-                  <span className="col-span-1 text-right tabular-nums font-medium">
+                  <span className="col-span-1 text-right tabular-nums text-muted-foreground">{row.closed}</span>
+                  <span className="col-span-1 text-right tabular-nums text-muted-foreground">{row.open}</span>
+                  <span className="col-span-2 text-right tabular-nums font-medium">
                     {hitRate == null ? "—" : `${hitRate.toFixed(0)}%`}
                   </span>
                   <span
@@ -293,6 +305,13 @@ export default async function PerformancePage() {
                     }`}
                   >
                     {fmtUsd(row.realized)}
+                  </span>
+                  <span
+                    className={`col-span-2 text-right tabular-nums ${
+                      row.unrealized > 0 ? "text-emerald-600/80" : row.unrealized < 0 ? "text-rose-600/80" : "text-muted-foreground"
+                    }`}
+                  >
+                    {fmtUsd(row.unrealized)}
                   </span>
                 </div>
               );
