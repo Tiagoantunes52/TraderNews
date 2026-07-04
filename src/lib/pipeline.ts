@@ -34,8 +34,10 @@ import {
   STRATEGY_IS_RM,
   reconcilePosition,
   reconcileRiskManaged,
+  reconcileEventPosition,
   planBrokerAction,
   isRiskBooksEnabled,
+  isInsiderBookEnabled,
   isBrokerStopsEnabled,
   utcDaysBetween,
   summarizeBook,
@@ -52,6 +54,7 @@ import {
 import {
   isRiskLimitsEnabled,
   evaluateBuy,
+  regimeMultiplier,
   correlationClusters,
   clusterKeyFor,
   type BookExposure,
@@ -1459,6 +1462,31 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     }
   }
 
+  // Regime filter (issue #58): while SPY sits below its moving average, the gross
+  // cap is scaled by regimeRiskOffGrossFrac — long-only books make most of their
+  // drawdown in bear markets. Neutral (1) until enough SPY history exists for the
+  // MA, and on any error: the filter only ever tightens on an OBSERVED downtrend.
+  let regimeMult = 1;
+  if (riskLimitsOn && limits.regimeMaWindow > 0) {
+    try {
+      const spy = await db.stock.findUnique({ where: { ticker: "SPY" }, select: { id: true } });
+      const closes = spy
+        ? await db.quantAnalysis.findMany({
+            where: { stockId: spy.id, price: { not: null } },
+            orderBy: { date: "desc" },
+            take: limits.regimeMaWindow,
+            select: { price: true },
+          })
+        : [];
+      if (closes.length >= limits.regimeMaWindow) {
+        const ma = closes.reduce((s, r) => s + r.price!, 0) / closes.length;
+        regimeMult = regimeMultiplier(closes[0].price, ma, limits.regimeRiskOffGrossFrac);
+      }
+    } catch (e) {
+      errors.push(`Regime filter failed (treated as risk-on): ${String(e)}`);
+    }
+  }
+
   // Correlation clusters across the watchlist (crypto = one bucket) so the cluster
   // cap limits *correlated* exposure, not just per-ticker. Built from recent closes.
   let clusterByTicker = new Map<string, string>();
@@ -1593,7 +1621,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         const br = bookRisk.get(strategy);
         if (br) {
           const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
-          if (evaluateBuy(br, candidate, limits).allowed) {
+          if (evaluateBuy(br, candidate, limits, regimeMult).allowed) {
             br.positions.push(candidate); // reserve so later opens this run see it
           } else {
             action = { type: "NONE" };
@@ -1690,9 +1718,100 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       errors.push(`Equity snapshot failed for ${strategy}: ${String(e)}`);
     }
   };
-  // _RM books first (when enabled), then the pure books — so SIM_COMBINED, the
-  // idempotency marker, is still written last.
+  // ── Insider event book (issue #57; ship-dark: PAPER_INSIDER_BOOK=1) ─────────
+  // Event-driven, NOT estimate-driven: open on an insider cluster-buy / C-suite-buy
+  // alert (fired by the insider stage), hold a fixed multi-week period, close on
+  // expiry — time is the only exit, so the book measures the event's raw drift.
+  // Runs before the snapshots so SIM_INSIDER gets today's equity point too.
+  if (isInsiderBookEnabled()) {
+    try {
+      const eventSince = new Date(todayUTC.getTime() - 3 * 86_400_000); // covers weekends/missed days
+      const [events, insiderOpen] = await Promise.all([
+        db.alert.findMany({
+          where: {
+            type: { in: ["INSIDER_CLUSTER_BUY", "INSIDER_CSUITE_BUY"] },
+            createdAt: { gte: eventSince },
+            stockId: { not: null },
+          },
+          select: { stockId: true, stock: { select: { ticker: true } } },
+        }),
+        db.simPosition.findMany({
+          where: { strategy: "INSIDER", status: "OPEN" },
+          select: { id: true, stockId: true, qty: true, entryPrice: true, entryDate: true },
+        }),
+      ]);
+      // Mark prices for every stock the book touches (open positions may be on
+      // names outside today's estimate set, so priceByStock can't be reused).
+      const insiderStockIds = [...new Set([...events.map((e) => e.stockId!), ...insiderOpen.map((p) => p.stockId)])];
+      const insiderQuant =
+        insiderStockIds.length > 0
+          ? await db.quantAnalysis.findMany({
+              where: { stockId: { in: insiderStockIds }, price: { not: null } },
+              orderBy: { date: "desc" },
+              distinct: ["stockId"],
+              select: { stockId: true, price: true },
+            })
+          : [];
+      const insiderPrice = new Map(insiderQuant.map((q) => [q.stockId, q.price!]));
+
+      // Manage open positions: close on hold expiry, else mark to the latest close.
+      for (const p of insiderOpen) {
+        const price = insiderPrice.get(p.stockId);
+        if (price == null) continue; // no price → carry as-is; next run retries
+        const action = reconcileEventPosition(price, utcDaysBetween(p.entryDate, todayUTC), cfg.insiderHoldDays, p);
+        try {
+          if (action.type === "CLOSE") {
+            await db.simPosition.update({
+              where: { id: p.id },
+              data: { status: "CLOSED", exitDate: to, exitPrice: action.price, realizedPnl: action.realizedPnl, lastMarkDate: to, lastMarkPrice: action.price },
+            });
+            simClosed++;
+          } else if (action.type === "MARK") {
+            await db.simPosition.update({ where: { id: p.id }, data: { lastMarkDate: to, lastMarkPrice: action.price } });
+          }
+        } catch (e) {
+          errors.push(`Insider book update failed for ${p.stockId}: ${String(e)}`);
+        }
+      }
+
+      // Fresh events → open flat-sized positions (one per stock; re-triggering
+      // alerts on an already-open name are ignored).
+      const alreadyOpen = new Set(insiderOpen.map((p) => p.stockId));
+      const tickerById = new Map(events.map((e) => [e.stockId!, e.stock!.ticker]));
+      for (const stockId of new Set(events.map((e) => e.stockId!))) {
+        if (alreadyOpen.has(stockId)) continue;
+        const ticker = tickerById.get(stockId);
+        const price = insiderPrice.get(stockId);
+        if (!ticker || !isPaperTradeEligible(ticker) || price == null || price <= 0) continue;
+        try {
+          await db.simPosition.create({
+            data: {
+              stockId,
+              strategy: "INSIDER",
+              status: "OPEN",
+              qty: cfg.insiderNotional / price,
+              entryDate: to,
+              entryPrice: price,
+              confidence: 1, // flat sizing — the event itself is the conviction
+              lastMarkDate: to,
+              lastMarkPrice: price,
+            },
+          });
+          simOpened++;
+          alreadyOpen.add(stockId);
+        } catch (e) {
+          errors.push(`Insider book open failed for ${ticker}: ${String(e)}`);
+        }
+      }
+    } catch (e) {
+      errors.push(`Insider event book failed: ${String(e)}`);
+    }
+  }
+
+  // _RM books first (when enabled), then the event + pure books — so SIM_COMBINED,
+  // the idempotency marker, is still written last.
   if (riskEnabled) for (const strategy of RM_STRATEGIES) await snapshotStrategy(strategy);
+  if (isInsiderBookEnabled()) await snapshotStrategy("INSIDER");
   for (const strategy of STRATEGIES) await snapshotStrategy(strategy);
 
   // ── Alpaca book (only when paper keys are configured) ──────────────────────
@@ -1766,7 +1885,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const gateAlpacaBuy = (symbol: string, notional: number): boolean => {
         if (!riskLimitsOn || !alpacaRisk) return true;
         const candidate = { cluster: clusterKeyFor(symbol, clusterByTicker), notional };
-        if (!evaluateBuy(alpacaRisk, candidate, limits).allowed) return false;
+        if (!evaluateBuy(alpacaRisk, candidate, limits, regimeMult).allowed) return false;
         alpacaRisk.positions.push(candidate);
         return true;
       };

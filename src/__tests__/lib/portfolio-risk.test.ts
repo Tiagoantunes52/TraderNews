@@ -11,6 +11,7 @@ import {
   currentDrawdown,
   deriskMultiplier,
   evaluateBuy,
+  regimeMultiplier,
   type BookExposure,
   type RiskLimits,
 } from "@/lib/portfolio-risk";
@@ -192,5 +193,32 @@ describe("evaluateBuy gate", () => {
   it("rejects non-positive equity / notional defensively", () => {
     expect(evaluateBuy(base({ equity: 0 }), { cluster: "A", notional: 10 }, limits).allowed).toBe(false);
     expect(evaluateBuy(base(), { cluster: "A", notional: 0 }, limits).allowed).toBe(false);
+  });
+});
+
+describe("regimeMultiplier() — SPY regime filter (issue #58)", () => {
+  it("is risk-on (1) while SPY holds at or above its MA", () => {
+    expect(regimeMultiplier(500, 480, 0.5)).toBe(1);
+    expect(regimeMultiplier(480, 480, 0.5)).toBe(1);
+  });
+
+  it("scales to the risk-off fraction below the MA", () => {
+    expect(regimeMultiplier(450, 480, 0.5)).toBe(0.5);
+    expect(regimeMultiplier(450, 480, 0)).toBe(0); // full halt variant
+  });
+
+  it("never tightens on missing data (no price / no MA / degenerate MA)", () => {
+    expect(regimeMultiplier(null, 480, 0.5)).toBe(1);
+    expect(regimeMultiplier(500, null, 0.5)).toBe(1);
+    expect(regimeMultiplier(500, 0, 0.5)).toBe(1);
+  });
+
+  it("scales the gross cap inside evaluateBuy", () => {
+    // Equity 100k, cap 95%. Deployed 40k + 10k candidate = 50k: fine risk-on,
+    // but risk-off at 0.5 the cap is 47.5k → blocked on GROSS_CAP.
+    const book = { equity: 100_000, peakEquity: 100_000, positions: [{ cluster: "A", notional: 40_000 }] };
+    const candidate = { cluster: "B", notional: 10_000 };
+    expect(evaluateBuy(book, candidate, DEFAULT_RISK_LIMITS, 1).allowed).toBe(true);
+    expect(evaluateBuy(book, candidate, DEFAULT_RISK_LIMITS, 0.5)).toEqual({ allowed: false, reason: "GROSS_CAP" });
   });
 });

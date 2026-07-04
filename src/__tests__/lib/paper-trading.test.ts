@@ -21,6 +21,9 @@ import {
   STRATEGY_IS_RM,
   STRATEGIES,
   RM_STRATEGIES,
+  EVENT_STRATEGIES,
+  reconcileEventPosition,
+  isInsiderBookEnabled,
   ALL_STRATEGIES,
   DEFAULT_RISK_CONFIG,
   riskConfig,
@@ -163,7 +166,10 @@ describe("strategy maps", () => {
   it("pairs each pure strategy with a risk-managed variant on the same source", () => {
     expect(STRATEGIES).toEqual(["SENTIMENT", "QUANT", "COMBINED"]);
     expect(RM_STRATEGIES).toEqual(["SENTIMENT_RM", "QUANT_RM", "COMBINED_RM"]);
-    expect(ALL_STRATEGIES).toEqual([...STRATEGIES, ...RM_STRATEGIES]);
+    expect(EVENT_STRATEGIES).toEqual(["INSIDER"]);
+    expect(ALL_STRATEGIES).toEqual([...STRATEGIES, ...RM_STRATEGIES, ...EVENT_STRATEGIES]);
+    expect(STRATEGY_BOOK.INSIDER).toBe("SIM_INSIDER");
+    expect(STRATEGY_IS_RM.INSIDER).toBe(false);
     for (const s of STRATEGIES) {
       expect(STRATEGY_IS_RM[s]).toBe(false);
       expect(STRATEGY_IS_RM[`${s}_RM` as (typeof RM_STRATEGIES)[number]]).toBe(true);
@@ -180,6 +186,32 @@ describe("isBearishSignal()", () => {
     expect(isBearishSignal("NEUTRAL")).toBe(false);
     expect(isBearishSignal("BUY")).toBe(false);
     expect(isBearishSignal("STRONG_BUY")).toBe(false);
+  });
+});
+
+describe("reconcileEventPosition() — insider event book", () => {
+  const open = { qty: 10, entryPrice: 100 };
+
+  it("marks while inside the fixed holding period", () => {
+    expect(reconcileEventPosition(110, 30, 56, open)).toEqual({ type: "MARK", price: 110 });
+  });
+
+  it("closes at expiry regardless of price direction (time is the only exit)", () => {
+    expect(reconcileEventPosition(110, 56, 56, open)).toEqual({ type: "CLOSE", price: 110, realizedPnl: 100 });
+    expect(reconcileEventPosition(90, 60, 56, open)).toEqual({ type: "CLOSE", price: 90, realizedPnl: -100 });
+  });
+
+  it("isInsiderBookEnabled() is gated on PAPER_INSIDER_BOOK=1", () => {
+    const prev = process.env.PAPER_INSIDER_BOOK;
+    try {
+      delete process.env.PAPER_INSIDER_BOOK;
+      expect(isInsiderBookEnabled()).toBe(false);
+      process.env.PAPER_INSIDER_BOOK = "1";
+      expect(isInsiderBookEnabled()).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PAPER_INSIDER_BOOK;
+      else process.env.PAPER_INSIDER_BOOK = prev;
+    }
   });
 });
 

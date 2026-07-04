@@ -203,6 +203,36 @@ describe("calcQuantScore()", () => {
     expect(calcQuantScore({ sma20: 100, price: 90 })).toBeLessThan(0);
   });
 
+  describe("RSI regime gate (issue #57 — no more self-cancelling composite)", () => {
+    it("in a strong uptrend, high RSI CONFIRMS instead of fighting the trend", () => {
+      // change7d 10 → momNorm 0.5 ≥ 0.3 → trending; RSI 75 reads (75−50)/50 = +0.5.
+      // Both 30% legs agree bullish → blended (0.5×0.3 + 0.5×0.3)/0.6 = +0.5.
+      expect(calcQuantScore({ rsi14: 75, change7d: 10 })).toBeCloseTo(0.5);
+    });
+
+    it("in a strong downtrend, low RSI confirms the bearish trend", () => {
+      expect(calcQuantScore({ rsi14: 25, change7d: -10 })).toBeCloseTo(-0.5);
+    });
+
+    it("keeps the mean-reversion read when momentum is weak (range-bound)", () => {
+      // change7d 2 → momNorm 0.1 < 0.3 → RSI 75 reads mean-reversion (−0.5);
+      // blended (−0.5×0.3 + 0.1×0.3)/0.6 = −0.2.
+      expect(calcQuantScore({ rsi14: 75, change7d: 2 })).toBeCloseTo(-0.2);
+    });
+
+    it("defaults to mean-reversion when momentum is unavailable (unknown regime)", () => {
+      expect(calcQuantScore({ rsi14: 25 })).toBeGreaterThan(0); // oversold → bullish
+      expect(calcQuantScore({ rsi14: 75 })).toBeLessThan(0);
+    });
+
+    it("uses the crypto momentum normalisation for the regime too", () => {
+      // Equity: 10/20 = 0.5 → trending → RSI confirms (+). Crypto: 10/40 = 0.25 < 0.3
+      // → range-bound → RSI mean-reverts (−).
+      expect(calcQuantScore({ rsi14: 75, change7d: 10 })).toBeGreaterThan(0);
+      expect(calcQuantScore({ rsi14: 75, change7d: 10, isCrypto: true })).toBeLessThan(0);
+    });
+  });
+
   it("result is always in [−1, 1]", () => {
     const score = calcQuantScore({ rsi14: 0, change7d: 100, sma20: 100, price: 1000 });
     expect(score).toBeGreaterThanOrEqual(-1);

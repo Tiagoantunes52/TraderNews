@@ -42,6 +42,7 @@ const STRATEGY_LABEL: Record<Strategy, string> = {
   COMBINED_RM: "Combined (risk-managed)",
   SENTIMENT_RM: "Sentiment (risk-managed)",
   QUANT_RM: "Quant (risk-managed)",
+  INSIDER: "Insider events",
 };
 
 function fmtUsd(v: number): string {

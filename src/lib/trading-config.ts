@@ -24,7 +24,7 @@ export const TRADING_CONFIG_KEY = "tradingConfig";
 
 export type TradingKnobKey = keyof RiskConfig | keyof RiskLimits;
 
-export type TradingKnobGroup = "entry" | "exits" | "sizing" | "portfolio";
+export type TradingKnobGroup = "entry" | "exits" | "sizing" | "portfolio" | "events";
 
 export type TradingKnobSpec = {
   env: string; // the legacy env var — still honored as a break-glass override
@@ -56,6 +56,9 @@ export const TRADING_KNOBS: Record<TradingKnobKey, TradingKnobSpec> = {
   minHoldRuns: { env: "PAPER_MIN_HOLD_RUNS", def: DEFAULT_RISK_CONFIG.minHoldRuns, min: 0, max: 30, int: true, group: "exits", label: "Days suppressing trail/signal/decay exits (stop stays live)" },
   timeStopRuns: { env: "PAPER_TIME_STOP_RUNS", def: DEFAULT_RISK_CONFIG.timeStopRuns, min: 0, max: 120, int: true, group: "exits", label: "Days of dead money before a time stop (0 disables)" },
   timeStopBandPct: { env: "PAPER_TIME_STOP_BAND_PCT", def: DEFAULT_RISK_CONFIG.timeStopBandPct, min: 0, max: 0.2, group: "exits", label: "± band around entry that counts as dead money" },
+  // ── Insider event book (issue #57) ───────────────────────────────────────────
+  insiderHoldDays: { env: "PAPER_INSIDER_HOLD_DAYS", def: DEFAULT_RISK_CONFIG.insiderHoldDays, min: 7, max: 180, int: true, group: "events", label: "Fixed holding period for insider-event positions (calendar days)" },
+  insiderNotional: { env: "PAPER_INSIDER_NOTIONAL", def: DEFAULT_RISK_CONFIG.insiderNotional, min: 50, max: 50_000, group: "events", label: "$ per insider-event position (flat sizing)" },
   // ── Portfolio limits ─────────────────────────────────────────────────────────
   maxGrossExposurePct: { env: "PAPER_MAX_GROSS_PCT", def: DEFAULT_RISK_LIMITS.maxGrossExposurePct, min: 0.05, max: 1, group: "portfolio", label: "Gross exposure ceiling (Σ notional ÷ equity)" },
   maxPositions: { env: "PAPER_MAX_POSITIONS", def: DEFAULT_RISK_LIMITS.maxPositions, min: 1, max: 100, int: true, group: "portfolio", label: "Concurrent open names" },
@@ -65,6 +68,8 @@ export const TRADING_KNOBS: Record<TradingKnobKey, TradingKnobSpec> = {
   killSwitchDrawdownPct: { env: "PAPER_KILL_SWITCH_DD_PCT", def: DEFAULT_RISK_LIMITS.killSwitchDrawdownPct, min: 0.02, max: 0.9, group: "portfolio", label: "Drawdown that halts ALL new buys" },
   deriskStartDrawdownPct: { env: "PAPER_DERISK_START_DD_PCT", def: DEFAULT_RISK_LIMITS.deriskStartDrawdownPct, min: 0, max: 0.9, group: "portfolio", label: "Drawdown where the gross-cap step-down begins" },
   peakWindowDays: { env: "PAPER_PEAK_WINDOW_DAYS", def: DEFAULT_RISK_LIMITS.peakWindowDays, min: 0, max: 3650, int: true, group: "portfolio", label: "Rolling window for the drawdown peak (0 = all-time)" },
+  regimeMaWindow: { env: "PAPER_REGIME_MA_WINDOW", def: DEFAULT_RISK_LIMITS.regimeMaWindow, min: 0, max: 400, int: true, group: "portfolio", label: "SPY moving-average window for the regime filter (0 disables)" },
+  regimeRiskOffGrossFrac: { env: "PAPER_REGIME_RISKOFF_GROSS_FRAC", def: DEFAULT_RISK_LIMITS.regimeRiskOffGrossFrac, min: 0, max: 1, group: "portfolio", label: "Fraction of the gross cap allowed while SPY is below its MA" },
 };
 
 export const TRADING_KNOB_KEYS = Object.keys(TRADING_KNOBS) as TradingKnobKey[];
