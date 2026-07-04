@@ -31,6 +31,7 @@ export type RiskLimits = {
   maxClusterPositions: number; // names per cluster (0 disables)
   killSwitchDrawdownPct: number; // halt ALL new buys above this drawdown from peak equity
   deriskStartDrawdownPct: number; // drawdown where the gross-cap step-down begins
+  peakWindowDays: number; // rolling window (days) for the peak the drawdown is measured from (0 = all-time)
 };
 
 // Conservative long-only defaults: near-fully-invested ceiling, ~12 names, no single
@@ -44,6 +45,10 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxClusterPositions: 5,
   killSwitchDrawdownPct: 0.2,
   deriskStartDrawdownPct: 0.08,
+  // Rolling, not all-time: an all-time peak never resets, so one bad stretch would
+  // halt new buys FOREVER (nothing new can open, so equity can never recover to a
+  // peak it can only drift away from). 90 days ≈ a quarter to work it off.
+  peakWindowDays: 90,
 };
 
 /** The active limits, each field overridable by its PAPER_* env var (no redeploy). */
@@ -56,6 +61,7 @@ export function riskLimits(): RiskLimits {
     maxClusterPositions: numEnv("PAPER_MAX_CLUSTER_POSITIONS", DEFAULT_RISK_LIMITS.maxClusterPositions),
     killSwitchDrawdownPct: numEnv("PAPER_KILL_SWITCH_DD_PCT", DEFAULT_RISK_LIMITS.killSwitchDrawdownPct),
     deriskStartDrawdownPct: numEnv("PAPER_DERISK_START_DD_PCT", DEFAULT_RISK_LIMITS.deriskStartDrawdownPct),
+    peakWindowDays: numEnv("PAPER_PEAK_WINDOW_DAYS", DEFAULT_RISK_LIMITS.peakWindowDays),
   };
 }
 

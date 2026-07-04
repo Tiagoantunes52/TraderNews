@@ -34,12 +34,13 @@ import {
   reconcilePosition,
   reconcileRiskManaged,
   planBrokerAction,
-  riskConfig,
   isRiskBooksEnabled,
   isBrokerStopsEnabled,
   utcDaysBetween,
   summarizeBook,
   confidenceNotional,
+  riskSizedNotional,
+  riskDistancePct,
   isPaperTradeEligible,
   isEntrySignal,
   SIM_STARTING_EQUITY,
@@ -48,12 +49,12 @@ import {
 } from "@/lib/paper-trading";
 import {
   isRiskLimitsEnabled,
-  riskLimits,
   evaluateBuy,
   correlationClusters,
   clusterKeyFor,
   type BookExposure,
 } from "@/lib/portfolio-risk";
+import { loadTradingConfig } from "@/lib/trading-config";
 import {
   isPaperTradingConfigured,
   getAccount,
@@ -1354,7 +1355,10 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // when PAPER_RISK_BOOKS=1; the same flag points the live Alpaca book at the
   // risk-managed combined signal below (else it mirrors the pure combined signal).
   const riskEnabled = isRiskBooksEnabled();
-  const cfg = riskConfig();
+  // Strategy knobs: DB-backed overrides (admin page) merged over env vars and code
+  // defaults. Bad stored values degrade per-field to env/default and are surfaced.
+  const { risk: cfg, limits, issues: configIssues } = await loadTradingConfig();
+  if (configIssues.length > 0) errors.push(`Trading config: ${configIssues.join("; ")}`);
   const activeStrategies: Strategy[] = riskEnabled ? [...STRATEGIES, ...RM_STRATEGIES] : STRATEGIES;
 
   // The live Alpaca book mirrors the COMBINED_RM book's open/flat decision (when the
@@ -1376,6 +1380,8 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       lastMarkDate: true,
       peakPrice: true,
       bearishStreak: true,
+      staleStreak: true,
+      entryAtrPct: true,
     },
   });
   const openByKey = new Map(openPositions.map((p) => [`${p.stockId}|${p.strategy}`, p]));
@@ -1386,7 +1392,11 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // once. They gate fresh opens in the risk-managed (_RM) sim books and the live
   // Alpaca buys below; the pure books stay the unconstrained attribution baseline.
   const riskLimitsOn = isRiskLimitsEnabled();
-  const limits = riskLimits();
+  // Rolling window for the kill-switch peak (all-time when 0): an all-time peak
+  // never resets, so a book that once drew down 20% could be halted forever.
+  const peakSince =
+    limits.peakWindowDays > 0 ? new Date(todayUTC.getTime() - limits.peakWindowDays * 86_400_000) : undefined;
+  const peakDateFilter = peakSince ? { date: { gte: peakSince } } : {};
   const tickerByStock = new Map(estimates.map((e) => [e.stockId, e.stock.ticker]));
 
   // Stale-pipeline health check: the freshest estimate anywhere vs now.
@@ -1452,7 +1462,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }),
         db.paperEquitySnapshot.groupBy({
           by: ["book"],
-          where: { book: { in: RM_STRATEGIES.map((s) => STRATEGY_BOOK[s]) } },
+          where: { book: { in: RM_STRATEGIES.map((s) => STRATEGY_BOOK[s]) }, ...peakDateFilter },
           _max: { equity: true },
         }),
       ]);
@@ -1515,6 +1525,8 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 entryPrice: open.entryPrice,
                 peakPrice: open.peakPrice ?? open.entryPrice,
                 bearishStreak: open.bearishStreak,
+                staleStreak: open.staleStreak,
+                entryAtrPct: open.entryAtrPct,
               }
             : null,
           cfg,
@@ -1559,6 +1571,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               lastMarkDate: to,
               lastMarkPrice: action.price,
               peakPrice: action.price,
+              // Freeze the entry-day ATR so exit distances never widen with a
+              // later volatility spike (only meaningful on the _RM books).
+              ...(STRATEGY_IS_RM[strategy] ? { entryAtrPct: atrPct } : {}),
             },
           });
           simOpened++;
@@ -1581,9 +1596,10 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             data: {
               lastMarkDate: to,
               lastMarkPrice: action.price,
-              // _RM marks carry updated trailing-peak + bearish-streak state.
+              // _RM marks carry updated trailing-peak + bearish/stale-streak state.
               ...(action.peakPrice != null ? { peakPrice: action.peakPrice } : {}),
               ...(action.bearishStreak != null ? { bearishStreak: action.bearishStreak } : {}),
+              ...(action.staleStreak != null ? { staleStreak: action.staleStreak } : {}),
             },
           });
         }
@@ -1673,7 +1689,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         try {
           const [acct, snap] = await Promise.all([
             getAccount(),
-            db.paperEquitySnapshot.aggregate({ where: { book: "ALPACA" }, _max: { equity: true } }),
+            db.paperEquitySnapshot.aggregate({ where: { book: "ALPACA", ...peakDateFilter }, _max: { equity: true } }),
           ]);
           const equity = acct.equity ?? 0;
           const peakEquity = Math.max(snap._max.equity ?? 0, equity);
@@ -1722,6 +1738,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           if (price == null) continue;
           const held = posBySymbol.get(ticker);
           const protective = protectiveBySymbol.get(ticker) ?? null;
+          // Frozen distances for a held name (its sim twin's entry-day ATR);
+          // today's ATR only when sizing a fresh entry (no sim row yet).
+          const rmOpen = openByKey.get(`${est.stockId}|COMBINED_RM`);
           const action = planBrokerAction({
             opened: combinedRmOpened.has(est.stockId),
             stillLong: combinedRmLong.has(est.stockId),
@@ -1730,8 +1749,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             avgEntryPrice: held?.avgEntryPrice ?? null,
             currentPrice: held?.currentPrice ?? null,
             restingProtectiveType: protective?.type === "trailing_stop" ? "trailing_stop" : protective ? "stop" : null,
+            restingTrailPercent: protective?.trailPercent ?? null,
             price,
-            atrPct: atrPctByStock.get(est.stockId) ?? null,
+            atrPct: rmOpen ? rmOpen.entryAtrPct : atrPctByStock.get(est.stockId) ?? null,
             confidence: est.confidence,
             cfg,
           });
@@ -1800,7 +1820,15 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           const sellSignal = riskEnabled ? combinedRmExit.get(est.stockId) ?? combinedSignal : combinedSignal;
           try {
             if (wantLong && !held) {
-              const notional = confidenceNotional(est.confidence);
+              // Mirror the _RM books' risk-based sizing when they drive the live
+              // book; legacy confidence-weighted notional when the flag is off.
+              const notional = riskEnabled
+                ? riskSizedNotional(
+                    est.confidence,
+                    riskDistancePct(cfg, atrPctByStock.get(est.stockId) ?? null, cfg.stopLossPct),
+                    cfg.riskPerTrade
+                  )
+                : confidenceNotional(est.confidence);
               if (gateAlpacaBuy(ticker, notional)) {
                 const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
                 await db.paperOrder.create({

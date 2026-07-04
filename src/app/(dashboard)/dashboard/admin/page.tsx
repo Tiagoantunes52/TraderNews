@@ -3,8 +3,10 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
 import { getWatchlistLimit } from "@/lib/settings";
+import { TRADING_KNOBS, TRADING_KNOB_KEYS, getTradingOverrides, envPinnedKnobs } from "@/lib/trading-config";
 import { InvitationsManager } from "./invitations-manager";
 import { WatchlistLimitForm } from "./watchlist-limit-form";
+import { TradingConfigForm, type KnobRow } from "./trading-config-form";
 
 export const metadata = { title: "Admin — TraderNews" };
 
@@ -13,6 +15,14 @@ export default async function AdminPage() {
   if (!isAdmin(user)) notFound();
 
   const watchlistLimit = await getWatchlistLimit();
+
+  const tradingOverrides = await getTradingOverrides();
+  const pinned = new Set(envPinnedKnobs());
+  const knobs: KnobRow[] = TRADING_KNOB_KEYS.map((key) => ({
+    key,
+    ...TRADING_KNOBS[key],
+    envPinned: pinned.has(key),
+  }));
 
   const invitations = await db.invitation.findMany({
     orderBy: [{ acceptedAt: { sort: "asc", nulls: "first" } }, { createdAt: "desc" }],
@@ -41,6 +51,8 @@ export default async function AdminPage() {
       </div>
 
       <WatchlistLimitForm initialLimit={watchlistLimit} />
+
+      <TradingConfigForm knobs={knobs} initialOverrides={tradingOverrides} />
 
       <InvitationsManager initialInvitations={serialized} />
     </div>

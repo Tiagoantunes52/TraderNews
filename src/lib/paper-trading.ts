@@ -99,11 +99,15 @@ export type RiskConfig = {
   atrStopFloorPct: number; // floor for the ATR-scaled distance
   atrStopCapPct: number; // cap for the ATR-scaled distance
   signalConfirmRuns: number; // consecutive bearish (SELL/STRONG_SELL) runs before exiting
+  decayRuns: number; // consecutive no-conviction runs before a profitable exit (0 disables)
+  trailRatchetActivatePct: number; // gain above entry that tightens the trail (0 disables)
+  trailRatchetFrac: number; // fraction of the trail distance kept once ratcheted
   minHoldRuns: number; // runs to suppress trail+signal exits (hard stop stays live)
   timeStopRuns: number; // runs of dead money before a time stop (0 disables)
   timeStopBandPct: number; // ± band around entry that counts as "dead money"
   entryScoreMin: number; // raw score must exceed this to open (deadband above BUY)
   minConfidence: number; // confidence floor for an entry (skips dust positions)
+  riskPerTrade: number; // $ lost if the stop fires at confidence 1 — drives sizing
 };
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
@@ -114,11 +118,17 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   atrStopFloorPct: 0.06,
   atrStopCapPct: 0.15,
   signalConfirmRuns: 2,
+  decayRuns: 5,
+  trailRatchetActivatePct: 0.15,
+  trailRatchetFrac: 0.5,
   minHoldRuns: 3,
   timeStopRuns: 20,
   timeStopBandPct: 0.03,
   entryScoreMin: 0.25,
   minConfidence: 0.3,
+  // 80 = old BASE_NOTIONAL × fixed 8% stop, so a fixed-stop name sizes exactly as
+  // the legacy $1000 × confidence did; ATR-stopped names now equalize $ risk instead.
+  riskPerTrade: 80,
 };
 
 /** The active risk overlay, with each field overridable by its PAPER_* env var. */
@@ -131,11 +141,15 @@ export function riskConfig(): RiskConfig {
     atrStopFloorPct: numEnv("PAPER_ATR_STOP_FLOOR_PCT", DEFAULT_RISK_CONFIG.atrStopFloorPct),
     atrStopCapPct: numEnv("PAPER_ATR_STOP_CAP_PCT", DEFAULT_RISK_CONFIG.atrStopCapPct),
     signalConfirmRuns: numEnv("PAPER_SIGNAL_CONFIRM_RUNS", DEFAULT_RISK_CONFIG.signalConfirmRuns),
+    decayRuns: numEnv("PAPER_DECAY_RUNS", DEFAULT_RISK_CONFIG.decayRuns),
+    trailRatchetActivatePct: numEnv("PAPER_TRAIL_RATCHET_ACTIVATE_PCT", DEFAULT_RISK_CONFIG.trailRatchetActivatePct),
+    trailRatchetFrac: numEnv("PAPER_TRAIL_RATCHET_FRAC", DEFAULT_RISK_CONFIG.trailRatchetFrac),
     minHoldRuns: numEnv("PAPER_MIN_HOLD_RUNS", DEFAULT_RISK_CONFIG.minHoldRuns),
     timeStopRuns: numEnv("PAPER_TIME_STOP_RUNS", DEFAULT_RISK_CONFIG.timeStopRuns),
     timeStopBandPct: numEnv("PAPER_TIME_STOP_BAND_PCT", DEFAULT_RISK_CONFIG.timeStopBandPct),
     entryScoreMin: numEnv("PAPER_ENTRY_SCORE_MIN", DEFAULT_RISK_CONFIG.entryScoreMin),
     minConfidence: numEnv("PAPER_MIN_CONFIDENCE", DEFAULT_RISK_CONFIG.minConfidence),
+    riskPerTrade: numEnv("PAPER_RISK_PER_TRADE", DEFAULT_RISK_CONFIG.riskPerTrade),
   };
 }
 
@@ -200,6 +214,18 @@ export function sizePosition(confidence: number, price: number, base = BASE_NOTI
   return confidenceNotional(confidence, base) / price;
 }
 
+/**
+ * Risk-based notional ($) for the _RM books: size so a stop-out loses exactly
+ * `riskPerTrade × confidence`, whatever the stop distance is. A wide-stopped
+ * volatile name gets a smaller position, a tight-stopped calm name a larger one —
+ * equal $ risk per trade, instead of the volatility-driven risk that a flat
+ * "$1000 × confidence" gives. 0 if the stop distance is degenerate.
+ */
+export function riskSizedNotional(confidence: number, stopPct: number, riskPerTrade: number): number {
+  if (stopPct <= 0) return 0;
+  return (riskPerTrade * Math.max(0, Math.min(1, confidence))) / stopPct;
+}
+
 /** Realized P&L of a long position closed at `exitPrice`. */
 export function realizedPnl(qty: number, entryPrice: number, exitPrice: number): number {
   return qty * (exitPrice - entryPrice);
@@ -216,14 +242,14 @@ export function isPaperTradeEligible(ticker: string): boolean {
 }
 
 /** Why a risk-managed position closed (pure books leave this unset). */
-export type ExitReason = "STOP" | "TRAIL" | "SIGNAL" | "TIME";
+export type ExitReason = "STOP" | "TRAIL" | "SIGNAL" | "DECAY" | "TIME";
 
 export type PositionAction =
   | { type: "OPEN"; qty: number; price: number }
   | { type: "CLOSE"; price: number; realizedPnl: number; reason?: ExitReason }
-  // _RM marks carry the running peak (for the trailing stop) and the bearish-signal
-  // streak (for the confirmed-signal exit) so the stage can persist them.
-  | { type: "MARK"; price: number; peakPrice?: number; bearishStreak?: number }
+  // _RM marks carry the running peak (for the trailing stop) plus the bearish-signal
+  // and stale-signal streaks (confirmed-signal / decay exits) so the stage can persist them.
+  | { type: "MARK"; price: number; peakPrice?: number; bearishStreak?: number; staleStreak?: number }
   | { type: "NONE" };
 
 /**
@@ -275,7 +301,7 @@ function atrFraction(atrPct: number | null | undefined): number | null {
 
 // Stop / trail distance: ATR-scaled (k × ATR%, clamped) when ATR is available and
 // scaling is enabled, else the fixed fallback. Same regime-aware distance for both.
-function riskDistancePct(cfg: RiskConfig, atrPct: number | null | undefined, fallback: number): number {
+export function riskDistancePct(cfg: RiskConfig, atrPct: number | null | undefined, fallback: number): number {
   const f = atrFraction(atrPct);
   if (cfg.atrStopMult > 0 && f != null) {
     return clampNum(cfg.atrStopMult * f, cfg.atrStopFloorPct, cfg.atrStopCapPct);
@@ -289,12 +315,26 @@ function riskDistancePct(cfg: RiskConfig, atrPct: number | null | undefined, fal
  *
  *   1. Hard stop-loss — price ≤ entry × (1 − stop). ALWAYS live, even in min-hold.
  *   2. Trailing stop — once peak ≥ entry × (1 + activate), exit on price ≤ peak ×
- *      (1 − trail). Suppressed during min-hold.
+ *      (1 − trail). Once peak ≥ entry × (1 + ratchetActivate) the trail distance
+ *      tightens to trail × ratchetFrac, so a big winner gives back less from its
+ *      peak. Suppressed during min-hold.
  *   3. Confirmed-signal exit — bearish (SELL/STRONG_SELL) for ≥ signalConfirmRuns
  *      consecutive runs. Suppressed during min-hold.
- *   4. Time stop — flat within ±band after timeStopRuns runs (0 disables).
+ *   4. Signal-decay exit — score below the entry deadband (no conviction either
+ *      way) for ≥ decayRuns consecutive runs while the position is profitable:
+ *      the thesis has played out, so take the profit rather than drift. Loss-side
+ *      staleness is left to the stop/time exits. Suppressed during min-hold;
+ *      0 disables.
+ *   5. Time stop — flat within ±band after timeStopRuns runs (0 disables).
  *
- * Entry is gated by a score deadband (above the BUY line) and a confidence floor.
+ * Entry is gated by a score deadband (above the BUY line) and a confidence floor,
+ * and sized so a stop-out loses `riskPerTrade × confidence` regardless of the stop
+ * distance (see `riskSizedNotional`).
+ *
+ * Stop/trail distances are FROZEN at entry: exits use the position's entry-day ATR
+ * (`open.entryAtrPct`), not today's — otherwise a volatility spike would *widen*
+ * the stop mid-drawdown, exactly when it must hold (and diverge from the broker's
+ * stop, which is fixed at entry). Today's `atrPct` is only used to size a new entry.
  *
  * Pure (no DB): the caller supplies the prior peak/streak and whether this is the
  * first action today (`isNewRun`); the streak only advances on a new run so a
@@ -306,15 +346,20 @@ export function reconcileRiskManaged(args: {
   signal: string;
   price: number;
   confidence: number;
-  atrPct: number | null;
+  atrPct: number | null; // today's ATR% — entry sizing only
   runsSinceEntry: number;
   isNewRun: boolean;
-  open: { qty: number; entryPrice: number; peakPrice: number; bearishStreak: number } | null;
+  open: {
+    qty: number;
+    entryPrice: number;
+    peakPrice: number;
+    bearishStreak: number;
+    staleStreak: number;
+    entryAtrPct: number | null; // ATR% captured at entry — drives all exit distances
+  } | null;
   cfg?: RiskConfig;
-  base?: number;
 }): PositionAction {
   const cfg = args.cfg ?? DEFAULT_RISK_CONFIG;
-  const base = args.base ?? BASE_NOTIONAL;
   const { score, signal, price, confidence, atrPct, runsSinceEntry, isNewRun, open } = args;
 
   if (open) {
@@ -323,6 +368,10 @@ export function reconcileRiskManaged(args: {
     const bearish = isBearishSignal(signal);
     // Reset to 0 on any non-bearish read (idempotent); only advance on a new run.
     const bearishStreak = bearish ? (isNewRun ? open.bearishStreak + 1 : open.bearishStreak) : 0;
+    // Stale = no entry-grade conviction (score at/below the deadband) — the mirror
+    // of the entry gate. Same advance/reset discipline as the bearish streak.
+    const stale = score <= cfg.entryScoreMin;
+    const staleStreak = stale ? (isNewRun ? open.staleStreak + 1 : open.staleStreak) : 0;
     const close = (reason: ExitReason): PositionAction => ({
       type: "CLOSE",
       price,
@@ -335,33 +384,46 @@ export function reconcileRiskManaged(args: {
     // level, so a name that gaps straight through its stop realizes the worse,
     // gapped price — keeping realized P&L and the equity-curve drawdown honest
     // rather than pretending we always got out exactly at the stop (issue #56).
-    const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
+    const stopPct = riskDistancePct(cfg, open.entryAtrPct, cfg.stopLossPct);
     if (price <= entryPrice * (1 - stopPct)) return close("STOP");
 
     const pastMinHold = runsSinceEntry >= cfg.minHoldRuns;
 
-    // 2. Trailing stop — only once armed by a gain, and not during min-hold.
+    // 2. Trailing stop — only once armed by a gain, and not during min-hold. A big
+    // winner (peak past the ratchet threshold) trails tighter so it gives back
+    // ratchetFrac of the normal distance instead of the full trail.
     if (pastMinHold && peakPrice >= entryPrice * (1 + cfg.trailActivatePct)) {
-      const trailPct = riskDistancePct(cfg, atrPct, cfg.trailPct);
+      let trailPct = riskDistancePct(cfg, open.entryAtrPct, cfg.trailPct);
+      if (cfg.trailRatchetActivatePct > 0 && peakPrice >= entryPrice * (1 + cfg.trailRatchetActivatePct)) {
+        trailPct *= cfg.trailRatchetFrac;
+      }
       if (price <= peakPrice * (1 - trailPct)) return close("TRAIL");
     }
 
     // 3. Confirmed-signal exit — bearish for N runs, and not during min-hold.
     if (pastMinHold && bearishStreak >= cfg.signalConfirmRuns) return close("SIGNAL");
 
-    // 4. Time stop — dead money near entry after a long hold.
+    // 4. Signal-decay exit — the conviction that justified the entry has been gone
+    // for N runs and the position is in profit: the thesis played out, take it.
+    if (cfg.decayRuns > 0 && pastMinHold && staleStreak >= cfg.decayRuns && price > entryPrice) {
+      return close("DECAY");
+    }
+
+    // 5. Time stop — dead money near entry after a long hold.
     if (cfg.timeStopRuns > 0 && runsSinceEntry >= cfg.timeStopRuns) {
       const lo = entryPrice * (1 - cfg.timeStopBandPct);
       const hi = entryPrice * (1 + cfg.timeStopBandPct);
       if (price >= lo && price <= hi) return close("TIME");
     }
 
-    return { type: "MARK", price, peakPrice, bearishStreak };
+    return { type: "MARK", price, peakPrice, bearishStreak, staleStreak };
   }
 
-  // Flat → enter only on real conviction (deadband) at a meaningful size.
-  if (score > cfg.entryScoreMin && confidence >= cfg.minConfidence) {
-    const qty = sizePosition(confidence, price, base);
+  // Flat → enter only on real conviction (deadband) at a meaningful size, sized
+  // off the entry-day stop distance so every stop-out costs the same $.
+  if (score > cfg.entryScoreMin && confidence >= cfg.minConfidence && price > 0) {
+    const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
+    const qty = riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price;
     if (qty > 0) return { type: "OPEN", qty, price };
   }
   return { type: "NONE" };
@@ -393,41 +455,42 @@ export type BrokerAction =
  * Decide the live broker book's action for one stock from the COMBINED_RM sim
  * transitions + the live broker state. Pure (no network/DB) so it's unit-testable.
  *
- * - EXIT only on an *info* exit (SIGNAL/TIME) — price exits (STOP/TRAIL) are enforced
- *   broker-side, so we never double-handle them here.
+ * - EXIT only on an *info* exit (SIGNAL/DECAY/TIME) — price exits (STOP/TRAIL) are
+ *   enforced broker-side, so we never double-handle them here.
  * - ENTER only on a *fresh* sim OPEN when flat — never re-buy a name the broker just
  *   stopped out while the sim is merely still-long (the re-entry guard).
  * - While held & still-long: arm the trailing stop once up `trailActivatePct` (a fixed
- *   stop is resting), or repair a missing protective order.
+ *   stop is resting), tighten a resting trailing stop once up `trailRatchetActivatePct`
+ *   (only when strictly tighter, so it never churns), or repair a missing protective
+ *   order.
  */
 export function planBrokerAction(input: {
   opened: boolean; // COMBINED_RM made a fresh OPEN this run
   stillLong: boolean; // COMBINED_RM is long after this run
-  exitReason: string | null; // COMBINED_RM close reason this run (STOP|TRAIL|SIGNAL|TIME)
+  exitReason: string | null; // COMBINED_RM close reason this run (STOP|TRAIL|SIGNAL|DECAY|TIME)
   held: boolean; // live Alpaca position exists
   avgEntryPrice: number | null;
   currentPrice: number | null;
   restingProtectiveType: "stop" | "trailing_stop" | null; // resting protective order, if any
+  restingTrailPercent?: number | null; // trail % of a resting trailing stop (ratchet compare)
   price: number; // reference price (latest quant close) for sizing + stop/limit
-  atrPct: number | null;
+  atrPct: number | null; // entry-day ATR% when held (frozen distances), today's when entering
   confidence: number;
   cfg?: RiskConfig;
-  base?: number;
   entryLimitBufferPct?: number;
 }): BrokerAction {
   const cfg = input.cfg ?? DEFAULT_RISK_CONFIG;
-  const base = input.base ?? BASE_NOTIONAL;
   const buffer = input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT;
-  const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, price, atrPct, confidence } = input;
+  const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, restingTrailPercent, price, atrPct, confidence } = input;
 
-  const infoExit = exitReason === "SIGNAL" || exitReason === "TIME";
+  const infoExit = exitReason === "SIGNAL" || exitReason === "DECAY" || exitReason === "TIME";
   if (held && infoExit) return { type: "EXIT", reason: exitReason! };
 
   if (!held) {
     if (opened && price > 0) {
-      const qty = Math.floor(confidenceNotional(confidence, base) / price);
+      const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
+      const qty = Math.floor(riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price);
       if (qty >= 1) {
-        const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
         return { type: "ENTER", qty, limitPrice: cents(price * (1 + buffer)), stopPrice: cents(price * (1 - stopPct)) };
       }
     }
@@ -440,14 +503,20 @@ export function planBrokerAction(input: {
       const anchor = avgEntryPrice ?? price;
       return { type: "REPAIR_STOP", stopPrice: cents(anchor * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct))) };
     }
-    if (
-      restingProtectiveType === "stop" &&
-      avgEntryPrice != null &&
-      currentPrice != null &&
-      avgEntryPrice > 0 &&
-      (currentPrice - avgEntryPrice) / avgEntryPrice >= cfg.trailActivatePct
-    ) {
-      return { type: "ARM_TRAILING", trailPercent: cents(riskDistancePct(cfg, atrPct, cfg.trailPct) * 100) };
+    if (avgEntryPrice != null && currentPrice != null && avgEntryPrice > 0) {
+      const gain = (currentPrice - avgEntryPrice) / avgEntryPrice;
+      const ratcheted = cfg.trailRatchetActivatePct > 0 && gain >= cfg.trailRatchetActivatePct;
+      const trailPercent = cents(
+        riskDistancePct(cfg, atrPct, cfg.trailPct) * (ratcheted ? cfg.trailRatchetFrac : 1) * 100
+      );
+      if (restingProtectiveType === "stop" && gain >= cfg.trailActivatePct) {
+        return { type: "ARM_TRAILING", trailPercent };
+      }
+      // Ratchet a resting trailing stop tighter once up big — but only when strictly
+      // tighter than what's resting, so the daily stage never cancel/replaces in place.
+      if (restingProtectiveType === "trailing_stop" && ratcheted && restingTrailPercent != null && trailPercent < restingTrailPercent) {
+        return { type: "ARM_TRAILING", trailPercent };
+      }
     }
   }
   return { type: "NONE" };
