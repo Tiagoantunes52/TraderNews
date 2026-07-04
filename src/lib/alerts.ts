@@ -13,7 +13,8 @@ export type AlertType =
   | "ACCOUNT_DRAWDOWN"
   | "ORDER_FAILURES"
   | "BROKER_UNREACHABLE"
-  | "STALE_PIPELINE";
+  | "STALE_PIPELINE"
+  | "MISSED_PAPER_DAYS";
 
 export type AlertDraft = {
   type: AlertType;
@@ -172,6 +173,43 @@ export function detectBrokerUnreachable(book = "Alpaca"): AlertDraft {
  * Fires when the freshest pipeline data is older than `maxAgeHours` (or missing) —
  * a stalled cron / data source means signals and equity marks are stale.
  */
+/**
+ * Dead-man's check for the paper stage: fires when one or more trading days
+ * between the previous equity snapshot and today produced NO snapshot — i.e. the
+ * near-close scheduler missed the whole trade window that day (July 2–3 2026:
+ * GH-cron drift past the close + an early-close Friday the fixed crons can't hit).
+ *
+ * `tradingDays` (YYYY-MM-DD) should come from the broker calendar when available
+ * so holidays don't false-alarm; without it, UTC weekdays approximate. Runs on the
+ * day's FIRST successful paper run, so it reports yesterday's miss, not today's.
+ */
+export function detectMissedPaperDays(
+  prevSnapshotDate: Date | null | undefined,
+  today: Date,
+  tradingDays?: string[] | null
+): AlertDraft | null {
+  if (prevSnapshotDate == null) return null; // no history yet — nothing to miss
+  const dayKey = (d: Date) => d.toISOString().slice(0, 10);
+  const missed: string[] = [];
+  for (
+    let d = new Date(Date.UTC(prevSnapshotDate.getUTCFullYear(), prevSnapshotDate.getUTCMonth(), prevSnapshotDate.getUTCDate() + 1));
+    dayKey(d) < dayKey(today);
+    d = new Date(d.getTime() + 86_400_000)
+  ) {
+    const isWeekday = d.getUTCDay() >= 1 && d.getUTCDay() <= 5;
+    const isTradingDay = tradingDays != null ? tradingDays.includes(dayKey(d)) : isWeekday;
+    if (isTradingDay) missed.push(dayKey(d));
+  }
+  if (missed.length === 0) return null;
+  const source = tradingDays != null ? "broker calendar" : "weekday approximation — holidays may false-alarm";
+  return {
+    type: "MISSED_PAPER_DAYS",
+    title: `Paper stage missed ${missed.length} trading day${missed.length === 1 ? "" : "s"}`,
+    message: `📅 No equity snapshot was written on ${missed.join(", ")} (${source}). The near-close scheduler likely missed the trade window — check the cron runs.`,
+    value: missed.length,
+  };
+}
+
 export function detectStalePipeline(
   latestDataAt: Date | null | undefined,
   now: Date,

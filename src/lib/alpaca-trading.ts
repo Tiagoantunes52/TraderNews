@@ -373,22 +373,48 @@ export async function getClock(): Promise<AlpacaClock> {
   return { isOpen: Boolean(raw.is_open), nextClose: raw.next_close ?? null };
 }
 
+/**
+ * Trading days (YYYY-MM-DD) in [start, end], from the market calendar — includes
+ * early-close days, excludes weekends AND holidays. Feeds the missed-paper-day
+ * dead-man's check so holidays don't false-alarm.
+ */
+export async function getCalendar(start: Date, end: Date): Promise<string[]> {
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  const raw = await apiGet<Array<{ date: string }>>(`/v2/calendar?start=${day(start)}&end=${day(end)}`);
+  return raw.map((c) => c.date);
+}
+
 export type AlpacaFill = { symbol: string; side: "buy" | "sell"; qty: number; price: number; time: string };
 
 /**
- * Recent FILL activities. Alpaca has no "closed position with realized P&L" endpoint,
- * so this is the source for reconstructing realized P&L (FIFO-match sells vs buys —
- * see realizedFromFills). `pageSize` caps at Alpaca's 100/page; newest first.
+ * FULL FILL activity history, paginated. Alpaca has no "closed position with
+ * realized P&L" endpoint, so this is the source for reconstructing realized P&L
+ * (FIFO-match sells vs buys — see realizedFromFills). The FIFO needs the COMPLETE
+ * history: once the oldest buy fills fall outside the window, later sells match
+ * the wrong lots (or none) and realized P&L drifts arbitrarily — so we page via
+ * `page_token` (Alpaca caps page_size at 100) until exhausted. `maxPages` bounds a
+ * runaway loop; at 50 pages / 5000 fills the FIFO is years from truncating.
  */
-export async function getAccountActivities(pageSize = 100): Promise<AlpacaFill[]> {
-  const raw = await apiGet<Array<{ symbol: string; side: string; qty?: string; price?: string; transaction_time?: string }>>(
-    `/v2/account/activities/FILL?direction=desc&page_size=${pageSize}`
-  );
-  return raw.map((a) => ({
-    symbol: a.symbol,
-    side: a.side === "sell" ? "sell" : "buy",
-    qty: num(a.qty) ?? 0,
-    price: num(a.price) ?? 0,
-    time: a.transaction_time ?? "",
-  }));
+export async function getAccountActivities(pageSize = 100, maxPages = 50): Promise<AlpacaFill[]> {
+  type RawActivity = { id?: string; symbol: string; side: string; qty?: string; price?: string; transaction_time?: string };
+  const fills: AlpacaFill[] = [];
+  let pageToken: string | null = null;
+  for (let page = 0; page < maxPages; page++) {
+    const qs: string =
+      `direction=desc&page_size=${pageSize}` + (pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : "");
+    const raw = await apiGet<RawActivity[]>(`/v2/account/activities/FILL?${qs}`);
+    for (const a of raw) {
+      fills.push({
+        symbol: a.symbol,
+        side: a.side === "sell" ? "sell" : "buy",
+        qty: num(a.qty) ?? 0,
+        price: num(a.price) ?? 0,
+        time: a.transaction_time ?? "",
+      });
+    }
+    const lastId = raw.length > 0 ? raw[raw.length - 1].id : undefined;
+    if (raw.length < pageSize || !lastId) break;
+    pageToken = lastId;
+  }
+  return fills;
 }

@@ -14,6 +14,8 @@ import {
   getAccountSummary,
   getPortfolioPositions,
   getPortfolioHistory,
+  getAccountActivities,
+  getCalendar,
 } from "@/lib/alpaca-trading";
 
 function jsonResponse(body: unknown) {
@@ -329,6 +331,73 @@ describe("alpaca-trading client", () => {
       );
       expect(points).toEqual([]);
       expect(baseValue).toBeNull();
+    });
+  });
+
+  describe("getAccountActivities() — full-history pagination", () => {
+    const fill = (id: string, side = "buy") => ({
+      id,
+      symbol: "AAPL",
+      side,
+      qty: "1",
+      price: "100",
+      transaction_time: "2026-07-01T15:00:00Z",
+    });
+
+    it("pages via page_token until a short page, concatenating all fills", async () => {
+      // Page 1 is full (pageSize=2) → must request page 2 with the last id as token.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce(jsonResponse([fill("a1"), fill("a2")]))
+        .mockResolvedValueOnce(jsonResponse([fill("a3", "sell")]));
+      vi.stubGlobal("fetch", mockFetch);
+      const fills = await getAccountActivities(2);
+      expect(fills).toHaveLength(3);
+      expect(fills[2].side).toBe("sell");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[0][0]).toBe(
+        "https://paper-api.alpaca.markets/v2/account/activities/FILL?direction=desc&page_size=2"
+      );
+      expect(mockFetch.mock.calls[1][0]).toBe(
+        "https://paper-api.alpaca.markets/v2/account/activities/FILL?direction=desc&page_size=2&page_token=a2"
+      );
+    });
+
+    it("stops after one request when the first page is short", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse([fill("a1")]));
+      vi.stubGlobal("fetch", mockFetch);
+      expect(await getAccountActivities(100)).toHaveLength(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops when a full page carries no id to continue from (no infinite loop)", async () => {
+      const noId = { symbol: "AAPL", side: "buy", qty: "1", price: "100", transaction_time: "t" };
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse([noId, noId]));
+      vi.stubGlobal("fetch", mockFetch);
+      expect(await getAccountActivities(2)).toHaveLength(2);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("respects the maxPages bound", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse([fill("x"), fill("y")]));
+      vi.stubGlobal("fetch", mockFetch);
+      const fills = await getAccountActivities(2, 3);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(fills).toHaveLength(6);
+    });
+  });
+
+  describe("getCalendar()", () => {
+    it("returns trading-day keys for the date range", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        jsonResponse([{ date: "2026-07-01" }, { date: "2026-07-02" }, { date: "2026-07-06" }])
+      );
+      vi.stubGlobal("fetch", mockFetch);
+      const days = await getCalendar(new Date("2026-07-01T12:00:00Z"), new Date("2026-07-06T12:00:00Z"));
+      expect(days).toEqual(["2026-07-01", "2026-07-02", "2026-07-06"]);
+      expect(mockFetch.mock.calls[0][0]).toBe(
+        "https://paper-api.alpaca.markets/v2/calendar?start=2026-07-01&end=2026-07-06"
+      );
     });
   });
 });

@@ -18,6 +18,7 @@ import {
   detectOrderFailures,
   detectBrokerUnreachable,
   detectStalePipeline,
+  detectMissedPaperDays,
   type AlertDraft,
 } from "@/lib/alerts";
 import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
@@ -41,6 +42,7 @@ import {
   confidenceNotional,
   riskSizedNotional,
   riskDistancePct,
+  realizedFromFills,
   isPaperTradeEligible,
   isEntrySignal,
   SIM_STARTING_EQUITY,
@@ -55,6 +57,8 @@ import {
   type BookExposure,
 } from "@/lib/portfolio-risk";
 import { loadTradingConfig } from "@/lib/trading-config";
+import { buildConfidenceCalibrator, isConfCalibrationEnabled } from "@/lib/confidence-calibration";
+import { PRIMARY_HORIZON, type CalibrationReport } from "@/lib/calibration-data";
 import {
   isPaperTradingConfigured,
   getAccount,
@@ -62,11 +66,13 @@ import {
   submitMarketOrder,
   getOrder,
   getClock,
+  getCalendar,
   getOpenOrders,
   cancelOrder,
   submitEntryWithStop,
   submitTrailingStop,
   submitStopSell,
+  getAccountActivities,
   type AlpacaOpenOrder,
 } from "@/lib/alpaca-trading";
 import { reportError } from "@/lib/observability";
@@ -1316,6 +1322,31 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
   }
 
+  // Dead-man's check: any trading day between the previous snapshot and today with
+  // no snapshot means the scheduler missed that day's whole trade window (the
+  // July 2–3 2026 failure mode). Broker calendar filters out holidays when set.
+  try {
+    const prevSnap = await db.paperEquitySnapshot.findFirst({
+      where: { book: "SIM_COMBINED", date: { lt: todayUTC } },
+      orderBy: { date: "desc" },
+      select: { date: true },
+    });
+    if (prevSnap) {
+      let tradingDays: string[] | null = null;
+      if (isPaperTradingConfigured()) {
+        try {
+          tradingDays = await getCalendar(prevSnap.date, todayUTC);
+        } catch {
+          // calendar unavailable → fall back to the weekday approximation
+        }
+      }
+      const missedAlert = detectMissedPaperDays(prevSnap.date, todayUTC, tradingDays);
+      if (missedAlert) accountAlerts.push(missedAlert);
+    }
+  } catch (e) {
+    errors.push(`Missed-day check failed: ${String(e)}`);
+  }
+
   // Today's estimates for watched stocks, newest first; dedupe to one per stock.
   const estimateRows = await db.stockEstimate.findMany({
     where: { date: { gte: todayUTC }, stock: universeWhere() },
@@ -1360,6 +1391,23 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   const { risk: cfg, limits, issues: configIssues } = await loadTradingConfig();
   if (configIssues.length > 0) errors.push(`Trading config: ${configIssues.join("; ")}`);
   const activeStrategies: Strategy[] = riskEnabled ? [...STRATEGIES, ...RM_STRATEGIES] : STRATEGIES;
+
+  // Reliability-based confidence recalibration (PAPER_CONF_CALIBRATION=1): adjust
+  // the sizing/entry confidence of the _RM + live books by how each stated-
+  // confidence bucket has actually performed (gate-horizon reliability diagram from
+  // the latest calibrate snapshot). Identity map unless the data passes the trust
+  // gates. The pure books ALWAYS keep the raw confidence — attribution baseline.
+  let confCalibrator = buildConfidenceCalibrator(null);
+  if (riskEnabled && isConfCalibrationEnabled()) {
+    try {
+      const snap = await db.calibrationSnapshot.findFirst({ orderBy: { date: "desc" }, select: { report: true } });
+      const report = snap?.report as CalibrationReport | undefined;
+      const rel = report?.horizons?.find((h) => h.horizon === PRIMARY_HORIZON)?.reliability ?? null;
+      confCalibrator = buildConfidenceCalibrator(rel);
+    } catch (e) {
+      errors.push(`Confidence calibration load failed (raw confidence used): ${String(e)}`);
+    }
+  }
 
   // The live Alpaca book mirrors the COMBINED_RM book's open/flat decision (when the
   // flag is on), so the real fills track the same risk-managed signal the sim does.
@@ -1495,6 +1543,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     const price = priceByStock.get(est.stockId);
     if (price == null) continue;
     const atrPct = atrPctByStock.get(est.stockId) ?? null;
+    // Empirically adjusted confidence for the _RM books (identity when the
+    // calibrator is off/untrusted). Pure books keep est.confidence untouched.
+    const rmConfidence = confCalibrator.calibrate(est.confidence);
     const sourceScores = {
       SENTIMENT: est.sentimentScore,
       QUANT: est.quantScore,
@@ -1513,7 +1564,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           score,
           signal,
           price,
-          confidence: est.confidence,
+          confidence: rmConfidence,
           atrPct,
           runsSinceEntry: open ? utcDaysBetween(open.entryDate, todayUTC) : 0,
           // First action today? The streak only advances on a new UTC day, so a
@@ -1567,7 +1618,8 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               qty: action.qty,
               entryDate: to,
               entryPrice: action.price,
-              confidence: est.confidence,
+              // Persist the confidence that actually sized the position.
+              confidence: STRATEGY_IS_RM[strategy] ? rmConfidence : est.confidence,
               lastMarkDate: to,
               lastMarkPrice: action.price,
               peakPrice: action.price,
@@ -1752,7 +1804,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             restingTrailPercent: protective?.trailPercent ?? null,
             price,
             atrPct: rmOpen ? rmOpen.entryAtrPct : atrPctByStock.get(est.stockId) ?? null,
-            confidence: est.confidence,
+            confidence: confCalibrator.calibrate(est.confidence),
             cfg,
           });
           try {
@@ -1824,7 +1876,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               // book; legacy confidence-weighted notional when the flag is off.
               const notional = riskEnabled
                 ? riskSizedNotional(
-                    est.confidence,
+                    confCalibrator.calibrate(est.confidence),
                     riskDistancePct(cfg, atrPctByStock.get(est.stockId) ?? null, cfg.stopLossPct),
                     cfg.riskPerTrade
                   )
@@ -1855,18 +1907,28 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const ordersAlert = detectOrderFailures(alpacaOrderFailures);
       if (ordersAlert) accountAlerts.push(ordersAlert);
 
-      // Equity straight from the paper account; unrealized rolled up from positions.
+      // Equity straight from the paper account; unrealized rolled up from positions;
+      // realized reconstructed from the full fill history (FIFO — same source the
+      // performance page uses). Best-effort: on failure the field is omitted so the
+      // previous snapshot's value survives instead of writing a false 0.
       const account = await getAccount();
       const unrealized = positions.reduce((s, p) => s + (p.unrealizedPl ?? 0), 0);
+      let alpacaRealized: number | null = null;
+      try {
+        alpacaRealized = realizedFromFills(await getAccountActivities()).totalRealized;
+      } catch (e) {
+        errors.push(`Alpaca fill history fetch failed (realized omitted): ${String(e)}`);
+      }
       const data = {
         equity: account.equity ?? 0,
         cash: account.cash,
         unrealizedPnl: unrealized,
         openPositions: positions.length,
+        ...(alpacaRealized != null ? { realizedPnl: alpacaRealized } : {}),
       };
       await db.paperEquitySnapshot.upsert({
         where: { book_date: { book: "ALPACA", date: todayUTC } },
-        create: { book: "ALPACA", date: todayUTC, realizedPnl: 0, ...data },
+        create: { book: "ALPACA", date: todayUTC, realizedPnl: alpacaRealized ?? 0, ...data },
         update: data,
       });
     } catch (e) {

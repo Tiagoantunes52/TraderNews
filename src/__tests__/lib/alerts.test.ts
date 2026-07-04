@@ -7,6 +7,7 @@ import {
   detectOrderFailures,
   detectBrokerUnreachable,
   detectStalePipeline,
+  detectMissedPaperDays,
   humanizeSignal,
 } from "@/lib/alerts";
 
@@ -165,6 +166,40 @@ describe("account-health alerts (issue #56)", () => {
     it("does not fire when data is fresh", () => {
       const recent = new Date("2026-06-21T06:00:00.000Z"); // 6h old
       expect(detectStalePipeline(recent, now, 48)).toBeNull();
+    });
+  });
+
+  describe("detectMissedPaperDays", () => {
+    const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
+
+    it("fires for weekday gaps between the previous snapshot and today", () => {
+      // Prev snapshot Wed 07-01, today Sat 07-04 → Thu 07-02 + Fri 07-03 missed.
+      const a = detectMissedPaperDays(d("2026-07-01"), d("2026-07-04"));
+      expect(a).not.toBeNull();
+      expect(a!.type).toBe("MISSED_PAPER_DAYS");
+      expect(a!.value).toBe(2);
+      expect(a!.message).toContain("2026-07-02");
+      expect(a!.message).toContain("2026-07-03");
+    });
+
+    it("does not fire for consecutive trading days or a plain weekend gap", () => {
+      expect(detectMissedPaperDays(d("2026-07-01"), d("2026-07-02"))).toBeNull();
+      // Fri → Mon: Sat/Sun aren't trading days.
+      expect(detectMissedPaperDays(d("2026-06-26"), d("2026-06-29"))).toBeNull();
+    });
+
+    it("uses the broker calendar to ignore holidays when provided", () => {
+      // Weekday 07-03 was a holiday per the calendar → not a miss.
+      expect(detectMissedPaperDays(d("2026-07-02"), d("2026-07-06"), ["2026-07-06"])).toBeNull();
+      // But a calendar trading day with no snapshot still fires.
+      const a = detectMissedPaperDays(d("2026-07-01"), d("2026-07-06"), ["2026-07-02", "2026-07-06"]);
+      expect(a!.value).toBe(1);
+      expect(a!.message).toContain("2026-07-02");
+      expect(a!.message).toContain("broker calendar");
+    });
+
+    it("is silent with no prior snapshot (nothing to miss yet)", () => {
+      expect(detectMissedPaperDays(null, d("2026-07-04"))).toBeNull();
     });
   });
 });
