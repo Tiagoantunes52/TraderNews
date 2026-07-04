@@ -340,6 +340,8 @@ model SimPosition {
   // Risk-managed (_RM) overlay state; null/0 on the pure books that don't use it.
   peakPrice     Float? // running max since entry — drives the trailing stop
   bearishStreak Int    @default(0) // consecutive bearish runs — confirmed-signal exit
+  staleStreak   Int    @default(0) // consecutive no-conviction runs — signal-decay exit
+  entryAtrPct   Float? // ATR% captured at entry — freezes the stop/trail distances
 
   createdAt DateTime @default(now())
 

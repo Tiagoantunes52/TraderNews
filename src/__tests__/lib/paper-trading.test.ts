@@ -226,25 +226,54 @@ describe("reconcileRiskManaged()", () => {
     atrPct: null as number | null,
     runsSinceEntry: 5,
     isNewRun: true,
-    open: null as null | { qty: number; entryPrice: number; peakPrice: number; bearishStreak: number },
+    open: null as null | {
+      qty: number;
+      entryPrice: number;
+      peakPrice: number;
+      bearishStreak: number;
+      staleStreak: number;
+      entryAtrPct: number | null;
+    },
     cfg,
-    base: 1000,
   };
   const rm = (o: Partial<typeof base>) => reconcileRiskManaged({ ...base, ...o });
-  const long = (over: Partial<{ qty: number; entryPrice: number; peakPrice: number; bearishStreak: number }> = {}) => ({
+  const long = (
+    over: Partial<{
+      qty: number;
+      entryPrice: number;
+      peakPrice: number;
+      bearishStreak: number;
+      staleStreak: number;
+      entryAtrPct: number | null;
+    }> = {}
+  ) => ({
     qty: 10,
     entryPrice: 100,
     peakPrice: 100,
     bearishStreak: 0,
+    staleStreak: 0,
+    entryAtrPct: null as number | null,
     ...over,
   });
 
-  describe("entry (deadband + confidence floor)", () => {
-    it("opens a confidence-sized long above the entry deadband", () => {
+  describe("entry (deadband + confidence floor + risk-based sizing)", () => {
+    it("opens a risk-sized long above the entry deadband", () => {
+      // riskPerTrade $80 × conf 0.5 = $40 at risk; fixed 8% stop → $500 notional
+      // → 10 shares at $50. (Same as the legacy $1000 × conf at the default stop.)
       expect(rm({ score: 0.3, confidence: 0.5, price: 50, open: null })).toEqual({
         type: "OPEN",
-        qty: 10, // 1000 × 0.5 / 50
+        qty: 10,
         price: 50,
+      });
+    });
+
+    it("sizes a wide-stopped volatile name down so every stop-out risks the same $", () => {
+      // ATR 4% → stop 10% → notional 80×0.5/0.10 = $400 → 4 shares at $100.
+      // Stop-out check: 4 shares × ($100 − $90) = $40 = riskPerTrade × confidence.
+      expect(rm({ score: 0.3, confidence: 0.5, price: 100, atrPct: 4, open: null })).toEqual({
+        type: "OPEN",
+        qty: 4,
+        price: 100,
       });
     });
 
@@ -274,6 +303,7 @@ describe("reconcileRiskManaged()", () => {
         price: 93,
         peakPrice: 100,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -305,6 +335,7 @@ describe("reconcileRiskManaged()", () => {
         price: 105,
         peakPrice: 120,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -315,6 +346,7 @@ describe("reconcileRiskManaged()", () => {
         price: 100,
         peakPrice: 105,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
   });
@@ -336,6 +368,7 @@ describe("reconcileRiskManaged()", () => {
         price: 98,
         peakPrice: 100,
         bearishStreak: 1,
+        staleStreak: 0,
       });
     });
 
@@ -345,6 +378,7 @@ describe("reconcileRiskManaged()", () => {
         price: 99,
         peakPrice: 100,
         bearishStreak: 1, // unchanged
+        staleStreak: 0,
       });
     });
 
@@ -354,12 +388,13 @@ describe("reconcileRiskManaged()", () => {
         price: 100,
         peakPrice: 100,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
     it("is suppressed during the minimum holding period", () => {
       const action = rm({ price: 98, signal: "SELL", runsSinceEntry: 1, open: long({ bearishStreak: 1 }) });
-      expect(action).toEqual({ type: "MARK", price: 98, peakPrice: 100, bearishStreak: 2 });
+      expect(action).toEqual({ type: "MARK", price: 98, peakPrice: 100, bearishStreak: 2, staleStreak: 0 });
     });
   });
 
@@ -380,37 +415,137 @@ describe("reconcileRiskManaged()", () => {
         price: 110,
         peakPrice: 110,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
   });
 
-  describe("ATR-scaled stops", () => {
-    it("widens the stop for a volatile name (vs the fixed fallback)", () => {
+  describe("ATR-scaled stops (frozen at entry)", () => {
+    it("widens the stop for a name that was volatile at entry (vs the fixed fallback)", () => {
       // Fixed 8% stop → triggers at ≤ 92; price 91 stops out.
       expect(rm({ price: 91, signal: "NEUTRAL", open: long() })).toMatchObject({ type: "CLOSE", reason: "STOP" });
-      // atrPct 4% × 2.5 = 10% stop → triggers at ≤ 90; price 91 survives.
-      expect(rm({ price: 91, signal: "NEUTRAL", atrPct: 4, open: long() })).toEqual({
+      // entry ATR 4% × 2.5 = 10% stop → triggers at ≤ 90; price 91 survives.
+      expect(rm({ price: 91, signal: "NEUTRAL", open: long({ entryAtrPct: 4 }) })).toEqual({
         type: "MARK",
         price: 91,
         peakPrice: 100,
         bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
     it("clamps the ATR-scaled distance to the floor", () => {
-      // atrPct 1% × 2.5 = 2.5% < 6% floor → stop at 6% → triggers at ≤ 94.
-      expect(rm({ price: 94, signal: "NEUTRAL", atrPct: 1, open: long() })).toMatchObject({
+      // entry ATR 1% × 2.5 = 2.5% < 6% floor → stop at 6% → triggers at ≤ 94.
+      expect(rm({ price: 94, signal: "NEUTRAL", open: long({ entryAtrPct: 1 }) })).toMatchObject({
         type: "CLOSE",
         reason: "STOP",
       });
-      expect(rm({ price: 95, signal: "NEUTRAL", atrPct: 1, open: long() })).toMatchObject({ type: "MARK" });
+      expect(rm({ price: 95, signal: "NEUTRAL", open: long({ entryAtrPct: 1 }) })).toMatchObject({ type: "MARK" });
+    });
+
+    it("ignores today's ATR for exits — a volatility crash cannot tighten the stop", () => {
+      // Entry ATR 4% froze a 10% stop (≤ 90). Today's ATR collapsed to 1% (a 6%
+      // floating stop would fire at ≤ 94) — price 93 must still be a hold.
+      expect(rm({ price: 93, signal: "NEUTRAL", atrPct: 1, open: long({ entryAtrPct: 4 }) })).toMatchObject({
+        type: "MARK",
+      });
+    });
+
+    it("ignores today's ATR for exits — a volatility spike cannot widen the stop", () => {
+      // No ATR at entry → frozen fixed 8% stop (≤ 92). Today's ATR spiked to 4%
+      // (a floating stop would widen to 10%, holding at 92) — price 92 must sell.
+      expect(rm({ price: 92, signal: "NEUTRAL", atrPct: 4, open: long() })).toMatchObject({
+        type: "CLOSE",
+        reason: "STOP",
+      });
+    });
+  });
+
+  describe("trail ratchet (big winners give back less)", () => {
+    it("tightens the trail once the peak clears the ratchet threshold", () => {
+      // peak 130 ≥ 100×1.15 → trail 12%×0.5 = 6% → trigger 130×0.94 = 122.2;
+      // price 120 ≤ that → a pullback the un-ratcheted 12% trail (114.4) would ride.
+      expect(rm({ price: 120, signal: "BUY", open: long({ peakPrice: 130 }) })).toEqual({
+        type: "CLOSE",
+        price: 120,
+        realizedPnl: 200,
+        reason: "TRAIL",
+      });
+    });
+
+    it("keeps the full trail below the ratchet threshold", () => {
+      // peak 112 armed (≥108) but under the 115 ratchet → trail 12% → 112×0.88 = 98.56.
+      expect(rm({ price: 99, signal: "BUY", open: long({ peakPrice: 112 }) })).toMatchObject({
+        type: "MARK",
+        peakPrice: 112,
+      });
+    });
+
+    it("is disabled when trailRatchetActivatePct is 0", () => {
+      const noRatchet = { ...cfg, trailRatchetActivatePct: 0 };
+      // Same 120-off-a-130-peak pullback as above: full 12% trail (114.4) holds it.
+      expect(rm({ price: 120, signal: "BUY", cfg: noRatchet, open: long({ peakPrice: 130 }) })).toMatchObject({
+        type: "MARK",
+        peakPrice: 130,
+      });
+    });
+  });
+
+  describe("signal-decay exit (thesis played out)", () => {
+    // Stale = score at/below the 0.25 entry deadband; NEUTRAL keeps bearishStreak at 0.
+    it("closes a profitable position once conviction has been gone for decayRuns", () => {
+      // streak 4 + this stale run = 5 ≥ decayRuns(5), price 106 > entry → take the profit.
+      expect(rm({ score: 0.1, signal: "NEUTRAL", price: 106, open: long({ staleStreak: 4 }) })).toEqual({
+        type: "CLOSE",
+        price: 106,
+        realizedPnl: 60,
+        reason: "DECAY",
+      });
+    });
+
+    it("keeps building the streak but does NOT exit at a loss (stop/time own that side)", () => {
+      expect(rm({ score: 0.1, signal: "NEUTRAL", price: 95, open: long({ staleStreak: 4 }) })).toEqual({
+        type: "MARK",
+        price: 95,
+        peakPrice: 100,
+        bearishStreak: 0,
+        staleStreak: 5,
+      });
+    });
+
+    it("resets the streak when conviction returns above the deadband", () => {
+      expect(rm({ score: 0.4, signal: "BUY", price: 106, open: long({ staleStreak: 4 }) })).toMatchObject({
+        type: "MARK",
+        staleStreak: 0,
+      });
+    });
+
+    it("does not advance the streak on a same-day re-run (idempotent)", () => {
+      expect(rm({ score: 0.1, signal: "NEUTRAL", price: 106, isNewRun: false, open: long({ staleStreak: 4 }) })).toMatchObject({
+        type: "MARK",
+        staleStreak: 4, // unchanged → no exit either
+      });
+    });
+
+    it("is suppressed during the minimum holding period", () => {
+      expect(rm({ score: 0.1, signal: "NEUTRAL", price: 106, runsSinceEntry: 1, open: long({ staleStreak: 10 }) })).toMatchObject({
+        type: "MARK",
+        staleStreak: 11,
+      });
+    });
+
+    it("is disabled when decayRuns is 0", () => {
+      const noDecay = { ...cfg, decayRuns: 0 };
+      expect(rm({ score: 0.1, signal: "NEUTRAL", price: 106, cfg: noDecay, open: long({ staleStreak: 40 }) })).toMatchObject({
+        type: "MARK",
+      });
     });
   });
 
   it("tracks the running peak with max()", () => {
-    // 120 is a pullback from the 130 peak but above both the stop (92) and the
-    // trailing trigger (130×0.88 = 114.4), so it just marks.
-    expect(rm({ price: 120, signal: "BUY", open: long({ peakPrice: 130 }) })).toMatchObject({
+    // 125 is a pullback from the 130 peak but above the stop (92) and the ratcheted
+    // trailing trigger (130×0.94 = 122.2), so it just marks.
+    expect(rm({ price: 125, signal: "BUY", open: long({ peakPrice: 130 }) })).toMatchObject({
       type: "MARK",
       peakPrice: 130, // a pullback doesn't lower the peak
     });
@@ -426,29 +561,30 @@ describe("planBrokerAction()", () => {
     avgEntryPrice: null as number | null,
     currentPrice: null as number | null,
     restingProtectiveType: null as "stop" | "trailing_stop" | null,
+    restingTrailPercent: null as number | null,
     price: 100,
     atrPct: null as number | null,
     confidence: 0.6,
     cfg: DEFAULT_RISK_CONFIG,
-    base: 1000,
     entryLimitBufferPct: 0.005,
   };
   const plan = (o: Partial<typeof base>) => planBrokerAction({ ...base, ...o });
 
   describe("entry (whole-share, marketable-limit + ATR stop)", () => {
     it("enters on a fresh sim OPEN when flat, flooring to whole shares", () => {
-      // notional 1000×0.6 = $600; floor(600/100) = 6 shares; stop 100×0.92 = 92.
+      // risk $80×0.6 = $48 at the fixed 8% stop → $600 notional; floor(600/100) = 6
+      // shares; stop 100×0.92 = 92.
       expect(plan({ opened: true })).toEqual({ type: "ENTER", qty: 6, limitPrice: 100.5, stopPrice: 92 });
     });
 
-    it("skips a name when the confidence-weighted budget is under one share", () => {
+    it("skips a name when the risk-sized budget is under one share", () => {
       // $600 budget, $700 price → floor = 0 → no live order (sim book still covers it).
       expect(plan({ opened: true, price: 700 })).toEqual({ type: "NONE" });
     });
 
-    it("widens the stop with ATR when available", () => {
-      // atrPct 4% × 2.5 = 10% → stop 100×0.90 = 90.
-      expect(plan({ opened: true, atrPct: 4 })).toMatchObject({ type: "ENTER", stopPrice: 90 });
+    it("widens the stop AND shrinks the size with ATR (equal $ risk)", () => {
+      // atrPct 4% × 2.5 = 10% → stop 100×0.90 = 90; notional 80×0.6/0.10 = $480 → 4 shares.
+      expect(plan({ opened: true, atrPct: 4 })).toEqual({ type: "ENTER", qty: 4, limitPrice: 100.5, stopPrice: 90 });
     });
 
     it("does NOT re-enter a name the broker stopped out while the sim is still long", () => {
@@ -458,8 +594,9 @@ describe("planBrokerAction()", () => {
   });
 
   describe("exits", () => {
-    it("exits on an info exit (signal flip / time stop)", () => {
+    it("exits on an info exit (signal flip / decay / time stop)", () => {
       expect(plan({ held: true, exitReason: "SIGNAL" })).toEqual({ type: "EXIT", reason: "SIGNAL" });
+      expect(plan({ held: true, exitReason: "DECAY" })).toEqual({ type: "EXIT", reason: "DECAY" });
       expect(plan({ held: true, exitReason: "TIME" })).toEqual({ type: "EXIT", reason: "TIME" });
     });
 
@@ -483,9 +620,29 @@ describe("planBrokerAction()", () => {
       ).toEqual({ type: "NONE" });
     });
 
-    it("does not re-arm a position already on a trailing stop", () => {
+    it("does not touch a resting trailing stop when its trail percent is unknown", () => {
       expect(
         plan({ held: true, restingProtectiveType: "trailing_stop", avgEntryPrice: 100, currentPrice: 130 })
+      ).toEqual({ type: "NONE" });
+    });
+
+    it("ratchets a resting trailing stop tighter once up the ratchet threshold", () => {
+      // gain 16% ≥ 15% ratchet → target trail 12%×0.5 = 6% < resting 12% → replace.
+      expect(
+        plan({ held: true, restingProtectiveType: "trailing_stop", restingTrailPercent: 12, avgEntryPrice: 100, currentPrice: 116 })
+      ).toEqual({ type: "ARM_TRAILING", trailPercent: 6 });
+    });
+
+    it("does not churn an already-ratcheted trailing stop", () => {
+      expect(
+        plan({ held: true, restingProtectiveType: "trailing_stop", restingTrailPercent: 6, avgEntryPrice: 100, currentPrice: 130 })
+      ).toEqual({ type: "NONE" });
+    });
+
+    it("does not ratchet before the ratchet threshold", () => {
+      // gain 10% arms the plain trail, but a trailing stop is already resting.
+      expect(
+        plan({ held: true, restingProtectiveType: "trailing_stop", restingTrailPercent: 12, avgEntryPrice: 100, currentPrice: 110 })
       ).toEqual({ type: "NONE" });
     });
 
