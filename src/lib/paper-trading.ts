@@ -26,22 +26,30 @@ export type Strategy =
   | "COMBINED"
   | "SENTIMENT_RM"
   | "QUANT_RM"
-  | "COMBINED_RM";
+  | "COMBINED_RM"
+  | "INSIDER";
 export type SimBook =
   | "SIM_SENTIMENT"
   | "SIM_QUANT"
   | "SIM_COMBINED"
   | "SIM_SENTIMENT_RM"
   | "SIM_QUANT_RM"
-  | "SIM_COMBINED_RM";
+  | "SIM_COMBINED_RM"
+  | "SIM_INSIDER";
 export type Book = "ALPACA" | SimBook;
 
 /** The three pure (signal-only) strategies — the attribution baseline. */
 export const STRATEGIES: Strategy[] = ["SENTIMENT", "QUANT", "COMBINED"];
 /** The three risk-managed variants (only run when PAPER_RISK_BOOKS=1). */
 export const RM_STRATEGIES: Strategy[] = ["SENTIMENT_RM", "QUANT_RM", "COMBINED_RM"];
+/**
+ * Event-driven books (issue #57): entered on discrete events (insider cluster /
+ * C-suite buys), NOT on the daily estimate scores — different horizon, own
+ * attribution book. Only run when PAPER_INSIDER_BOOK=1.
+ */
+export const EVENT_STRATEGIES: Strategy[] = ["INSIDER"];
 /** Every strategy — used by views that render whatever books have data. */
-export const ALL_STRATEGIES: Strategy[] = [...STRATEGIES, ...RM_STRATEGIES];
+export const ALL_STRATEGIES: Strategy[] = [...STRATEGIES, ...RM_STRATEGIES, ...EVENT_STRATEGIES];
 
 /** Each internal strategy maps to its equity-curve book. */
 export const STRATEGY_BOOK: Record<Strategy, SimBook> = {
@@ -51,6 +59,7 @@ export const STRATEGY_BOOK: Record<Strategy, SimBook> = {
   SENTIMENT_RM: "SIM_SENTIMENT_RM",
   QUANT_RM: "SIM_QUANT_RM",
   COMBINED_RM: "SIM_COMBINED_RM",
+  INSIDER: "SIM_INSIDER",
 };
 
 /** Which raw estimate score each strategy reads (pure and _RM share a source). */
@@ -61,6 +70,7 @@ export const STRATEGY_SOURCE: Record<Strategy, "SENTIMENT" | "QUANT" | "COMBINED
   SENTIMENT_RM: "SENTIMENT",
   QUANT_RM: "QUANT",
   COMBINED_RM: "COMBINED",
+  INSIDER: "COMBINED", // unused — the event book doesn't read estimate scores
 };
 
 /** True for the risk-managed variants (price-aware exit ladder + entry deadband). */
@@ -71,6 +81,7 @@ export const STRATEGY_IS_RM: Record<Strategy, boolean> = {
   SENTIMENT_RM: true,
   QUANT_RM: true,
   COMBINED_RM: true,
+  INSIDER: false,
 };
 
 // Base position size before the confidence weighting, and the notional bankroll the
@@ -108,6 +119,8 @@ export type RiskConfig = {
   entryScoreMin: number; // raw score must exceed this to open (deadband above BUY)
   minConfidence: number; // confidence floor for an entry (skips dust positions)
   riskPerTrade: number; // $ lost if the stop fires at confidence 1 — drives sizing
+  insiderHoldDays: number; // event-book fixed holding period (UTC days ≈ 40 trading days)
+  insiderNotional: number; // $ per insider-event position (flat — no confidence weighting)
 };
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
@@ -129,6 +142,10 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   // 80 = old BASE_NOTIONAL × fixed 8% stop, so a fixed-stop name sizes exactly as
   // the legacy $1000 × confidence did; ATR-stopped names now equalize $ risk instead.
   riskPerTrade: 80,
+  // Insider event book (issue #57): ~40 trading days ≈ 56 calendar days, mid-range
+  // of the research-backed 20–60-day drift window for insider cluster buys.
+  insiderHoldDays: 56,
+  insiderNotional: 1000,
 };
 
 /** The active risk overlay, with each field overridable by its PAPER_* env var. */
@@ -150,12 +167,19 @@ export function riskConfig(): RiskConfig {
     entryScoreMin: numEnv("PAPER_ENTRY_SCORE_MIN", DEFAULT_RISK_CONFIG.entryScoreMin),
     minConfidence: numEnv("PAPER_MIN_CONFIDENCE", DEFAULT_RISK_CONFIG.minConfidence),
     riskPerTrade: numEnv("PAPER_RISK_PER_TRADE", DEFAULT_RISK_CONFIG.riskPerTrade),
+    insiderHoldDays: numEnv("PAPER_INSIDER_HOLD_DAYS", DEFAULT_RISK_CONFIG.insiderHoldDays),
+    insiderNotional: numEnv("PAPER_INSIDER_NOTIONAL", DEFAULT_RISK_CONFIG.insiderNotional),
   };
 }
 
 /** Gate for the risk-managed books + the risk overlay on the live Alpaca book. */
 export function isRiskBooksEnabled(): boolean {
   return process.env.PAPER_RISK_BOOKS === "1";
+}
+
+/** Gate for the insider event book (issue #57). Sim-only; ship-dark. */
+export function isInsiderBookEnabled(): boolean {
+  return process.env.PAPER_INSIDER_BOOK === "1";
 }
 
 /**
@@ -275,6 +299,25 @@ export function reconcilePosition(
     return qty > 0 ? { type: "OPEN", qty, price } : { type: "NONE" };
   }
   return { type: "NONE" };
+}
+
+/**
+ * Event-book reconciliation (issue #57): a position opened on a discrete event
+ * (insider cluster / C-suite buy) is held for a FIXED period and then closed —
+ * time is the only exit. Deliberately no stops or signal exits: like the pure
+ * books, this measures the event's raw multi-week drift so its edge can be judged
+ * before any risk overlay is layered on. Pure; the caller supplies days held.
+ */
+export function reconcileEventPosition(
+  price: number,
+  daysHeld: number,
+  holdDays: number,
+  open: { qty: number; entryPrice: number }
+): PositionAction {
+  if (daysHeld >= holdDays) {
+    return { type: "CLOSE", price, realizedPnl: realizedPnl(open.qty, open.entryPrice, price) };
+  }
+  return { type: "MARK", price };
 }
 
 /**

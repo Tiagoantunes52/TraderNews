@@ -32,6 +32,8 @@ export type RiskLimits = {
   killSwitchDrawdownPct: number; // halt ALL new buys above this drawdown from peak equity
   deriskStartDrawdownPct: number; // drawdown where the gross-cap step-down begins
   peakWindowDays: number; // rolling window (days) for the peak the drawdown is measured from (0 = all-time)
+  regimeMaWindow: number; // SPY moving-average window (closes) for the regime filter (0 disables)
+  regimeRiskOffGrossFrac: number; // fraction of the gross cap allowed while SPY < its MA
 };
 
 // Conservative long-only defaults: near-fully-invested ceiling, ~12 names, no single
@@ -49,6 +51,11 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   // halt new buys FOREVER (nothing new can open, so equity can never recover to a
   // peak it can only drift away from). 90 days ≈ a quarter to work it off.
   peakWindowDays: 90,
+  // Regime filter (issue #58): long-only books make most of their drawdown in bear
+  // markets — while SPY sits below its MA, only half the gross cap may deploy.
+  // Neutral (full cap) until enough SPY history exists to compute the MA.
+  regimeMaWindow: 200,
+  regimeRiskOffGrossFrac: 0.5,
 };
 
 /** The active limits, each field overridable by its PAPER_* env var (no redeploy). */
@@ -62,6 +69,8 @@ export function riskLimits(): RiskLimits {
     killSwitchDrawdownPct: numEnv("PAPER_KILL_SWITCH_DD_PCT", DEFAULT_RISK_LIMITS.killSwitchDrawdownPct),
     deriskStartDrawdownPct: numEnv("PAPER_DERISK_START_DD_PCT", DEFAULT_RISK_LIMITS.deriskStartDrawdownPct),
     peakWindowDays: numEnv("PAPER_PEAK_WINDOW_DAYS", DEFAULT_RISK_LIMITS.peakWindowDays),
+    regimeMaWindow: numEnv("PAPER_REGIME_MA_WINDOW", DEFAULT_RISK_LIMITS.regimeMaWindow),
+    regimeRiskOffGrossFrac: numEnv("PAPER_REGIME_RISKOFF_GROSS_FRAC", DEFAULT_RISK_LIMITS.regimeRiskOffGrossFrac),
   };
 }
 
@@ -193,6 +202,23 @@ export function deriskMultiplier(drawdown: number, limits: RiskLimits = DEFAULT_
   return Math.max(0, Math.min(1, 1 - (drawdown - start) / (kill - start)));
 }
 
+// ── Regime filter (issue #58) ────────────────────────────────────────────────
+
+/**
+ * Gross-cap multiplier from the market regime: 1 (risk-on) while SPY holds at or
+ * above its moving average, `riskOffFrac` below it. Null price/MA (not enough SPY
+ * history yet, or the filter disabled) reads as risk-on — the filter must never
+ * *tighten* on missing data, only on an observed downtrend.
+ */
+export function regimeMultiplier(
+  spyPrice: number | null | undefined,
+  spyMa: number | null | undefined,
+  riskOffFrac: number
+): number {
+  if (spyPrice == null || spyMa == null || spyMa <= 0) return 1;
+  return spyPrice >= spyMa ? 1 : Math.max(0, Math.min(1, riskOffFrac));
+}
+
 // ── The buy gate ─────────────────────────────────────────────────────────────
 
 export type RiskBlockReason =
@@ -225,12 +251,14 @@ export type BuyDecision = { allowed: boolean; reason: RiskBlockReason | null };
  *   6. MAX_CLUSTER_POSITIONS — cluster already at its name-count cap
  *
  * Pure: the caller mutates a running `BookExposure` between candidates so multiple
- * opens in one run respect each other.
+ * opens in one run respect each other. `regimeMult` scales the gross cap down in
+ * a risk-off regime (see regimeMultiplier); 1 = regime-neutral.
  */
 export function evaluateBuy(
   book: BookExposure,
   candidate: BuyCandidate,
-  limits: RiskLimits = DEFAULT_RISK_LIMITS
+  limits: RiskLimits = DEFAULT_RISK_LIMITS,
+  regimeMult = 1
 ): BuyDecision {
   const { equity } = book;
   if (equity <= 0 || candidate.notional <= 0) return { allowed: false, reason: "GROSS_CAP" };
@@ -241,9 +269,9 @@ export function evaluateBuy(
   // 1. Kill-switch — drawdown blew past the limit; no new risk until we recover.
   if (dd >= limits.killSwitchDrawdownPct) return { allowed: false, reason: "KILL_SWITCH" };
 
-  // 2. Gross-exposure cap, de-risked as drawdown deepens.
+  // 2. Gross-exposure cap, de-risked as drawdown deepens and in risk-off regimes.
   const deployed = book.positions.reduce((s, p) => s + p.notional, 0);
-  const grossCap = limits.maxGrossExposurePct * deriskMultiplier(dd, limits) * equity;
+  const grossCap = limits.maxGrossExposurePct * deriskMultiplier(dd, limits) * regimeMult * equity;
   if (deployed + candidate.notional > grossCap) return { allowed: false, reason: "GROSS_CAP" };
 
   // 3. Position-count cap.

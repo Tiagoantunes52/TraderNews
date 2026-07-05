@@ -26,8 +26,9 @@ const GROUP_TITLES: Record<string, string> = {
   sizing: "Sizing",
   exits: "Exit ladder",
   portfolio: "Portfolio limits",
+  events: "Insider event book",
 };
-const GROUP_ORDER = ["entry", "sizing", "exits", "portfolio"];
+const GROUP_ORDER = ["entry", "sizing", "exits", "portfolio", "events"];
 
 export function TradingConfigForm({
   knobs,

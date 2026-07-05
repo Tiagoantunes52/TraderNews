@@ -13,6 +13,7 @@ export const BOOK_META = [
   { key: "SIM_COMBINED_RM", label: "Combined (risk-managed)", color: "#8b5cf6" },
   { key: "SIM_SENTIMENT_RM", label: "Sentiment (risk-managed)", color: "#14b8a6" },
   { key: "SIM_QUANT_RM", label: "Quant (risk-managed)", color: "#f97316" },
+  { key: "SIM_INSIDER", label: "Insider events", color: "#0ea5e9" },
   { key: "ALPACA", label: "Alpaca (live)", color: "#ec4899" },
 ] as const;
 

@@ -173,13 +173,27 @@ export function calcMACD(closes: number[], fast = 12, slow = 26, signal = 9): MA
 // Missing components are excluded and remaining weights are rescaled.
 //
 // Components and their weights when all 5 are present:
-//   RSI(14)              30% — oversold → positive, overbought → negative
+//   RSI(14)              30% — REGIME-GATED (see below)
 //   7d momentum          30% — uses relativeStr7d if available; crypto-aware normalisation
 //   SMA(20)/Bollinger %B 10% — when bollingerPctB provided, replaces SMA position component
 //   Volume ratio         10% — elevated volume confirms the trend direction
 //   MACD histogram       20% — momentum confirmation
 //
+// RSI regime gate (issue #57): the composite used to score RSI as pure
+// mean-reversion (oversold → bullish) while the other 70% of the weight scores
+// trend-following — so a stock at new highs got a bullish trend read and a bearish
+// RSI read IN THE SAME NUMBER, partially cancelling and capping the blend's
+// directional content. Now the momentum leg decides the regime: when the
+// normalized momentum magnitude ≥ TREND_REGIME_MIN the name is trending and RSI is
+// scored as trend CONFIRMATION (high RSI = strength = bullish); otherwise it's
+// range-bound and RSI keeps its mean-reversion read. Without a momentum reading
+// the regime is unknown and defaults to mean-reversion (the conservative prior).
+//
 // After scoring, a volatility dampener reduces the magnitude in high-vol regimes.
+
+// Normalized |momentum| at/above this = trending regime (0.3 → a ≥6% 7-day move
+// for equities, ≥12% for crypto — a decisive directional move, not chop).
+export const TREND_REGIME_MIN = 0.3;
 export function calcQuantScore({
   rsi14,
   change7d,
@@ -208,18 +222,23 @@ export function calcQuantScore({
   let score = 0;
   let totalWeight = 0;
 
-  if (rsi14 != null) {
-    // Oversold (low RSI) → positive; overbought (high RSI) → negative
-    score += clamp((50 - rsi14) / 50, -1, 1) * 0.30;
+  // Momentum first — it also decides RSI's regime below.
+  // Use relativeStr7d (stock vs SPY) when available, else change7d.
+  const momentumValue = relativeStr7d != null ? relativeStr7d : change7d;
+  // Crypto swings ±40% routinely; equities use ±20% as the extreme
+  const momNormFactor = isCrypto ? 40 : 20;
+  const momNorm = momentumValue != null ? clamp(momentumValue / momNormFactor, -1, 1) : null;
+  if (momNorm != null) {
+    score += momNorm * 0.30;
     totalWeight += 0.30;
   }
 
-  // Momentum: use relativeStr7d (stock vs SPY) when available, else change7d
-  const momentumValue = relativeStr7d != null ? relativeStr7d : change7d;
-  if (momentumValue != null) {
-    // Crypto swings ±40% routinely; equities use ±20% as the extreme
-    const normFactor = isCrypto ? 40 : 20;
-    score += clamp(momentumValue / normFactor, -1, 1) * 0.30;
+  if (rsi14 != null) {
+    const trending = momNorm != null && Math.abs(momNorm) >= TREND_REGIME_MIN;
+    // Trending: RSI confirms strength (high RSI → positive). Range-bound (or
+    // unknown regime): classic mean-reversion (oversold → positive).
+    const rsiRead = trending ? (rsi14 - 50) / 50 : (50 - rsi14) / 50;
+    score += clamp(rsiRead, -1, 1) * 0.30;
     totalWeight += 0.30;
   }
 
