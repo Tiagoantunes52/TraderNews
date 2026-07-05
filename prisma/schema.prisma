@@ -407,6 +407,37 @@ model AppSetting {
 // day (the `calibrate` stage upserts it — idempotent like the other stages). A few
 // columns are promoted for querying gate-status history / alerts; the full report
 // is kept as JSON so the admin page can render a past day without recomputing.
+// ── Private-company news watch (issue #63) ─────────────────────────────────
+// Deliberately isolated from the public Stock/ArticleStock universe: private
+// companies have no tickers, prices, signals, alerts, or trading. The canonical
+// company list lives in code (lib/private-companies.ts) and is synced here
+// idempotently by the pipeline stage; rows dropped from the seed go inactive
+// rather than being deleted, preserving their article history.
+model PrivateCompany {
+  id        String                  @id @default(cuid())
+  slug      String                  @unique // stable key for the code-side seed sync
+  name      String
+  query     String? // Google News query override for ambiguous names (null → derived from name)
+  active    Boolean                 @default(true)
+  createdAt DateTime                @default(now())
+  articles  PrivateCompanyArticle[]
+}
+
+model PrivateCompanyArticle {
+  id          String         @id @default(cuid())
+  company     PrivateCompany @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId   String
+  headline    String
+  url         String
+  source      String
+  publishedAt DateTime
+  createdAt   DateTime       @default(now())
+
+  // Same article may cover two watched companies — dedupe per company, not globally.
+  @@unique([companyId, url])
+  @@index([companyId, publishedAt])
+}
+
 model CalibrationSnapshot {
   id             String   @id @default(cuid())
   date           DateTime // UTC day

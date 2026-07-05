@@ -110,8 +110,18 @@ const BROWSER_UA =
 export async function getGoogleNews(name: string, ticker: string, since: Date): Promise<GoogleNewsArticle[]> {
   const query = googleNewsQuery(name);
   if (query.length < 2) return [];
+  return searchGoogleNews(query, since, localeForTicker(ticker));
+}
 
-  const loc = localeForTicker(ticker);
+/**
+ * Fetch Google News RSS for a prebuilt query string (the ticker-oriented
+ * `getGoogleNews` above and the private-company watch both funnel through here).
+ */
+export async function searchGoogleNews(
+  query: string,
+  since: Date,
+  loc: Locale = DEFAULT_LOCALE
+): Promise<GoogleNewsArticle[]> {
   const days = Math.max(1, Math.ceil((Date.now() - since.getTime()) / 86_400_000));
 
   const url = new URL("https://news.google.com/rss/search");
