@@ -14,7 +14,7 @@ import {
   type AlpacaPortfolioPosition,
   type AlpacaEquityPoint,
 } from "@/lib/alpaca-trading";
-import { PortfolioValueChart } from "@/components/portfolio-value-chart";
+import { PortfolioValueChart } from "@/components/lazy-charts";
 import { cn } from "@/lib/utils";
 
 export const metadata = { title: "Portfolio — TraderNews" };

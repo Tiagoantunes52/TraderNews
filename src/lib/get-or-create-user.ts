@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { db } from "@/lib/db";
 
@@ -23,8 +24,10 @@ async function fetchClerkEmail(clerkId: string): Promise<string | null> {
  *  - new Clerk user has no matching pending invitation
  *
  * Existing TraderNews users are grandfathered in (no invitation check).
+ *
+ * Memoized per request so the layout and pages share one resolution.
  */
-export async function getOrCreateUser() {
+export const getOrCreateUser = cache(async () => {
   const { userId } = await auth();
   if (!userId) return null;
 
@@ -72,4 +75,4 @@ export async function getOrCreateUser() {
   });
 
   return createdUser;
-}
+});

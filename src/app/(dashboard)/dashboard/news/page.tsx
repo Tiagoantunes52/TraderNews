@@ -81,21 +81,14 @@ export default async function NewsFeedPage({
     };
   }
 
-  // Fetch enough to filter on mood in-memory; mood filter is applied after fetch.
-  // 4× when mood-filtered so we have headroom after dropping non-matching rows.
+  // Two-step fetch so mood filtering never hydrates rows it will drop:
+  // 1) candidate IDs + their stock links (light), 4× headroom when mood-filtered;
+  // 2) full rows for the visible page only.
   const takeFromDb = Math.min(MAX_LIMIT * 4, moodFilter === "all" ? limit : limit * 4);
 
-  const articles = await db.article.findMany({
+  const candidates = await db.article.findMany({
     where,
-    include: {
-      articleStock: {
-        include: {
-          stock: {
-            include: { sentiments: { orderBy: { date: "desc" }, take: 1 } },
-          },
-        },
-      },
-    },
+    select: { id: true, articleStock: { select: { stockId: true } } },
     orderBy: { publishedAt: "desc" },
     take: takeFromDb,
   });
@@ -104,21 +97,49 @@ export default async function NewsFeedPage({
   // (already covered by the "no ticker scope" branch above — `where.articleStock` is undefined,
   // so we get all articles).
 
-  // In-memory mood filter
-  const enriched = articles.map((article) => {
-    const tickers = article.articleStock.map((as) => as.stock);
-    const topSentiment = tickers
-      .flatMap((s) => s.sentiments)
-      .sort((a, b) => Math.abs(b.score) - Math.abs(a.score))[0];
-    return { article, tickers, topSentiment };
-  });
+  // Latest sentiment per linked stock, one query for the whole candidate set.
+  const candidateStockIds = [...new Set(candidates.flatMap((c) => c.articleStock.map((as) => as.stockId)))];
+  const latestSentiments = candidateStockIds.length
+    ? await db.sentiment.findMany({
+        where: { stockId: { in: candidateStockIds } },
+        orderBy: { date: "desc" },
+        distinct: ["stockId"],
+        select: { stockId: true, score: true },
+      })
+    : [];
+  const sentimentByStock = new Map(latestSentiments.map((s) => [s.stockId, s.score]));
+
+  // An article's mood = its linked stock sentiment with the largest magnitude.
+  const topScoreFor = (c: (typeof candidates)[number]): number | undefined => {
+    let top: number | undefined;
+    for (const as of c.articleStock) {
+      const score = sentimentByStock.get(as.stockId);
+      if (score != null && (top === undefined || Math.abs(score) > Math.abs(top))) top = score;
+    }
+    return top;
+  };
+  const scored = candidates.map((c) => ({ id: c.id, topScore: topScoreFor(c) }));
 
   const filtered = moodFilter === "all"
-    ? enriched
-    : enriched.filter((e) => moodBucket(e.topSentiment?.score) === moodFilter);
+    ? scored
+    : scored.filter((e) => moodBucket(e.topScore) === moodFilter);
 
-  const finalList = filtered.slice(0, limit);
-  const hasMore = finalList.length >= limit && limit < MAX_LIMIT;
+  const visible = filtered.slice(0, limit);
+  const hasMore = visible.length >= limit && limit < MAX_LIMIT;
+
+  // Hydrate only the visible page, preserving candidate (publishedAt desc) order.
+  const articleRows = visible.length
+    ? await db.article.findMany({
+        where: { id: { in: visible.map((v) => v.id) } },
+        include: { articleStock: { include: { stock: { select: { id: true, ticker: true } } } } },
+      })
+    : [];
+  const rowById = new Map(articleRows.map((a) => [a.id, a]));
+  const finalList = visible.flatMap(({ id, topScore }) => {
+    const article = rowById.get(id);
+    if (!article) return [];
+    return [{ article, tickers: article.articleStock.map((as) => as.stock), topScore }];
+  });
 
   return (
     <div className="space-y-6">
@@ -152,7 +173,7 @@ export default async function NewsFeedPage({
         </Card>
       ) : (
         <div className="grid gap-3">
-          {finalList.map(({ article, tickers, topSentiment }) => (
+          {finalList.map(({ article, tickers, topScore }) => (
             <Card key={article.id}>
               <CardHeader className="pb-2">
                 <div className="flex flex-col-reverse sm:flex-row sm:items-start sm:justify-between gap-2 sm:gap-4">
@@ -167,7 +188,7 @@ export default async function NewsFeedPage({
                     </a>
                   </CardTitle>
                   <div className="self-start">
-                    <SentimentBadge score={topSentiment?.score} />
+                    <SentimentBadge score={topScore} />
                   </div>
                 </div>
               </CardHeader>

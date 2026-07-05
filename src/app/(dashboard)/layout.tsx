@@ -4,7 +4,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { Separator } from "@/components/ui/separator";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { PipelineStatusBadge } from "@/components/pipeline-status-badge";
-import { UserButton } from "@clerk/nextjs";
+import { ClerkProvider, UserButton } from "@clerk/nextjs";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { db } from "@/lib/db";
 
@@ -19,22 +19,26 @@ export default async function DashboardLayout({ children }: { children: React.Re
     select: { date: true },
   });
 
+  // ClerkProvider lives here (not the root layout) so only signed-in surfaces
+  // ship Clerk's client bundle — see the root layout note.
   return (
-    <SidebarProvider>
-      <AppSidebar isAdmin={isAdmin} />
-      <SidebarInset>
-        <header className="flex h-14 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="h-4" />
-          <span className="font-semibold text-sm">TraderNews</span>
-          <div className="ml-auto flex items-center gap-2 sm:gap-3">
-            <PipelineStatusBadge lastRun={lastSentiment?.date ?? null} isAdmin={isAdmin} />
-            <ThemeToggle />
-            <UserButton />
-          </div>
-        </header>
-        <main className="flex-1 p-4 sm:p-6">{children}</main>
-      </SidebarInset>
-    </SidebarProvider>
+    <ClerkProvider>
+      <SidebarProvider>
+        <AppSidebar isAdmin={isAdmin} />
+        <SidebarInset>
+          <header className="flex h-14 items-center gap-2 border-b px-4">
+            <SidebarTrigger className="-ml-1" />
+            <Separator orientation="vertical" className="h-4" />
+            <span className="font-semibold text-sm">TraderNews</span>
+            <div className="ml-auto flex items-center gap-2 sm:gap-3">
+              <PipelineStatusBadge lastRun={lastSentiment?.date ?? null} isAdmin={isAdmin} />
+              <ThemeToggle />
+              <UserButton />
+            </div>
+          </header>
+          <main className="flex-1 p-4 sm:p-6">{children}</main>
+        </SidebarInset>
+      </SidebarProvider>
+    </ClerkProvider>
   );
 }

@@ -79,6 +79,9 @@ model Article {
   publishedAt  DateTime
   createdAt    DateTime       @default(now())
   articleStock ArticleStock[]
+
+  @@index([publishedAt])
+  @@index([headline])
 }
 
 model ArticleStock {
@@ -95,6 +98,7 @@ model ArticleStock {
 
   @@unique([articleId, stockId])
   @@index([stockId])
+  @@index([articleId])
 }
 
 model Sentiment {
@@ -112,6 +116,7 @@ model Sentiment {
   createdAt          DateTime @default(now())
 
   @@index([stockId, date])
+  @@index([date])
 }
 
 model QuantAnalysis {
