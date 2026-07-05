@@ -1,7 +1,9 @@
 import { notFound } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
+import { formatDistanceToNow } from "@/lib/format-date";
 import { isAdmin } from "@/lib/auth";
 import { Hint, HINT_TEXT } from "@/components/hint";
 import { cn } from "@/lib/utils";
@@ -262,7 +264,16 @@ export default async function CalibrationPage() {
   // Operator view — the signals/books it audits are app-level, not per-user.
   if (!isAdmin(user)) notFound();
 
-  const report = await loadCalibrationReport();
+  // Serve the pipeline's daily snapshot (the calibrate stage refreshes it every
+  // run); recomputing from all estimates + quant rows on page load is reserved
+  // for the empty state before the first snapshot exists.
+  const snapshot = await db.calibrationSnapshot.findFirst({
+    orderBy: { date: "desc" },
+    select: { report: true },
+  });
+  const report = snapshot
+    ? (snapshot.report as unknown as CalibrationReport)
+    : await loadCalibrationReport();
 
   if (report.estimateCount === 0) {
     return (
@@ -288,6 +299,10 @@ export default async function CalibrationPage() {
   return (
     <div className="space-y-6">
       <Header />
+
+      <p className="text-xs text-muted-foreground">
+        Report computed {formatDistanceToNow(new Date(report.generatedAt))} by the pipeline&apos;s calibrate stage.
+      </p>
 
       {/* Coverage summary */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

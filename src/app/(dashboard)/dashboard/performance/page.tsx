@@ -8,7 +8,7 @@ import { isAdmin } from "@/lib/auth";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, realizedFromFills, type Strategy, type ClosedTrade } from "@/lib/paper-trading";
 import { isPaperTradingConfigured, getAccountActivities } from "@/lib/alpaca-trading";
-import { PerformanceEquityChart } from "@/components/performance-equity-chart";
+import { PerformanceEquityChart } from "@/components/lazy-charts";
 import { RefreshCountdown } from "@/components/refresh-countdown";
 import { Hint, HINT_TEXT } from "@/components/hint";
 import { BOOK_META, type BookKey, type EquityPoint } from "@/lib/performance-books";
@@ -65,10 +65,26 @@ export default async function PerformancePage() {
   if (!isAdmin(user)) notFound();
 
   // Signal performance is a global property of the app's signals (not per-user), so
-  // these books span the whole watched universe.
-  const [snapshots, closedPositions, recentClosed, openPositions, recentOrders] = await Promise.all([
-    db.paperEquitySnapshot.findMany({ orderBy: { date: "asc" } }),
-    db.simPosition.findMany({ where: { status: "CLOSED" }, select: { strategy: true, realizedPnl: true } }),
+  // these books span the whole watched universe. Chart history is capped to a year
+  // so the page doesn't grow unbounded; closed-position stats come from DB aggregates.
+  // eslint-disable-next-line react-hooks/purity -- server component, fresh render per request
+  const chartSince = new Date(Date.now() - 365 * 86_400_000);
+  const [snapshots, firstAlpacaSnap, closedByStrategy, winsByStrategy, recentClosed, openPositions, recentOrders] = await Promise.all([
+    db.paperEquitySnapshot.findMany({ where: { date: { gte: chartSince } }, orderBy: { date: "asc" } }),
+    // The Alpaca card's return baseline is its first-ever snapshot, which the
+    // capped chart window above may not include.
+    db.paperEquitySnapshot.findFirst({ where: { book: "ALPACA" }, orderBy: { date: "asc" }, select: { equity: true } }),
+    db.simPosition.groupBy({
+      by: ["strategy"],
+      where: { status: "CLOSED" },
+      _count: { _all: true },
+      _sum: { realizedPnl: true },
+    }),
+    db.simPosition.groupBy({
+      by: ["strategy"],
+      where: { status: "CLOSED", realizedPnl: { gt: 0 } },
+      _count: { _all: true },
+    }),
     db.simPosition.findMany({
       where: { status: "CLOSED" },
       orderBy: { exitDate: "desc" },
@@ -137,15 +153,18 @@ export default async function PerformancePage() {
   const latestByBook = new Map<BookKey, (typeof snapshots)[number]>();
   for (const s of snapshots) latestByBook.set(s.book as BookKey, s); // ascending → last wins
 
-  // Hit-rate + realized P&L per strategy from closed positions.
+  // Hit-rate + realized P&L per strategy from the closed-position aggregates.
   const statsByStrategy = new Map<Strategy, { closed: number; wins: number; realized: number }>();
   for (const strat of ALL_STRATEGIES) statsByStrategy.set(strat, { closed: 0, wins: 0, realized: 0 });
-  for (const p of closedPositions) {
-    const st = statsByStrategy.get(p.strategy as Strategy);
+  for (const row of closedByStrategy) {
+    const st = statsByStrategy.get(row.strategy as Strategy);
     if (!st) continue;
-    st.closed++;
-    st.realized += p.realizedPnl ?? 0;
-    if ((p.realizedPnl ?? 0) > 0) st.wins++;
+    st.closed = row._count._all;
+    st.realized = row._sum.realizedPnl ?? 0;
+  }
+  for (const row of winsByStrategy) {
+    const st = statsByStrategy.get(row.strategy as Strategy);
+    if (st) st.wins = row._count._all;
   }
   const openCountByStrategy = new Map<Strategy, number>();
   const unrealizedByStrategy = new Map<Strategy, number>();
@@ -160,7 +179,7 @@ export default async function PerformancePage() {
     unrealizedByStrategy.set(strat, (unrealizedByStrategy.get(strat) ?? 0) + p.qty * (mark - p.entryPrice));
   }
   // Total realized P&L across every closed sim position (all books).
-  const totalRealized = closedPositions.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+  const totalRealized = closedByStrategy.reduce((s, row) => s + (row._sum.realizedPnl ?? 0), 0);
   // Only rate strategies whose book has data — keeps the risk-managed rows hidden
   // until PAPER_RISK_BOOKS=1 has produced snapshots for them.
   const ratedStrategies = ALL_STRATEGIES.filter((s) => booksPresent.has(STRATEGY_BOOK[s]));
@@ -169,7 +188,7 @@ export default async function PerformancePage() {
     const meta = BOOK_META.find((b) => b.key === key)!;
     const latest = latestByBook.get(key)!;
     const isSim = key !== "ALPACA";
-    const baseline = isSim ? SIM_STARTING_EQUITY : (snapshots.find((s) => s.book === key)?.equity ?? null);
+    const baseline = isSim ? SIM_STARTING_EQUITY : (firstAlpacaSnap?.equity ?? null);
     const returnPct = baseline && baseline !== 0 ? (latest.equity / baseline - 1) * 100 : null;
     return { key, meta, latest, returnPct };
   });

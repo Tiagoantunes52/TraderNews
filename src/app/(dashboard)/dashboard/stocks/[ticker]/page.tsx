@@ -7,7 +7,7 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { formatDistanceToNow } from "@/lib/format-date";
 import { WatchlistToggleButton } from "@/components/watchlist-toggle-button";
-import { SentimentHistoryChart } from "@/components/sentiment-history-chart";
+import { SentimentHistoryChart } from "@/components/lazy-charts";
 import { CongressTradeList } from "@/components/congress-trade-list";
 import { Hint, HINT_TEXT } from "@/components/hint";
 import { cn } from "@/lib/utils";

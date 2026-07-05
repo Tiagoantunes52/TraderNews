@@ -40,7 +40,7 @@ import {
   isInsiderBookEnabled,
   isBrokerStopsEnabled,
   utcDaysBetween,
-  summarizeBook,
+  unrealizedPnl,
   confidenceNotional,
   riskSizedNotional,
   riskDistancePct,
@@ -504,14 +504,34 @@ async function linkArticlesToStocks(
     await db.articleStock.createMany({ data: plainLinks, skipDuplicates: true });
     tags += plainLinks.length;
   }
-  for (const { articleId, stockId, score, relevance } of sentimentLinks) {
-    await db.articleStock.upsert({
-      where: { articleId_stockId: { articleId, stockId } },
-      create: { articleId, stockId, sentimentScore: score, sentimentRelevance: relevance },
-      update: { sentimentScore: score, sentimentRelevance: relevance },
+  // Bulk path instead of per-row upserts: diff against the existing links, then
+  // createMany the new ones and update only rows whose score actually changed —
+  // in the steady state (the 7-day news window re-scanned every run, with AV
+  // scores static per article) that's a single read + zero writes.
+  if (sentimentLinks.length > 0) {
+    const existing = await db.articleStock.findMany({
+      where: { articleId: { in: [...new Set(sentimentLinks.map((l) => l.articleId))] } },
+      select: { articleId: true, stockId: true, sentimentScore: true, sentimentRelevance: true },
     });
+    const existingByPair = new Map(existing.map((e) => [`${e.articleId}|${e.stockId}`, e]));
+    const toCreate: Array<{ articleId: string; stockId: string; sentimentScore: number; sentimentRelevance: number }> = [];
+    const toUpdate: typeof sentimentLinks = [];
+    for (const l of sentimentLinks) {
+      const ex = existingByPair.get(`${l.articleId}|${l.stockId}`);
+      if (!ex) toCreate.push({ articleId: l.articleId, stockId: l.stockId, sentimentScore: l.score, sentimentRelevance: l.relevance });
+      else if (ex.sentimentScore !== l.score || ex.sentimentRelevance !== l.relevance) toUpdate.push(l);
+    }
+    // skipDuplicates covers a concurrent run inserting the same pair between the
+    // read above and this write.
+    if (toCreate.length > 0) await db.articleStock.createMany({ data: toCreate, skipDuplicates: true });
+    for (const { articleId, stockId, score, relevance } of toUpdate) {
+      await db.articleStock.update({
+        where: { articleId_stockId: { articleId, stockId } },
+        data: { sentimentScore: score, sentimentRelevance: relevance },
+      });
+    }
+    tags += sentimentLinks.length;
   }
-  tags += sentimentLinks.length;
   return tags;
 }
 
@@ -862,26 +882,65 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
     const eAt = todayEstimateAt.get(s.id);
     return !eAt || eAt.getTime() < sAt.getTime();
   });
+  const worklistIds = worklist.map((s) => s.id);
+
+  // Batch the per-stock reads for the whole worklist up front — the work loop
+  // below then only writes. The quant window is bounded (quant runs right before
+  // this stage, so the two most recent rows are always inside it).
+  const quantWindowStart = new Date(to.getTime() - 60 * 86_400_000);
+  const [sentimentRows, quantRows, articleLinks24h, oldEstimateRows, prevEstimateRows] = worklistIds.length
+    ? await Promise.all([
+        db.sentiment.findMany({
+          where: { stockId: { in: worklistIds } },
+          orderBy: { date: "desc" },
+          distinct: ["stockId"],
+          select: { stockId: true, score: true, confidence: true, articleCount: true },
+        }),
+        db.quantAnalysis.findMany({
+          where: { stockId: { in: worklistIds }, date: { gte: quantWindowStart } },
+          orderBy: { date: "desc" },
+          select: { stockId: true, score: true, volatility30d: true, daysToEarnings: true, rsi14: true },
+        }),
+        db.articleStock.groupBy({
+          by: ["stockId"],
+          where: { stockId: { in: worklistIds }, article: { publishedAt: { gte: yesterday } } },
+          _count: { _all: true },
+        }),
+        db.stockEstimate.findMany({
+          where: { stockId: { in: worklistIds }, date: { lte: sevenDaysAgo } },
+          orderBy: { date: "desc" },
+          distinct: ["stockId"],
+          select: { stockId: true, combinedScore: true },
+        }),
+        db.stockEstimate.findMany({
+          where: { stockId: { in: worklistIds } },
+          orderBy: { date: "desc" },
+          distinct: ["stockId"],
+          select: { stockId: true, id: true, signal: true, date: true },
+        }),
+      ])
+    : [[], [], [], [], []];
+  const sentimentByStock = new Map(sentimentRows.map((r) => [r.stockId, r]));
+  // Two most recent quant rows per stock: today's (for the score) and the
+  // previous one (for RSI-cross detection). Rows arrive date-desc.
+  const recentQuantByStock = new Map<string, typeof quantRows>();
+  for (const q of quantRows) {
+    const arr = recentQuantByStock.get(q.stockId);
+    if (!arr) recentQuantByStock.set(q.stockId, [q]);
+    else if (arr.length < 2) arr.push(q);
+  }
+  const count24hByStock = new Map(articleLinks24h.map((r) => [r.stockId, r._count._all]));
+  const oldEstimateByStock = new Map(oldEstimateRows.map((r) => [r.stockId, r]));
+  const prevEstimateByStock = new Map(prevEstimateRows.map((r) => [r.stockId, r]));
 
   const outcome = await processWithBudget(
     worklist,
     async (stock) => {
       try {
-        const latestSentiment = await db.sentiment.findFirst({
-          where: { stockId: stock.id },
-          orderBy: { date: "desc" },
-          select: { score: true, confidence: true, articleCount: true },
-        });
+        const latestSentiment = sentimentByStock.get(stock.id);
         if (!latestSentiment) return; // can't estimate without sentiment; attempted
 
-        // Two most recent quant rows: today's (for the score) and the previous
-        // one (for RSI-cross detection).
-        const recentQuant = await db.quantAnalysis.findMany({
-          where: { stockId: stock.id },
-          orderBy: { date: "desc" },
-          take: 2,
-          select: { score: true, volatility30d: true, daysToEarnings: true, rsi14: true },
-        });
+        const recentQuant = recentQuantByStock.get(stock.id) ?? [];
         const latestQuant = recentQuant[0] ?? null;
         const prevRsi = recentQuant[1]?.rsi14 ?? null;
 
@@ -892,9 +951,7 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
         const daysToEarnings = latestQuant?.daysToEarnings ?? null;
 
         // Article velocity: last-24h count vs daily average over the 7-day window.
-        const last24hCount = await db.article.count({
-          where: { articleStock: { some: { stockId: stock.id } }, publishedAt: { gte: yesterday } },
-        });
+        const last24hCount = count24hByStock.get(stock.id) ?? 0;
         const articleVelocityRatio = articleCount > 0 ? last24hCount / (articleCount / 7) : null;
 
         // Dynamic blending based on article count and volatility
@@ -933,22 +990,14 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
         confidence = Math.max(0.1, Math.min(1.0, confidence + (articleCount >= 10 ? 0.15 : 0)));
 
         // Sentiment delta vs 7 days ago
-        const oldEstimate = await db.stockEstimate.findFirst({
-          where: { stockId: stock.id, date: { lte: sevenDaysAgo } },
-          orderBy: { date: "desc" },
-          select: { combinedScore: true },
-        });
+        const oldEstimate = oldEstimateByStock.get(stock.id) ?? null;
         const sentimentDelta = oldEstimate ? combinedScore - oldEstimate.combinedScore : null;
 
         // Latest existing estimate: its signal is the baseline for signal-change
         // detection (including an intraday flip when we refresh today's row), and
         // when it's today's row we update it in place — one estimate per stock per
         // UTC day, so no stale snapshot is left behind when sentiment moves.
-        const prevEstimate = await db.stockEstimate.findFirst({
-          where: { stockId: stock.id },
-          orderBy: { date: "desc" },
-          select: { id: true, signal: true, date: true },
-        });
+        const prevEstimate = prevEstimateByStock.get(stock.id) ?? null;
 
         const signal = scoreToSignal(combinedScore);
         const data = {
@@ -1694,20 +1743,26 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // it must land only once the day's reconciliation has succeeded.
   const snapshotStrategy = async (strategy: Strategy) => {
     try {
-      const [closed, open] = await Promise.all([
-        db.simPosition.findMany({ where: { strategy, status: "CLOSED" }, select: { realizedPnl: true } }),
+      // Closed history only matters as Σrealized here — aggregate it in the DB
+      // instead of loading every closed row (this runs per book, every day).
+      const [closedAgg, open] = await Promise.all([
+        db.simPosition.aggregate({ where: { strategy, status: "CLOSED" }, _sum: { realizedPnl: true } }),
         db.simPosition.findMany({
           where: { strategy, status: "OPEN" },
           select: { qty: true, entryPrice: true, lastMarkPrice: true },
         }),
       ]);
-      const summary = summarizeBook(closed, open);
+      const realized = closedAgg._sum.realizedPnl ?? 0;
+      const unrealized = open.reduce(
+        (s, p) => s + unrealizedPnl(p.qty, p.entryPrice, p.lastMarkPrice ?? p.entryPrice),
+        0
+      );
       const book = STRATEGY_BOOK[strategy];
       const data = {
-        equity: summary.equity,
-        realizedPnl: summary.realizedPnl,
-        unrealizedPnl: summary.unrealizedPnl,
-        openPositions: summary.openPositions,
+        equity: SIM_STARTING_EQUITY + realized + unrealized,
+        realizedPnl: realized,
+        unrealizedPnl: unrealized,
+        openPositions: open.length,
       };
       await db.paperEquitySnapshot.upsert({
         where: { book_date: { book, date: todayUTC } },
