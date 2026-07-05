@@ -76,3 +76,29 @@ jobs:
           done
           echo "congress stage did not finish within $MAX_POLLS polls"
           exit 1
+
+      # Private-company news watch (issue #63) shares this daily cadence too:
+      # Google News RSS moves slowly enough that once a day is plenty, and the
+      # stage is idempotent (URL-deduped inserts), so reruns are free. Runs with
+      # `if: always()` because it shares nothing with the two steps above — an
+      # insider/congress API failure shouldn't starve the news radar.
+      - name: Run private-companies stage
+        if: always()
+        run: |
+          i=0
+          while [ "$i" -lt "$MAX_POLLS" ]; do
+            i=$((i + 1))
+            resp=$(curl -fsS -X POST "$APP_URL/api/pipeline/private-companies" \
+              -H "x-pipeline-secret: $PIPELINE_SECRET" \
+              -H "x-pipeline-run-id: $RUN_ID") || {
+                echo "private-companies: HTTP call failed (poll $i)"; exit 1; }
+            echo "poll $i: $resp"
+            done=$(printf '%s' "$resp" | jq -r '.done // empty')
+            if [ "$done" = "true" ]; then
+              echo "private-companies stage complete after $i poll(s)"
+              exit 0
+            fi
+            sleep "$POLL_DELAY"
+          done
+          echo "private-companies stage did not finish within $MAX_POLLS polls"
+          exit 1
