@@ -342,6 +342,13 @@ model SimPosition {
   exitPrice    Float?
   realizedPnl  Float?
 
+  // Why the trade happened. The reconcilers compute all three and the daily review
+  // audits against them; before they existed the reason was discarded, so rows
+  // predating this are null and the review treats null as "pre-instrumentation".
+  entrySignal String? // scoreToSignal label at entry (BUY | STRONG_BUY)
+  entryScore  Float? // this strategy's source score at entry (drives the decay audit)
+  exitReason  String? // STOP | TRAIL | SIGNAL | DECAY | TIME | HOLD_EXPIRY
+
   // Risk-managed (_RM) overlay state; null/0 on the pure books that don't use it.
   peakPrice     Float? // running max since entry — drives the trailing stop
   bearishStreak Int    @default(0) // consecutive bearish runs — confirmed-signal exit
@@ -451,6 +458,27 @@ model CalibrationSnapshot {
   combinedIc     Float? // combined-score IC at the gate horizon
   report         Json // full CalibrationReport
   createdAt      DateTime @default(now())
+
+  @@unique([date])
+}
+
+// Daily post-close self-audit — "did the app do what its own rules say it should?".
+// One row per UTC trading day, written by two stages an hour apart:
+//   • the paper stage appends `paperRun` — the decision log for its run (the exact
+//     inputs each (stock, strategy) was judged on, plus the action taken). Without
+//     it the review can only infer intent from the mutated end state; with it the
+//     pure reconcilers can be replayed against identical inputs and diffed.
+//   • the review stage fills `report` — the findings, plus the health/tuning rollups.
+// `status` and `findingCount` are denormalized out of `report` so the dashboard and
+// the report API can list days without deserializing every payload.
+model DailyReview {
+  id           String   @id @default(cuid())
+  date         DateTime // start of UTC day
+  paperRun     Json? // PaperRunLog — written by the paper stage
+  report       Json? // DailyReviewReport — written by the review stage
+  status       String? // OK | WARN | FAIL
+  findingCount Int      @default(0)
+  createdAt    DateTime @default(now())
 
   @@unique([date])
 }

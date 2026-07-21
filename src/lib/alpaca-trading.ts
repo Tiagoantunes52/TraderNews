@@ -374,14 +374,31 @@ export async function getClock(): Promise<AlpacaClock> {
 }
 
 /**
- * Trading days (YYYY-MM-DD) in [start, end], from the market calendar — includes
- * early-close days, excludes weekends AND holidays. Feeds the missed-paper-day
- * dead-man's check so holidays don't false-alarm.
+ * One trading session. `open`/`close` are ET wall-clock "HH:MM" exactly as Alpaca
+ * returns them — an early close reads "13:00". Turning those into an absolute
+ * instant needs the ET offset for that date; see sessionCloseUtc in market-hours.
+ */
+export type AlpacaCalendarDay = { date: string; open: string; close: string };
+
+/**
+ * Trading sessions in [start, end] from the market calendar — includes early-close
+ * days, excludes weekends AND holidays. The close times are what let the post-close
+ * review fire an hour after the *actual* close on a half-day.
+ */
+export async function getCalendarDays(start: Date, end: Date): Promise<AlpacaCalendarDay[]> {
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  const raw = await apiGet<Array<{ date: string; open?: string; close?: string }>>(
+    `/v2/calendar?start=${day(start)}&end=${day(end)}`
+  );
+  return raw.map((c) => ({ date: c.date, open: c.open ?? "09:30", close: c.close ?? "16:00" }));
+}
+
+/**
+ * Trading days (YYYY-MM-DD) in [start, end]. Feeds the missed-paper-day dead-man's
+ * check, which only cares whether a session existed, not when it ended.
  */
 export async function getCalendar(start: Date, end: Date): Promise<string[]> {
-  const day = (d: Date) => d.toISOString().slice(0, 10);
-  const raw = await apiGet<Array<{ date: string }>>(`/v2/calendar?start=${day(start)}&end=${day(end)}`);
-  return raw.map((c) => c.date);
+  return (await getCalendarDays(start, end)).map((c) => c.date);
 }
 
 export type AlpacaFill = { symbol: string; side: "buy" | "sell"; qty: number; price: number; time: string };
