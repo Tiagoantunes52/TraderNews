@@ -103,7 +103,7 @@ See **`.env.example`** for the full, annotated list. The essentials:
 | Data sources | `FINNHUB_API_KEY`, `MARKETAUX_API_KEY`, `ALPHAVANTAGE_API_KEY`, `TIINGO_API_KEY`, `COINGECKO_API_KEY`, `ALPACA_API_KEY_ID/SECRET`, `AINVEST_API_KEY`, `SEC_USER_AGENT` (most optional) |
 | Pipeline | `PIPELINE_SECRET`, `CRON_SECRET` |
 | Paper trading | `ALPACA_PAPER_API_KEY_ID/SECRET`, plus the optional `PAPER_*` knobs |
-| Email / Observability | `RESEND_API_KEY`, `SENTRY_DSN`, `AXIOM_TOKEN`/`AXIOM_DATASET` |
+| Email / Observability | `RESEND_API_KEY` + `ALERT_FROM_EMAIL` (both needed, or sends no-op), `SENTRY_DSN`, `AXIOM_TOKEN`/`AXIOM_DATASET` |
 
 ---
 

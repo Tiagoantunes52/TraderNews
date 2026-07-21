@@ -1,0 +1,54 @@
+name: Daily Review
+
+# BACKUP trigger for the post-close self-audit. The PRIMARY trigger is pg_cron
+# inside Supabase (job `daily-review-tick`, see the migration
+# 20260721180500_daily_review_pg_cron) — GitHub's scheduler is best-effort and has
+# already been observed drifting more than an hour, which is precisely how the
+# paper stage missed two consecutive trade windows in July 2026.
+#
+# These two entries bracket the regular close in both DST regimes: 16:00 ET is
+# 20:00 UTC in EDT and 21:00 in EST, so +1h is 21:00/22:00 UTC. They deliberately
+# do NOT try to cover early closes — that's what the dense pg_cron tick is for.
+# Landing outside the window is harmless: the stage self-gates and no-ops.
+on:
+  schedule:
+    - cron: "13 21 * * 1-5"  # ~1h after the 20:00 UTC (EDT) close
+    - cron: "13 22 * * 1-5"  # ~1h after the 21:00 UTC (EST) close
+  workflow_dispatch:          # manual trigger from the Actions UI
+
+concurrency:
+  group: daily-review
+  cancel-in-progress: false
+
+jobs:
+  run-review:
+    runs-on: ubuntu-latest
+    environment: Production
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
+      RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check secrets are set
+        run: |
+          if [ -z "$APP_URL" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "$PIPELINE_SECRET" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+          echo "APP_URL is set (length: ${#APP_URL})"
+
+      # Single-shot: the stage always returns {"done": true}, so there's nothing to
+      # poll. `reviewed` says whether it actually produced a report — false means
+      # the call landed outside the post-close window or the day was already done,
+      # both of which are normal for a backup trigger and must not fail the job.
+      - name: Run review stage
+        run: |
+          resp=$(curl -fsS -X POST "$APP_URL/api/pipeline/review" \
+            -H "x-pipeline-secret: $PIPELINE_SECRET" \
+            -H "x-pipeline-run-id: $RUN_ID") || {
+              echo "review: HTTP call failed"; exit 1; }
+          echo "$resp"
+          reviewed=$(printf '%s' "$resp" | jq -r '.reviewed // empty')
+          if [ "$reviewed" = "true" ]; then
+            echo "review complete: status=$(printf '%s' "$resp" | jq -r '.status')"
+          else
+            echo "review skipped (outside the post-close window, or already done today)"
+          fi

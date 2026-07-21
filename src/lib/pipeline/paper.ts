@@ -42,6 +42,7 @@ import {
   type BookExposure,
 } from "@/lib/portfolio-risk";
 import { loadTradingConfig } from "@/lib/trading-config";
+import type { DecisionRecord, PaperRunLog } from "@/lib/daily-review";
 import { buildConfidenceCalibrator, isConfCalibrationEnabled } from "@/lib/confidence-calibration";
 import { PRIMARY_HORIZON, type CalibrationReport } from "@/lib/calibration-data";
 import {
@@ -146,6 +147,10 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // Account / trading-health alerts (issue #56) accumulated across the run, then
   // persisted + emailed to admins once at the end (the daily guard fires them once).
   const accountAlerts: AlertDraft[] = [];
+  // Decision log for the post-close review: the exact inputs behind every call the
+  // stage makes, so an hour later the pure reconcilers can be replayed against them
+  // and diffed. Without it the review only sees state this stage already mutated.
+  const decisions: DecisionRecord[] = [];
 
   const to = new Date();
   const todayUTC = startOfUtcDay(to);
@@ -427,6 +432,24 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const signal = scoreToSignal(score);
       const open = openByKey.get(`${est.stockId}|${strategy}`) ?? null;
 
+      // The open state as the reconciler sees it — captured here so the decision log
+      // records the inputs rather than the post-run state they get overwritten with.
+      const openState = open
+        ? {
+            qty: open.qty,
+            entryPrice: open.entryPrice,
+            peakPrice: open.peakPrice ?? open.entryPrice,
+            bearishStreak: open.bearishStreak,
+            staleStreak: open.staleStreak,
+            entryAtrPct: open.entryAtrPct,
+          }
+        : null;
+      const runsSinceEntry = open ? utcDaysBetween(open.entryDate, todayUTC) : 0;
+      // First action today? The streak only advances on a new UTC day, so a
+      // same-day retry (after a partial failure) can't double-count it.
+      const isNewRun = open ? startOfUtcDay(open.lastMarkDate) < todayUTC : true;
+      const decisionConfidence = STRATEGY_IS_RM[strategy] ? rmConfidence : est.confidence;
+
       let action: PositionAction;
       if (STRATEGY_IS_RM[strategy]) {
         action = reconcileRiskManaged({
@@ -435,25 +458,39 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           price,
           confidence: rmConfidence,
           atrPct,
-          runsSinceEntry: open ? utcDaysBetween(open.entryDate, todayUTC) : 0,
-          // First action today? The streak only advances on a new UTC day, so a
-          // same-day retry (after a partial failure) can't double-count it.
-          isNewRun: open ? startOfUtcDay(open.lastMarkDate) < todayUTC : true,
-          open: open
-            ? {
-                qty: open.qty,
-                entryPrice: open.entryPrice,
-                peakPrice: open.peakPrice ?? open.entryPrice,
-                bearishStreak: open.bearishStreak,
-                staleStreak: open.staleStreak,
-                entryAtrPct: open.entryAtrPct,
-              }
-            : null,
+          runsSinceEntry,
+          isNewRun,
+          open: openState,
           cfg,
         });
       } else {
         action = reconcilePosition(signal, price, est.confidence, open);
       }
+
+      // Log the rules' verdict before the portfolio gate can override it, so the
+      // replay compares like with like; `riskBlocked` records the override itself.
+      const decision: DecisionRecord = {
+        stockId: est.stockId,
+        ticker: est.stock.ticker,
+        strategy,
+        inputs: {
+          score,
+          signal,
+          price,
+          confidence: decisionConfidence,
+          atrPct,
+          runsSinceEntry,
+          isNewRun,
+          open: openState,
+        },
+        action:
+          action.type === "OPEN"
+            ? { type: "OPEN", qty: action.qty, price: action.price }
+            : action.type === "CLOSE"
+              ? { type: "CLOSE", price: action.price, reason: action.reason ?? null }
+              : { type: action.type },
+      };
+      decisions.push(decision);
 
       // Portfolio-level gate: block a fresh _RM open that would breach a cap or the
       // drawdown kill-switch. Must run before the COMBINED_RM capture so a blocked
@@ -466,6 +503,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             br.positions.push(candidate); // reserve so later opens this run see it
           } else {
             action = { type: "NONE" };
+            decision.riskBlocked = true;
           }
         }
       }
@@ -488,7 +526,11 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               entryDate: to,
               entryPrice: action.price,
               // Persist the confidence that actually sized the position.
-              confidence: STRATEGY_IS_RM[strategy] ? rmConfidence : est.confidence,
+              confidence: decisionConfidence,
+              // The justification for the entry, frozen here: today's estimate row
+              // gets overwritten, so a later join can't recover what we acted on.
+              entrySignal: signal,
+              entryScore: score,
               lastMarkDate: to,
               lastMarkPrice: action.price,
               peakPrice: action.price,
@@ -508,6 +550,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               realizedPnl: action.realizedPnl,
               lastMarkDate: to,
               lastMarkPrice: action.price,
+              // The pure books have only one way out — the signal flipped off a buy —
+              // so they carry SIGNAL; the _RM ladder names the rung that fired.
+              exitReason: action.reason ?? "SIGNAL",
             },
           });
           simClosed++;
@@ -610,7 +655,8 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           if (action.type === "CLOSE") {
             await db.simPosition.update({
               where: { id: p.id },
-              data: { status: "CLOSED", exitDate: to, exitPrice: action.price, realizedPnl: action.realizedPnl, lastMarkDate: to, lastMarkPrice: action.price },
+              // Time is the event book's only exit, so the rung is never ambiguous.
+              data: { status: "CLOSED", exitDate: to, exitPrice: action.price, realizedPnl: action.realizedPnl, lastMarkDate: to, lastMarkPrice: action.price, exitReason: "HOLD_EXPIRY" },
             });
             simClosed++;
           } else if (action.type === "MARK") {
@@ -902,6 +948,34 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       reportError("paper_alpaca_book_failed", e, { stage: "paper" });
       if (riskLimitsOn) accountAlerts.push(detectBrokerUnreachable());
     }
+  }
+
+  // Hand the decision log to the post-close review (see DailyReview in the schema).
+  // Best-effort and last: the review degrades to invariant checks without it, so a
+  // failure here must never cost the day's trading its result.
+  try {
+    const runLog: PaperRunLog = {
+      version: 1,
+      ranAt: to.toISOString(),
+      flags: {
+        riskBooks: riskEnabled,
+        riskLimits: riskLimitsOn,
+        brokerStops: isBrokerStopsEnabled() && riskEnabled,
+        insiderBook: isInsiderBookEnabled(),
+        nearClose: isTradeNearCloseEnabled(),
+      },
+      cfg,
+      decisions,
+      errors,
+      counts: { simOpened, simClosed, ordersSubmitted },
+    };
+    await db.dailyReview.upsert({
+      where: { date: todayUTC },
+      create: { date: todayUTC, paperRun: runLog },
+      update: { paperRun: runLog },
+    });
+  } catch (e) {
+    errors.push(`Paper run log persist failed: ${String(e)}`);
   }
 
   // Persist + notify on any account/trading-health alerts raised this run.

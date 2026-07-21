@@ -12,7 +12,7 @@ import {
   SidebarHeader,
   SidebarFooter,
 } from "@/components/ui/sidebar";
-import { BarChart2, Building2, Calculator, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Compass, UserSearch, LineChart, Briefcase, Gauge } from "lucide-react";
+import { BarChart2, Building2, Calculator, ClipboardCheck, LayoutDashboard, Newspaper, Star, Settings, TrendingUp, Shield, Compass, UserSearch, LineChart, Briefcase, Gauge } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -52,6 +52,7 @@ const navSections: NavSection[] = [
     items: [
       { label: "Portfolio", href: "/dashboard/portfolio", icon: Briefcase },
       { label: "Performance", href: "/dashboard/performance", icon: LineChart },
+      { label: "Daily Review", href: "/dashboard/review", icon: ClipboardCheck },
       { label: "Calibration", href: "/dashboard/calibration", icon: Gauge },
     ],
   },

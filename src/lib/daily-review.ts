@@ -1,0 +1,945 @@
+// Pure checks for the daily post-close self-audit.
+//
+// The performance and calibration pages answer "how predictive are the signals?".
+// Nothing answered "did the machine do what its own rules say it should have done?"
+// — a protective stop that was never placed, an entry that never filled, a position
+// that met an exit condition and stayed open, a stage that ran outside its window.
+// Those are correctness bugs, and they were invisible.
+//
+// Everything here is pure and unit-tested; src/lib/pipeline/review.ts does the I/O
+// and hands the data in. Each check returns Findings rather than throwing, so one
+// unhappy check never costs you the rest of the report.
+
+import {
+  reconcilePosition,
+  reconcileRiskManaged,
+  reconcileEventPosition,
+  riskDistancePct,
+  utcDaysBetween,
+  STRATEGY_IS_RM,
+  type RiskConfig,
+  type Strategy,
+} from "@/lib/paper-trading";
+
+export type Severity = "info" | "warn" | "fail";
+
+/**
+ * One observation. `code` is stable and machine-readable so the agent reading this
+ * report can group findings across days without parsing prose; `title`/`detail` are
+ * what a human reads in the email.
+ */
+export type Finding = {
+  severity: Severity;
+  code: string;
+  title: string;
+  detail: string;
+  refs?: Record<string, string | number | boolean | null>;
+};
+
+const finding = (
+  severity: Severity,
+  code: string,
+  title: string,
+  detail: string,
+  refs?: Finding["refs"]
+): Finding => ({ severity, code, title, detail, ...(refs ? { refs } : {}) });
+
+/** Worst severity wins: any fail → FAIL, any warn → WARN, else OK. */
+export function overallStatus(findings: Finding[]): "OK" | "WARN" | "FAIL" {
+  if (findings.some((f) => f.severity === "fail")) return "FAIL";
+  if (findings.some((f) => f.severity === "warn")) return "WARN";
+  return "OK";
+}
+
+const pct = (v: number) => `${(v * 100).toFixed(2)}%`;
+const money = (v: number) => `${v < 0 ? "-" : ""}$${Math.abs(v).toFixed(2)}`;
+const near = (a: number, b: number, tol = 1e-6) => Math.abs(a - b) <= tol * Math.max(1, Math.abs(a), Math.abs(b));
+
+// ── The paper stage's decision log ────────────────────────────────────────────
+// Written by runPaperStage, replayed here. Without it the audit can only infer
+// intent from state the stage already mutated; with it the exact inputs of every
+// decision survive, so the pure reconcilers can be re-run and diffed.
+
+export type OpenState = {
+  qty: number;
+  entryPrice: number;
+  peakPrice: number;
+  bearishStreak: number;
+  staleStreak: number;
+  entryAtrPct: number | null;
+};
+
+export type DecisionInputs = {
+  score: number;
+  signal: string;
+  price: number;
+  confidence: number;
+  atrPct: number | null;
+  runsSinceEntry: number;
+  isNewRun: boolean;
+  open: OpenState | null;
+};
+
+export type LoggedAction = {
+  type: "OPEN" | "CLOSE" | "MARK" | "NONE";
+  reason?: string | null;
+  qty?: number;
+  price?: number;
+};
+
+export type DecisionRecord = {
+  stockId: string;
+  ticker: string;
+  strategy: Strategy;
+  inputs: DecisionInputs;
+  /** What the reconciler decided — BEFORE the portfolio gate had its say. */
+  action: LoggedAction;
+  /** True when the portfolio gate vetoed a would-be OPEN (so nothing was persisted). */
+  riskBlocked?: boolean;
+};
+
+export type PaperRunLog = {
+  version: 1;
+  ranAt: string;
+  flags: {
+    riskBooks: boolean;
+    riskLimits: boolean;
+    brokerStops: boolean;
+    insiderBook: boolean;
+    nearClose: boolean;
+  };
+  cfg: RiskConfig;
+  decisions: DecisionRecord[];
+  errors: string[];
+  counts: { simOpened: number; simClosed: number; ordersSubmitted: number };
+};
+
+// ── 1. Decision replay ───────────────────────────────────────────────────────
+
+/**
+ * Re-run each logged decision through the same pure reconciler with the same
+ * inputs and config, and diff. A mismatch means the persisted outcome and the
+ * rules disagree — always a bug, never a tuning question, so it's a `fail`.
+ *
+ * Uses the config captured in the log rather than today's, so a knob edited
+ * between the two stages can't manufacture a mismatch.
+ */
+export function replayDecisions(log: PaperRunLog): Finding[] {
+  const out: Finding[] = [];
+  for (const d of log.decisions) {
+    const i = d.inputs;
+    const expected = STRATEGY_IS_RM[d.strategy]
+      ? reconcileRiskManaged({
+          score: i.score,
+          signal: i.signal,
+          price: i.price,
+          confidence: i.confidence,
+          atrPct: i.atrPct,
+          runsSinceEntry: i.runsSinceEntry,
+          isNewRun: i.isNewRun,
+          open: i.open,
+          cfg: log.cfg,
+        })
+      : reconcilePosition(i.signal, i.price, i.confidence, i.open);
+
+    const actual = d.action;
+    if (expected.type !== actual.type) {
+      out.push(
+        finding(
+          "fail",
+          "REPLAY_TYPE_MISMATCH",
+          `${d.ticker} ${d.strategy}: recorded ${actual.type}, rules say ${expected.type}`,
+          `Replaying the stage's own inputs (signal ${i.signal}, score ${i.score.toFixed(3)}, price ${i.price.toFixed(2)}) through the reconciler yields ${expected.type}, but the run logged ${actual.type}. The persisted book and the strategy rules disagree.`,
+          { ticker: d.ticker, strategy: d.strategy, expected: expected.type, actual: actual.type }
+        )
+      );
+      continue;
+    }
+    if (expected.type === "CLOSE") {
+      const expectedReason = expected.reason ?? null;
+      const actualReason = actual.reason ?? null;
+      if (expectedReason !== actualReason) {
+        out.push(
+          finding(
+            "fail",
+            "REPLAY_REASON_MISMATCH",
+            `${d.ticker} ${d.strategy}: exit reason recorded as ${actualReason ?? "none"}, rules say ${expectedReason ?? "none"}`,
+            `Both agree the position closed, but the exit rung differs. The exit ladder is first-match-wins, so this means the ladder was evaluated against different state than was logged.`,
+            { ticker: d.ticker, strategy: d.strategy, expected: expectedReason, actual: actualReason }
+          )
+        );
+      }
+    }
+    if (expected.type === "OPEN" && actual.qty != null && !near(expected.qty, actual.qty, 1e-4)) {
+      out.push(
+        finding(
+          "fail",
+          "REPLAY_SIZE_MISMATCH",
+          `${d.ticker} ${d.strategy}: sized ${actual.qty.toFixed(4)} shares, rules say ${expected.qty.toFixed(4)}`,
+          `Position sizing is deterministic given confidence, stop distance and price — a divergence means one of those was not what the log recorded.`,
+          { ticker: d.ticker, strategy: d.strategy, expected: expected.qty, actual: actual.qty }
+        )
+      );
+    }
+  }
+  return out;
+}
+
+// ── 2. Invariant audit of persisted positions ────────────────────────────────
+
+export type AuditPosition = {
+  id: string;
+  ticker: string;
+  strategy: Strategy;
+  status: "OPEN" | "CLOSED";
+  qty: number;
+  entryDate: Date;
+  entryPrice: number;
+  confidence: number;
+  entryScore: number | null;
+  entrySignal: string | null;
+  entryAtrPct: number | null;
+  peakPrice: number | null;
+  bearishStreak: number;
+  staleStreak: number;
+  lastMarkDate: Date;
+  lastMarkPrice: number | null;
+  exitDate: Date | null;
+  exitPrice: number | null;
+  exitReason: string | null;
+  realizedPnl: number | null;
+};
+
+/**
+ * Check closed positions against the rung they claim to have exited on.
+ *
+ * This is the second, independent layer: the replay above proves the stage agreed
+ * with the rules *at decision time*, while these invariants hold against whatever
+ * ended up in the table — so they still catch a bad write, and they work on days
+ * with no run log at all.
+ *
+ * `cfgChangedAt` downgrades findings for positions whose life spans a config edit:
+ * the audit necessarily uses today's knobs, and a mid-flight change makes an
+ * honest exit look wrong.
+ */
+export function auditClosedPositions(
+  closed: AuditPosition[],
+  cfg: RiskConfig,
+  cfgChangedAt: Date | null
+): Finding[] {
+  const out: Finding[] = [];
+  for (const p of closed) {
+    if (!STRATEGY_IS_RM[p.strategy]) continue; // pure books exit on signal flip alone
+    if (p.exitPrice == null || p.exitReason == null) continue; // pre-instrumentation
+    const stale = cfgChangedAt != null && cfgChangedAt > p.entryDate;
+    const sev: Severity = stale ? "info" : "warn";
+    const suffix = stale
+      ? " (trading config changed during this position's life, so today's knobs may not be the ones it traded under)"
+      : "";
+    const refs = { ticker: p.ticker, strategy: p.strategy, positionId: p.id, exitReason: p.exitReason };
+
+    const stopPct = riskDistancePct(cfg, p.entryAtrPct, cfg.stopLossPct);
+    const runs = utcDaysBetween(p.entryDate, p.exitDate ?? p.lastMarkDate);
+
+    switch (p.exitReason) {
+      case "STOP": {
+        const trigger = p.entryPrice * (1 - stopPct);
+        if (p.exitPrice > trigger && !near(p.exitPrice, trigger)) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_STOP_ABOVE_TRIGGER",
+              `${p.ticker} ${p.strategy}: stopped out above its stop level`,
+              `Exit ${p.exitPrice.toFixed(2)} is above the ${pct(stopPct)} stop at ${trigger.toFixed(2)} (entry ${p.entryPrice.toFixed(2)}). A stop should only fire at or below the trigger${suffix}.`,
+              refs
+            )
+          );
+        }
+        break;
+      }
+      case "TRAIL": {
+        const armed = p.entryPrice * (1 + cfg.trailActivatePct);
+        if (p.peakPrice != null && p.peakPrice < armed && !near(p.peakPrice, armed)) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_TRAIL_NOT_ARMED",
+              `${p.ticker} ${p.strategy}: trailing stop fired before it was armed`,
+              `Peak ${p.peakPrice.toFixed(2)} never reached the ${pct(cfg.trailActivatePct)} activation at ${armed.toFixed(2)} (entry ${p.entryPrice.toFixed(2)}), yet the position exited on TRAIL${suffix}.`,
+              refs
+            )
+          );
+        }
+        if (runs < cfg.minHoldRuns) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_DURING_MIN_HOLD",
+              `${p.ticker} ${p.strategy}: TRAIL exit inside the min-hold window`,
+              `Held ${runs} run(s), min-hold is ${cfg.minHoldRuns}. Only the hard stop is allowed to fire during min-hold${suffix}.`,
+              refs
+            )
+          );
+        }
+        break;
+      }
+      case "SIGNAL": {
+        if (p.bearishStreak < cfg.signalConfirmRuns) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_SIGNAL_UNCONFIRMED",
+              `${p.ticker} ${p.strategy}: signal exit without a confirmed bearish streak`,
+              `Bearish streak was ${p.bearishStreak}, confirmation needs ${cfg.signalConfirmRuns}${suffix}.`,
+              refs
+            )
+          );
+        }
+        if (runs < cfg.minHoldRuns) {
+          out.push(
+            finding(sev, "EXIT_DURING_MIN_HOLD", `${p.ticker} ${p.strategy}: SIGNAL exit inside the min-hold window`, `Held ${runs} run(s), min-hold is ${cfg.minHoldRuns}${suffix}.`, refs)
+          );
+        }
+        break;
+      }
+      case "DECAY": {
+        if (p.exitPrice <= p.entryPrice) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_DECAY_AT_LOSS",
+              `${p.ticker} ${p.strategy}: decay exit taken at a loss`,
+              `Decay exits are only meant to bank a profit once conviction is gone — exit ${p.exitPrice.toFixed(2)} vs entry ${p.entryPrice.toFixed(2)}. Loss-side staleness belongs to the stop and time exits${suffix}.`,
+              refs
+            )
+          );
+        }
+        if (p.staleStreak < cfg.decayRuns) {
+          out.push(
+            finding(sev, "EXIT_DECAY_UNCONFIRMED", `${p.ticker} ${p.strategy}: decay exit before the stale streak matured`, `Stale streak was ${p.staleStreak}, decay needs ${cfg.decayRuns}${suffix}.`, refs)
+          );
+        }
+        break;
+      }
+      case "TIME": {
+        if (cfg.timeStopRuns > 0 && runs < cfg.timeStopRuns) {
+          out.push(
+            finding(sev, "EXIT_TIME_EARLY", `${p.ticker} ${p.strategy}: time stop fired early`, `Held ${runs} run(s), the time stop is set at ${cfg.timeStopRuns}${suffix}.`, refs)
+          );
+        }
+        const ret = p.entryPrice > 0 ? (p.exitPrice - p.entryPrice) / p.entryPrice : 0;
+        if (Math.abs(ret) > cfg.timeStopBandPct && !near(Math.abs(ret), cfg.timeStopBandPct)) {
+          out.push(
+            finding(
+              sev,
+              "EXIT_TIME_OUT_OF_BAND",
+              `${p.ticker} ${p.strategy}: time stop fired on a position that wasn't flat`,
+              `Return at exit was ${pct(ret)}, outside the ±${pct(cfg.timeStopBandPct)} dead-money band. A moving position should have exited on a different rung${suffix}.`,
+              refs
+            )
+          );
+        }
+        break;
+      }
+    }
+
+    // Realized P&L must equal qty × (exit − entry); anything else is an arithmetic
+    // or write bug, and it silently corrupts every equity curve downstream.
+    if (p.realizedPnl != null) {
+      const expected = p.qty * (p.exitPrice - p.entryPrice);
+      if (!near(expected, p.realizedPnl, 1e-4)) {
+        out.push(
+          finding(
+            "fail",
+            "REALIZED_PNL_MISMATCH",
+            `${p.ticker} ${p.strategy}: realized P&L doesn't match the fill`,
+            `Stored ${money(p.realizedPnl)}, but ${p.qty.toFixed(4)} × (${p.exitPrice.toFixed(2)} − ${p.entryPrice.toFixed(2)}) = ${money(expected)}.`,
+            refs
+          )
+        );
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Positions still open that meet an exit condition right now.
+ *
+ * Only positions the stage actually marked today are judged. A position it never
+ * looked at (no fresh estimate, no price) hasn't had its chance, and flagging it
+ * would blame the exit ladder for a data gap — that gap is reported separately,
+ * once, below. For the rest the stage evaluated this same ladder against this same
+ * mark, so a CLOSE here is a genuine missed exit: capital still at risk that the
+ * rules wanted out of.
+ */
+export function auditOpenPositions(open: AuditPosition[], cfg: RiskConfig, today: Date): Finding[] {
+  const out: Finding[] = [];
+  const unmarked: AuditPosition[] = [];
+
+  for (const p of open) {
+    const price = p.lastMarkPrice;
+    if (utcDaysBetween(p.lastMarkDate, today) >= 1) {
+      unmarked.push(p);
+      continue;
+    }
+    if (price == null) continue;
+
+    if (STRATEGY_IS_RM[p.strategy]) {
+      // Re-run with the *persisted* (post-run) streaks and isNewRun=false, which is
+      // exactly the state the stage left behind — so the ladder sees what it saw.
+      const action = reconcileRiskManaged({
+        score: p.entryScore ?? cfg.entryScoreMin + 1e-9, // score isn't stored per-run; entry score is the honest stand-in
+        signal: "NEUTRAL", // unknown post-hoc: only suppresses the SIGNAL rung, never invents one
+        price,
+        confidence: p.confidence,
+        atrPct: p.entryAtrPct,
+        runsSinceEntry: utcDaysBetween(p.entryDate, today),
+        isNewRun: false,
+        open: {
+          qty: p.qty,
+          entryPrice: p.entryPrice,
+          peakPrice: p.peakPrice ?? p.entryPrice,
+          bearishStreak: p.bearishStreak,
+          staleStreak: p.staleStreak,
+          entryAtrPct: p.entryAtrPct,
+        },
+        cfg,
+      });
+      if (action.type === "CLOSE") {
+        out.push(
+          finding(
+            "fail",
+            "MISSED_EXIT",
+            `${p.ticker} ${p.strategy}: still open but meets the ${action.reason} exit`,
+            `Marked at ${price.toFixed(2)} (entry ${p.entryPrice.toFixed(2)}, peak ${(p.peakPrice ?? p.entryPrice).toFixed(2)}), the exit ladder returns ${action.reason} — but the position is still OPEN after today's run. Capital is exposed that the rules wanted out of.`,
+            { ticker: p.ticker, strategy: p.strategy, positionId: p.id, reason: action.reason ?? null }
+          )
+        );
+      }
+    }
+
+    // Insider book: time is its only exit, so an over-held position is unambiguous.
+    if (p.strategy === "INSIDER") {
+      const held = utcDaysBetween(p.entryDate, today);
+      const action = reconcileEventPosition(price, held, cfg.insiderHoldDays, p);
+      if (action.type === "CLOSE") {
+        out.push(
+          finding(
+            "fail",
+            "MISSED_EXIT",
+            `${p.ticker} INSIDER: held past its exit date`,
+            `Held ${held} days against a ${cfg.insiderHoldDays}-day holding period; the event book's only exit is expiry, so this should have closed.`,
+            { ticker: p.ticker, strategy: p.strategy, positionId: p.id }
+          )
+        );
+      }
+    }
+
+  }
+
+  // Unmarked positions get ONE finding, not one each. They share a single root
+  // cause (the stage didn't see them), and on a bad day there are hundreds — enough
+  // to bury the failures that actually need reading.
+  if (unmarked.length > 0) {
+    const staleDays = Math.max(...unmarked.map((p) => utcDaysBetween(p.lastMarkDate, today)));
+    const names = [...new Set(unmarked.map((p) => p.ticker))];
+    const shown = names.slice(0, 12).join(", ");
+    out.push(
+      finding(
+        staleDays >= 3 ? "fail" : "warn",
+        "POSITIONS_NOT_MARKED",
+        `${unmarked.length} open position(s) were not marked today`,
+        `Across ${names.length} ticker(s) — ${shown}${names.length > 12 ? `, +${names.length - 12} more` : ""}. The oldest mark is ${staleDays} day(s) old. The exit ladder only runs on positions that get a fresh estimate and price, so these are currently unmanaged: no marks, no stops, no exits.`,
+        { positions: unmarked.length, tickers: names.length, staleDays }
+      )
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Entries that shouldn't have cleared the gate. Sizing and the entry deadband are
+ * both deterministic, so a position below either threshold means the gate was
+ * bypassed or the stored score is wrong.
+ */
+export function auditEntries(openedToday: AuditPosition[], cfg: RiskConfig): Finding[] {
+  const out: Finding[] = [];
+  for (const p of openedToday) {
+    if (!STRATEGY_IS_RM[p.strategy]) continue;
+    const refs = { ticker: p.ticker, strategy: p.strategy, positionId: p.id };
+    if (p.entryScore != null && p.entryScore <= cfg.entryScoreMin) {
+      out.push(
+        finding(
+          "warn",
+          "ENTRY_BELOW_DEADBAND",
+          `${p.ticker} ${p.strategy}: opened below the entry deadband`,
+          `Entry score ${p.entryScore.toFixed(3)} does not clear entryScoreMin ${cfg.entryScoreMin}.`,
+          refs
+        )
+      );
+    }
+    if (p.confidence < cfg.minConfidence) {
+      out.push(
+        finding(
+          "warn",
+          "ENTRY_BELOW_CONFIDENCE",
+          `${p.ticker} ${p.strategy}: opened below the confidence floor`,
+          `Sized on confidence ${p.confidence.toFixed(3)}, floor is ${cfg.minConfidence}.`,
+          refs
+        )
+      );
+    }
+  }
+  return out;
+}
+
+// ── 3. Broker reconciliation ─────────────────────────────────────────────────
+
+export type BrokerPosition = { symbol: string; qty: number; avgEntryPrice: number | null; currentPrice: number | null };
+export type BrokerOrder = { id: string; symbol: string; type: string; side: string; qty: number | null };
+export type SubmittedOrder = {
+  ticker: string;
+  side: string;
+  signal: string;
+  status: string;
+  qty: number | null;
+  filledQty: number | null;
+  filledAvgPrice: number | null;
+};
+
+/**
+ * Diff the live Alpaca account against the COMBINED_RM book it mirrors. This is
+ * where the expensive failures hide: the sim book is always internally consistent
+ * because one function writes it, while the broker is a separate system that can
+ * reject, partially fill, or quietly drop a protective order.
+ */
+export function reconcileBroker(args: {
+  brokerPositions: BrokerPosition[];
+  brokerOrders: BrokerOrder[];
+  simLong: { ticker: string; qty: number }[];
+  submittedToday: SubmittedOrder[];
+  brokerStopsEnabled: boolean;
+}): Finding[] {
+  const { brokerPositions, brokerOrders, simLong, submittedToday, brokerStopsEnabled } = args;
+  const out: Finding[] = [];
+
+  const bySymbol = new Map(brokerPositions.map((p) => [p.symbol, p]));
+  const simBySymbol = new Map(simLong.map((p) => [p.ticker, p]));
+  const protectiveBySymbol = new Map<string, BrokerOrder>();
+  for (const o of brokerOrders) {
+    if (o.side === "sell" && (o.type === "stop" || o.type === "trailing_stop")) protectiveBySymbol.set(o.symbol, o);
+  }
+
+  // Each class of drift is reported once with its full ticker list rather than
+  // once per name. A live/sim divergence is nearly always systemic — one cause,
+  // many symbols — and thirty near-identical entries bury everything else.
+  const list = (tickers: string[]) => {
+    const shown = tickers.slice(0, 12).join(", ");
+    return tickers.length > 12 ? `${shown}, +${tickers.length - 12} more` : shown;
+  };
+
+  const missing = simLong.filter((s) => !bySymbol.has(s.ticker)).map((s) => s.ticker);
+  if (missing.length > 0) {
+    out.push(
+      finding(
+        "warn",
+        "BROKER_POSITIONS_MISSING",
+        `${missing.length} sim position(s) the broker isn't holding`,
+        `COMBINED_RM is long ${list(missing)}, but the paper account is flat in them. Either those entries never filled, they were closed outside the app, or whole-share sizing skipped a name whose risk budget came to under one share. Live and sim P&L diverge for as long as this persists.`,
+        { count: missing.length, tickers: missing.join(",") }
+      )
+    );
+  }
+
+  const orphans = brokerPositions.filter((p) => !simBySymbol.has(p.symbol)).map((p) => p.symbol);
+  if (orphans.length > 0) {
+    out.push(
+      finding(
+        "warn",
+        "BROKER_POSITIONS_ORPHAN",
+        `${orphans.length} broker position(s) the strategy no longer wants`,
+        `The paper account is long ${list(orphans)} while COMBINED_RM is flat in them. The live book is carrying risk the strategy has already exited.`,
+        { count: orphans.length, tickers: orphans.join(",") }
+      )
+    );
+  }
+
+  if (brokerStopsEnabled) {
+    const unprotected = brokerPositions.filter((p) => !protectiveBySymbol.has(p.symbol)).map((p) => p.symbol);
+    if (unprotected.length > 0) {
+      out.push(
+        finding(
+          "fail",
+          "BROKER_STOPS_MISSING",
+          `${unprotected.length} open position(s) with no protective order`,
+          `Broker stops are enabled, but no resting stop or trailing stop covers ${list(unprotected)}. These are unprotected against a gap until a later run repairs them — the single most expensive failure mode this review exists to catch.`,
+          { count: unprotected.length, tickers: unprotected.join(",") }
+        )
+      );
+    }
+  }
+
+  const strayStops = [...protectiveBySymbol.keys()].filter((symbol) => !bySymbol.has(symbol));
+  if (strayStops.length > 0) {
+    out.push(
+      finding(
+        "warn",
+        "BROKER_STOPS_ORPHAN",
+        `${strayStops.length} protective order(s) resting with no position`,
+        `Sell stops are still working on ${list(strayStops)} although those positions are closed. If one fills it opens a short — which this long-only book has no way to manage.`,
+        { count: strayStops.length, tickers: strayStops.join(",") }
+      )
+    );
+  }
+
+  for (const o of submittedToday) {
+    const status = o.status.toLowerCase();
+    if (status === "rejected" || status === "canceled" || status === "cancelled" || status === "expired") {
+      out.push(
+        finding(
+          "warn",
+          "ORDER_NOT_EXECUTED",
+          `${o.ticker}: ${o.side} order ${status}`,
+          `Submitted on signal ${o.signal} and never executed. The sim books recorded the trade regardless, so live and sim P&L diverge from here.`,
+          { ticker: o.ticker, side: o.side, status: o.status }
+        )
+      );
+    } else if (status !== "filled" && o.side === "BUY") {
+      out.push(
+        finding(
+          "info",
+          "ORDER_PENDING",
+          `${o.ticker}: buy order still ${status}`,
+          `Not yet filled at review time. Normal for an order placed into the close; a finding tomorrow would not be.`,
+          { ticker: o.ticker, status: o.status }
+        )
+      );
+    }
+    if (o.filledQty != null && o.qty != null && o.filledQty > 0 && o.filledQty < o.qty) {
+      out.push(
+        finding(
+          "warn",
+          "ORDER_PARTIAL_FILL",
+          `${o.ticker}: partial fill (${o.filledQty}/${o.qty})`,
+          `The sim book assumes the full size, so position sizing diverges between the books.`,
+          { ticker: o.ticker, filledQty: o.filledQty, qty: o.qty }
+        )
+      );
+    }
+  }
+
+  return out;
+}
+
+// ── 4. Pipeline & data health ────────────────────────────────────────────────
+
+export type HealthInput = {
+  universeSize: number;
+  estimatesToday: number;
+  sentimentsToday: number;
+  quantToday: number;
+  articlesToday: number;
+  dataWarningCounts: Record<string, number>;
+  paperRanAt: Date | null;
+  marketClosedAt: Date | null;
+  paperErrors: string[];
+  missedTradingDays: string[];
+  alertsToday: { type: string; title: string }[];
+};
+
+const ACCOUNT_HEALTH_ALERTS = new Set([
+  "ACCOUNT_DRAWDOWN",
+  "ORDER_FAILURES",
+  "BROKER_UNREACHABLE",
+  "STALE_PIPELINE",
+  "MISSED_PAPER_DAYS",
+]);
+
+/** Did the pipeline actually produce today's inputs, and did it trade on time? */
+export function auditHealth(h: HealthInput): Finding[] {
+  const out: Finding[] = [];
+
+  if (h.estimatesToday === 0) {
+    out.push(
+      finding(
+        "fail",
+        "NO_ESTIMATES",
+        "No estimates were produced today",
+        `The paper stage trades off StockEstimate rows dated today; with none, every book sat idle regardless of what the market did.`,
+        { universeSize: h.universeSize }
+      )
+    );
+  } else if (h.universeSize > 0 && h.estimatesToday < h.universeSize * 0.5) {
+    out.push(
+      finding(
+        "warn",
+        "PARTIAL_ESTIMATES",
+        `Only ${h.estimatesToday} of ${h.universeSize} watched stocks got an estimate`,
+        `Stocks without a fresh estimate are skipped entirely — they are neither entered nor marked nor exited, so open positions in them went unmanaged.`,
+        { estimatesToday: h.estimatesToday, universeSize: h.universeSize }
+      )
+    );
+  }
+
+  if (h.quantToday === 0) {
+    out.push(
+      finding("fail", "NO_QUANT", "No quant analyses today", "Mark prices come from QuantAnalysis; with none, no position could be marked, sized or exited.")
+    );
+  }
+  if (h.sentimentsToday === 0) {
+    out.push(finding("warn", "NO_SENTIMENT", "No sentiment scores today", "The sentiment and combined books run on stale or missing scores."));
+  }
+  if (h.articlesToday === 0) {
+    out.push(finding("warn", "NO_ARTICLES", "No articles ingested today", "Sentiment has nothing fresh to read, so scores drift toward their previous values."));
+  }
+
+  if (h.paperRanAt == null) {
+    out.push(finding("fail", "PAPER_DID_NOT_RUN", "The paper stage did not run today", "No equity snapshot exists for today, so no book was marked and no trade was placed."));
+  } else if (h.marketClosedAt != null) {
+    const mins = (h.paperRanAt.getTime() - h.marketClosedAt.getTime()) / 60_000;
+    if (mins > 5) {
+      out.push(
+        finding(
+          "warn",
+          "PAPER_RAN_AFTER_CLOSE",
+          `The paper stage ran ${Math.round(mins)} min after the close`,
+          `It is meant to act inside the final minutes before the close, where liquidity is deepest and the marks match the sim books. Running afterwards means the fills came from a different session than the marks.`,
+          { minutesAfterClose: Math.round(mins) }
+        )
+      );
+    } else if (mins < -35) {
+      out.push(
+        finding(
+          "warn",
+          "PAPER_RAN_EARLY",
+          `The paper stage ran ${Math.round(-mins)} min before the close`,
+          `Outside the intended near-close window, so the marks are mid-session prices.`,
+          { minutesBeforeClose: Math.round(-mins) }
+        )
+      );
+    }
+  }
+
+  for (const err of h.paperErrors) {
+    out.push(finding("warn", "STAGE_ERROR", "Paper stage reported an error", err));
+  }
+
+  if (h.missedTradingDays.length > 0) {
+    out.push(
+      finding(
+        "fail",
+        "MISSED_TRADING_DAYS",
+        `${h.missedTradingDays.length} trading day(s) with no run`,
+        `No equity snapshot exists for ${h.missedTradingDays.join(", ")}. Positions went unmanaged on those days — no marks, no exits.`,
+        { days: h.missedTradingDays.join(",") }
+      )
+    );
+  }
+
+  const warned = Object.entries(h.dataWarningCounts).sort((a, b) => b[1] - a[1]);
+  for (const [warning, count] of warned.slice(0, 5)) {
+    if (count > 0) {
+      out.push(
+        finding(
+          count > h.estimatesToday * 0.25 ? "warn" : "info",
+          "DATA_WARNING",
+          `${count} estimate(s) carried "${warning}"`,
+          `Estimates flagged this today. Widespread warnings mean the scores that drove trading were built on degraded inputs.`,
+          { warning, count }
+        )
+      );
+    }
+  }
+
+  for (const a of h.alertsToday) {
+    if (ACCOUNT_HEALTH_ALERTS.has(a.type)) {
+      out.push(finding("warn", "ACCOUNT_ALERT", `Account alert: ${a.title}`, `The ${a.type} detector fired today.`, { type: a.type }));
+    }
+  }
+
+  return out;
+}
+
+// ── 5. Strategy tuning signals ───────────────────────────────────────────────
+
+export type ClosedTradeStat = {
+  strategy: Strategy;
+  exitReason: string | null;
+  realizedPnl: number;
+  returnPct: number;
+  holdDays: number;
+  exitDate: Date;
+};
+
+export type StrategyStats = {
+  strategy: Strategy;
+  closed: number;
+  wins: number;
+  hitRate: number | null;
+  totalPnl: number;
+  avgWin: number | null;
+  avgLoss: number | null;
+  avgHoldDays: number | null;
+  payoff: number | null; // avgWin / |avgLoss| — the edge multiple
+  exitMix: Record<string, { count: number; totalPnl: number; hitRate: number | null }>;
+};
+
+/** Per-book rollup, sliced by exit rung so the ladder can be judged rung by rung. */
+export function summarizeStrategies(trades: ClosedTradeStat[]): StrategyStats[] {
+  const byStrategy = new Map<Strategy, ClosedTradeStat[]>();
+  for (const t of trades) {
+    const arr = byStrategy.get(t.strategy);
+    if (arr) arr.push(t);
+    else byStrategy.set(t.strategy, [t]);
+  }
+
+  const stats: StrategyStats[] = [];
+  for (const [strategy, arr] of byStrategy) {
+    const wins = arr.filter((t) => t.realizedPnl > 0);
+    const losses = arr.filter((t) => t.realizedPnl < 0);
+    const avgWin = wins.length > 0 ? wins.reduce((s, t) => s + t.realizedPnl, 0) / wins.length : null;
+    const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.realizedPnl, 0) / losses.length : null;
+
+    const exitMix: StrategyStats["exitMix"] = {};
+    for (const t of arr) {
+      const key = t.exitReason ?? "UNRECORDED";
+      const bucket = (exitMix[key] ??= { count: 0, totalPnl: 0, hitRate: null });
+      bucket.count++;
+      bucket.totalPnl += t.realizedPnl;
+    }
+    for (const [key, bucket] of Object.entries(exitMix)) {
+      const rungTrades = arr.filter((t) => (t.exitReason ?? "UNRECORDED") === key);
+      bucket.hitRate = rungTrades.length > 0 ? rungTrades.filter((t) => t.realizedPnl > 0).length / rungTrades.length : null;
+    }
+
+    stats.push({
+      strategy,
+      closed: arr.length,
+      wins: wins.length,
+      hitRate: arr.length > 0 ? wins.length / arr.length : null,
+      totalPnl: arr.reduce((s, t) => s + t.realizedPnl, 0),
+      avgWin,
+      avgLoss,
+      avgHoldDays: arr.length > 0 ? arr.reduce((s, t) => s + t.holdDays, 0) / arr.length : null,
+      payoff: avgWin != null && avgLoss != null && avgLoss !== 0 ? avgWin / Math.abs(avgLoss) : null,
+      exitMix,
+    });
+  }
+  return stats.sort((a, b) => a.strategy.localeCompare(b.strategy));
+}
+
+// Below this many trades on a rung, its hit rate is noise — say so rather than
+// dressing a handful of trades up as a tuning recommendation.
+const MIN_RUNG_SAMPLE = 8;
+
+/**
+ * Tuning observations, all severity `info`: these are arguments for changing a
+ * knob, never bugs. Each one names the knob and the evidence so the agent reading
+ * the report can propose a specific value instead of a vague direction.
+ */
+export function tuningSignals(stats: StrategyStats[]): Finding[] {
+  const out: Finding[] = [];
+  for (const s of stats) {
+    if (s.closed < MIN_RUNG_SAMPLE) continue;
+
+    for (const [rung, bucket] of Object.entries(s.exitMix)) {
+      if (bucket.count < MIN_RUNG_SAMPLE) continue;
+      const share = bucket.count / s.closed;
+
+      if (rung === "TIME" && bucket.hitRate != null && bucket.hitRate < 0.35) {
+        out.push(
+          finding(
+            "info",
+            "TUNE_TIME_STOP",
+            `${s.strategy}: time stops are mostly closing losers (${pct(bucket.hitRate)} win rate over ${bucket.count} trades)`,
+            `Dead money is being held to the ${bucket.count}-trade time limit and then released at a loss. A shorter timeStopRuns or a wider timeStopBandPct would recycle that capital sooner. Net ${money(bucket.totalPnl)} from this rung.`,
+            { strategy: s.strategy, knob: "timeStopRuns", rungCount: bucket.count, rungHitRate: bucket.hitRate }
+          )
+        );
+      }
+      if (rung === "STOP" && share > 0.5) {
+        out.push(
+          finding(
+            "info",
+            "TUNE_STOP_DISTANCE",
+            `${s.strategy}: ${pct(share)} of exits are hard stops`,
+            `Over half of all closes are stop-outs (${bucket.count} of ${s.closed}, net ${money(bucket.totalPnl)}). Stops that tight get hit by noise rather than by a broken thesis — consider a larger atrStopMult or a higher atrStopFloorPct.`,
+            { strategy: s.strategy, knob: "atrStopMult", share, rungCount: bucket.count }
+          )
+        );
+      }
+      if (rung === "TRAIL" && bucket.hitRate != null && bucket.hitRate > 0.8 && s.payoff != null && s.payoff < 1) {
+        out.push(
+          finding(
+            "info",
+            "TUNE_TRAIL_DISTANCE",
+            `${s.strategy}: trailing stops win often but small (payoff ${s.payoff.toFixed(2)})`,
+            `Trails are banking ${pct(bucket.hitRate)} winners, yet the average win is smaller than the average loss. The trail is probably too tight — a wider trailPct or a later trailRatchetActivatePct would let winners run.`,
+            { strategy: s.strategy, knob: "trailPct", payoff: s.payoff }
+          )
+        );
+      }
+      if (rung === "DECAY" && bucket.hitRate != null && bucket.hitRate < 0.5) {
+        out.push(
+          finding(
+            "info",
+            "TUNE_DECAY_RUNS",
+            `${s.strategy}: decay exits are underperforming (${pct(bucket.hitRate)} win rate)`,
+            `Decay is meant to bank a profit once conviction fades; at this hit rate it is firing too early. Consider raising decayRuns.`,
+            { strategy: s.strategy, knob: "decayRuns", rungHitRate: bucket.hitRate }
+          )
+        );
+      }
+    }
+
+    if (s.payoff != null && s.hitRate != null) {
+      // Expectancy per trade in R-multiples: below zero the book loses money at its
+      // current hit rate no matter how the individual rungs look.
+      const expectancy = s.hitRate * s.payoff - (1 - s.hitRate);
+      if (expectancy < 0) {
+        out.push(
+          finding(
+            "info",
+            "NEGATIVE_EXPECTANCY",
+            `${s.strategy}: negative expectancy over ${s.closed} closed trades`,
+            `Hit rate ${pct(s.hitRate)} at a payoff of ${s.payoff.toFixed(2)} gives ${expectancy.toFixed(2)}R per trade. The book needs either a higher payoff (wider targets, tighter entries) or a better hit rate to be viable.`,
+            { strategy: s.strategy, expectancy, closed: s.closed }
+          )
+        );
+      }
+    }
+  }
+  return out;
+}
+
+// ── Report assembly ──────────────────────────────────────────────────────────
+
+export type DailyReviewReport = {
+  version: 1;
+  date: string; // YYYY-MM-DD (UTC)
+  generatedAt: string;
+  status: "OK" | "WARN" | "FAIL";
+  summary: {
+    findings: number;
+    fails: number;
+    warns: number;
+    openPositions: number;
+    openedToday: number;
+    closedToday: number;
+    realizedToday: number;
+    ordersSubmittedToday: number;
+    replayed: number;
+  };
+  findings: Finding[];
+  strategies: StrategyStats[];
+  books: { book: string; equity: number; realizedPnl: number; unrealizedPnl: number; openPositions: number; dayChange: number | null }[];
+  notes: string[];
+};
+
+/** Order findings worst-first so the email and the agent both lead with what matters. */
+export function rankFindings(findings: Finding[]): Finding[] {
+  const rank: Record<Severity, number> = { fail: 0, warn: 1, info: 2 };
+  return [...findings].sort((a, b) => rank[a.severity] - rank[b.severity] || a.code.localeCompare(b.code));
+}

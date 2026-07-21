@@ -16,6 +16,7 @@ export { runEstimateStage } from "./estimate";
 export { runInsiderStage } from "./insider";
 export { runCongressStage, type CongressStageResult } from "./congress";
 export { runPaperStage, type PaperStageResult } from "./paper";
+export { runReviewStage, type ReviewStageResult } from "./review";
 export { type BatchStageResult, type StageOptions } from "./shared";
 
 // Re-exported so existing imports from "@/lib/pipeline" keep working.
