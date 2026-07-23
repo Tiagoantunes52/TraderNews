@@ -540,15 +540,34 @@ export function reconcileBroker(args: {
     return tickers.length > 12 ? `${shown}, +${tickers.length - 12} more` : shown;
   };
 
-  const missing = simLong.filter((s) => !bySymbol.has(s.ticker)).map((s) => s.ticker);
+  // A sim position under one whole share can't be mirrored by the live book, which
+  // only holds whole shares (planBrokerAction floors qty, so the broker enters 0). The
+  // sim sizes fractionally on purpose — it measures signal quality, not capital — so
+  // that gap is an expected sizing artifact, not drift. Split it out as info so the
+  // warning is left to name genuine problems (unfilled, risk-gated, or closed outside
+  // the app), which are actually fixable.
+  const missingAll = simLong.filter((s) => !bySymbol.has(s.ticker));
+  const missing = missingAll.filter((s) => s.qty >= 1).map((s) => s.ticker);
+  const subShare = missingAll.filter((s) => s.qty < 1).map((s) => s.ticker);
   if (missing.length > 0) {
     out.push(
       finding(
         "warn",
         "BROKER_POSITIONS_MISSING",
         `${missing.length} sim position(s) the broker isn't holding`,
-        `COMBINED_RM is long ${list(missing)}, but the paper account is flat in them. Either those entries never filled, they were closed outside the app, or whole-share sizing skipped a name whose risk budget came to under one share. Live and sim P&L diverge for as long as this persists.`,
+        `COMBINED_RM is long ${list(missing)} at a full share or more, but the paper account is flat in them. Either those entries never filled, they were gated by the risk caps, or they were closed outside the app. Live and sim P&L diverge for as long as this persists.`,
         { count: missing.length, tickers: missing.join(",") }
+      )
+    );
+  }
+  if (subShare.length > 0) {
+    out.push(
+      finding(
+        "info",
+        "BROKER_POSITIONS_SUBSHARE",
+        `${subShare.length} sub-one-share sim position(s) the live book can't mirror`,
+        `COMBINED_RM holds a fractional position (<1 share) in ${list(subShare)}, so whole-share sizing enters 0 at the broker and it stays flat. Expected on a small book — the sim sizes fractionally to measure signal quality — not a fault to fix.`,
+        { count: subShare.length, tickers: subShare.join(",") }
       )
     );
   }
@@ -738,19 +757,32 @@ export function auditHealth(h: HealthInput): Finding[] {
     );
   }
 
+  // Estimate warnings split into two kinds. Genuine *degraded inputs* — missing price
+  // data, too few articles — mean the score rested on thin/missing evidence, so a
+  // widespread occurrence is worth a warning. The rest ("signal disagreement", "high
+  // volatility", "earnings soon") are normal market *conditions* the estimate already
+  // prices into confidence (each docks it 0.1–0.15), not data faults — so they stay
+  // informational even when common, and never carry the "degraded inputs" framing.
+  // Anything unrecognized keeps the widespread → warn default, so new input problems
+  // still surface.
+  const isPricedCondition = (w: string) =>
+    w.includes("Signal disagreement") || w.includes("High volatility") || w.includes("Earnings in");
   const warned = Object.entries(h.dataWarningCounts).sort((a, b) => b[1] - a[1]);
   for (const [warning, count] of warned.slice(0, 5)) {
-    if (count > 0) {
-      out.push(
-        finding(
-          count > h.estimatesToday * 0.25 ? "warn" : "info",
-          "DATA_WARNING",
-          `${count} estimate(s) carried "${warning}"`,
-          `Estimates flagged this today. Widespread warnings mean the scores that drove trading were built on degraded inputs.`,
-          { warning, count }
-        )
-      );
-    }
+    if (count <= 0) continue;
+    const condition = isPricedCondition(warning);
+    const widespread = count > h.estimatesToday * 0.25;
+    out.push(
+      finding(
+        !condition && widespread ? "warn" : "info",
+        "DATA_WARNING",
+        `${count} estimate(s) carried "${warning}"`,
+        condition
+          ? `Estimates flagged this today. It's a market condition the estimate already discounts in its confidence, not a degraded input.`
+          : `Estimates flagged this today. Widespread warnings mean the scores that drove trading were built on degraded inputs.`,
+        { warning, count }
+      )
+    );
   }
 
   for (const a of h.alertsToday) {

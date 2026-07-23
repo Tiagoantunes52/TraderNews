@@ -590,6 +590,7 @@ describe("planBrokerAction()", () => {
     stillLong: true,
     exitReason: null as string | null,
     held: false,
+    everAttempted: true,
     avgEntryPrice: null as number | null,
     currentPrice: null as number | null,
     restingProtectiveType: null as "stop" | "trailing_stop" | null,
@@ -620,8 +621,30 @@ describe("planBrokerAction()", () => {
     });
 
     it("does NOT re-enter a name the broker stopped out while the sim is still long", () => {
-      // flat (broker stop fired) + sim still long but NOT a fresh open → re-entry guard.
-      expect(plan({ opened: false, stillLong: true, held: false })).toEqual({ type: "NONE" });
+      // flat (broker stop fired) + sim still long, NOT a fresh open, broker already
+      // entered this episode (everAttempted) → re-entry guard leaves it flat.
+      expect(plan({ opened: false, stillLong: true, held: false, everAttempted: true })).toEqual({ type: "NONE" });
+    });
+
+    it("catches up an entry the broker never placed (gated / grown sub-share)", () => {
+      // flat + sim still long, not a fresh open, but the broker never attempted this
+      // episode → enter now (same whole-share sizing as a fresh open).
+      expect(plan({ opened: false, stillLong: true, held: false, everAttempted: false })).toEqual({
+        type: "ENTER",
+        qty: 6,
+        limitPrice: 100.5,
+        stopPrice: 92,
+      });
+    });
+
+    it("does not catch up a name the sim is no longer long", () => {
+      expect(plan({ opened: false, stillLong: false, held: false, everAttempted: false })).toEqual({ type: "NONE" });
+    });
+
+    it("catch-up still respects whole-share sizing (under one share → no order)", () => {
+      expect(plan({ opened: false, stillLong: true, held: false, everAttempted: false, price: 700 })).toEqual({
+        type: "NONE",
+      });
     });
   });
 

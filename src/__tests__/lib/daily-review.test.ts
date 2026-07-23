@@ -377,9 +377,18 @@ describe("reconcileBroker", () => {
     expect(codes(found)).not.toContain("BROKER_STOPS_MISSING");
   });
 
-  it("flags a sim position the broker doesn't hold", () => {
+  it("flags a whole-share sim position the broker doesn't hold as a warning", () => {
     const found = reconcileBroker({ ...base, simLong: [{ ticker: "AAPL", qty: 10 }] });
-    expect(codes(found)).toContain("BROKER_POSITIONS_MISSING");
+    const missing = found.find((f) => f.code === "BROKER_POSITIONS_MISSING");
+    expect(missing?.severity).toBe("warn");
+    expect(codes(found)).not.toContain("BROKER_POSITIONS_SUBSHARE");
+  });
+
+  it("reports a sub-one-share sim position as info, not a warning", () => {
+    const found = reconcileBroker({ ...base, simLong: [{ ticker: "AAPL", qty: 0.6 }] });
+    const sub = found.find((f) => f.code === "BROKER_POSITIONS_SUBSHARE");
+    expect(sub?.severity).toBe("info");
+    expect(codes(found)).not.toContain("BROKER_POSITIONS_MISSING");
   });
 
   it("flags a broker position the sim book has exited", () => {
@@ -468,6 +477,22 @@ describe("auditHealth", () => {
     const isolated = auditHealth({ ...healthy, dataWarningCounts: { stale_price: 2 } });
     expect(widespread.find((f) => f.code === "DATA_WARNING")?.severity).toBe("warn");
     expect(isolated.find((f) => f.code === "DATA_WARNING")?.severity).toBe("info");
+  });
+
+  it("keeps a priced-in market condition as info even when widespread", () => {
+    const found = auditHealth({
+      ...healthy,
+      dataWarningCounts: { "Signal disagreement between sentiment and quant": 60 },
+    });
+    const f = found.find((x) => x.code === "DATA_WARNING");
+    expect(f?.severity).toBe("info");
+    expect(f?.detail).toContain("market condition");
+    expect(f?.detail).not.toContain("degraded inputs");
+  });
+
+  it("still warns on widespread genuine input degradation", () => {
+    const found = auditHealth({ ...healthy, dataWarningCounts: { "No price data — sentiment only": 60 } });
+    expect(found.find((x) => x.code === "DATA_WARNING")?.severity).toBe("warn");
   });
 
   it("surfaces account-health alerts and ignores watchlist ones", () => {
