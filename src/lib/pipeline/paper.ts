@@ -907,48 +907,77 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           }
         }
 
-        // Safety-net sweep: the loop above only visits names with a fresh estimate
-        // today, so a held position that produced no estimate this run (no fresh
-        // news/quant, or dropped from the watched universe) would never have its
-        // missing protective order repaired — it would sit unprotected against a gap
-        // indefinitely (the failure the daily review keeps flagging). Guarantee every
-        // held long carries a resting stop by repairing any that the loop didn't
-        // already handle. Distance uses the fixed fallback stop (no sim-twin ATR is
-        // available for an off-universe name); precision matters less than coverage.
-        const unswept = [...posBySymbol.keys()].filter(
-          (symbol) => !managedSymbols.has(symbol) && !protectiveBySymbol.has(symbol)
-        );
-        if (unswept.length > 0) {
+        // Reconcile sweep: the loop above only visits names with a fresh estimate
+        // today, so any held position that produced no estimate this run (no fresh
+        // news/quant, or dropped from the watched universe) is invisible to it — its
+        // exit never reaches the broker and its missing stop is never repaired. Sweep
+        // every held position the loop didn't manage against the ACTUAL COMBINED_RM sim
+        // state (not just today's estimates):
+        //   • sim flat  → orphan: the strategy has exited but the broker still holds it,
+        //                 so flatten it (cancel any resting stop, then market-sell).
+        //   • sim long, no protective order → repair a missing stop.
+        // A price exit (STOP/TRAIL) closes the sim position, so this is also the belt
+        // that flattens a name whose broker stop failed to fire.
+        const unmanaged = [...posBySymbol.keys()].filter((symbol) => !managedSymbols.has(symbol));
+        if (unmanaged.length > 0) {
           const fallbackStopPct = riskDistancePct(cfg, null, cfg.stopLossPct);
           // Resolve stockIds for every held ticker (PaperOrder.stockId is required),
           // including off-universe names absent from today's estimates.
           const sweepStocks = await db.stock.findMany({
-            where: { ticker: { in: unswept } },
+            where: { ticker: { in: unmanaged } },
             select: { id: true, ticker: true },
           });
           const stockIdByTicker = new Map(sweepStocks.map((s) => [s.ticker, s.id]));
-          for (const symbol of unswept) {
+          // Which of these does the strategy still want? An OPEN COMBINED_RM sim row.
+          const stockIds = [...stockIdByTicker.values()];
+          const simOpenRows =
+            stockIds.length > 0
+              ? await db.simPosition.findMany({
+                  where: { strategy: "COMBINED_RM", status: "OPEN", stockId: { in: stockIds } },
+                  select: { stockId: true },
+                })
+              : [];
+          const simOpenStockIds = new Set(simOpenRows.map((r) => r.stockId));
+
+          for (const symbol of unmanaged) {
             const pos = posBySymbol.get(symbol)!;
-            const qty = Math.floor(pos.qty);
-            if (qty < 1) continue; // long, whole-share only (Alpaca rejects stops otherwise)
-            const anchor = pos.avgEntryPrice ?? pos.currentPrice;
-            if (anchor == null || anchor <= 0) continue;
             const stockId = stockIdByTicker.get(symbol);
+            const simLong = stockId != null && simOpenStockIds.has(stockId);
+            const protective = protectiveBySymbol.get(symbol) ?? null;
             try {
-              const order = await submitStopSell({ symbol, qty, stopPrice: cents(anchor * (1 - fallbackStopPct)) });
-              // Protection is placed at the broker either way; only persist the order
-              // record when we can attach it to a known stock (near-always true).
-              if (stockId) {
-                await db.paperOrder.create({
-                  data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-                });
-              } else {
-                errors.push(`Protective-stop sweep placed a stop for ${symbol} but found no Stock row to record it`);
+              if (!simLong) {
+                // Orphan → flatten. Market-sell takes the whole position (fractional is
+                // fine, unlike a stop), after cancelling any resting protective order.
+                if (protective) await cancelOrder(protective.id);
+                const qty = Math.abs(pos.qty);
+                const order = await submitMarketOrder({ symbol, side: "sell", qty });
+                if (stockId) {
+                  await db.paperOrder.create({
+                    data: { stockId, side: "SELL", signal: "ORPHAN_EXIT", qty, alpacaOrderId: order.id, status: order.status },
+                  });
+                } else {
+                  errors.push(`Orphan-exit sold ${symbol} but found no Stock row to record it`);
+                }
+                ordersSubmitted++;
+              } else if (!protective) {
+                // Sim still wants it, but nothing is protecting it → repair the stop.
+                const qty = Math.floor(Math.abs(pos.qty));
+                if (qty < 1) continue; // whole-share only (Alpaca rejects fractional stops)
+                const anchor = pos.avgEntryPrice ?? pos.currentPrice;
+                if (anchor == null || anchor <= 0) continue;
+                const order = await submitStopSell({ symbol, qty, stopPrice: cents(anchor * (1 - fallbackStopPct)) });
+                if (stockId) {
+                  await db.paperOrder.create({
+                    data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
+                  });
+                } else {
+                  errors.push(`Protective-stop sweep placed a stop for ${symbol} but found no Stock row to record it`);
+                }
+                ordersSubmitted++;
               }
-              ordersSubmitted++;
             } catch (e) {
               alpacaOrderFailures++;
-              errors.push(`Alpaca protective-stop sweep failed for ${symbol}: ${String(e)}`);
+              errors.push(`Alpaca reconcile sweep failed for ${symbol}: ${String(e)}`);
             }
           }
         }
