@@ -500,8 +500,11 @@ export type BrokerAction =
  *
  * - EXIT only on an *info* exit (SIGNAL/DECAY/TIME) — price exits (STOP/TRAIL) are
  *   enforced broker-side, so we never double-handle them here.
- * - ENTER only on a *fresh* sim OPEN when flat — never re-buy a name the broker just
- *   stopped out while the sim is merely still-long (the re-entry guard).
+ * - ENTER on a *fresh* sim OPEN when flat, or *catch up* an entry the broker never
+ *   placed this episode (`everAttempted` false) — e.g. the risk caps gated the buy
+ *   when the sim opened, or a sub-share position has since grown to a whole share.
+ *   A name the broker DID enter and then stopped out has `everAttempted` true and is
+ *   left flat until the sim also exits — never re-bought (the re-entry guard).
  * - While held & still-long: arm the trailing stop once up `trailActivatePct` (a fixed
  *   stop is resting), tighten a resting trailing stop once up `trailRatchetActivatePct`
  *   (only when strictly tighter, so it never churns), or repair a missing protective
@@ -512,6 +515,7 @@ export function planBrokerAction(input: {
   stillLong: boolean; // COMBINED_RM is long after this run
   exitReason: string | null; // COMBINED_RM close reason this run (STOP|TRAIL|SIGNAL|DECAY|TIME)
   held: boolean; // live Alpaca position exists
+  everAttempted?: boolean; // broker already placed an entry order this episode (default true = re-entry guard on)
   avgEntryPrice: number | null;
   currentPrice: number | null;
   restingProtectiveType: "stop" | "trailing_stop" | null; // resting protective order, if any
@@ -525,12 +529,19 @@ export function planBrokerAction(input: {
   const cfg = input.cfg ?? DEFAULT_RISK_CONFIG;
   const buffer = input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT;
   const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, restingTrailPercent, price, atrPct, confidence } = input;
+  // Unknown history ⇒ assume the broker already acted, so we never catch-up-buy a name
+  // that was actually stopped out. Only an explicit `false` unlocks a catch-up entry.
+  const everAttempted = input.everAttempted ?? true;
 
   const infoExit = exitReason === "SIGNAL" || exitReason === "DECAY" || exitReason === "TIME";
   if (held && infoExit) return { type: "EXIT", reason: exitReason! };
 
   if (!held) {
-    if (opened && price > 0) {
+    // Fresh open, or a catch-up for an entry that never took hold (gated / sub-share
+    // that grew). Never a name the broker entered then stopped out — that keeps
+    // `everAttempted` true and stays flat until the sim exits (the re-entry guard).
+    const catchUp = stillLong && !everAttempted;
+    if ((opened || catchUp) && price > 0) {
       const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
       const qty = Math.floor(riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price);
       if (qty >= 1) {

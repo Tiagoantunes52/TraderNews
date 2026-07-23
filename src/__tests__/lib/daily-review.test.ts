@@ -377,9 +377,18 @@ describe("reconcileBroker", () => {
     expect(codes(found)).not.toContain("BROKER_STOPS_MISSING");
   });
 
-  it("flags a sim position the broker doesn't hold", () => {
+  it("flags a whole-share sim position the broker doesn't hold as a warning", () => {
     const found = reconcileBroker({ ...base, simLong: [{ ticker: "AAPL", qty: 10 }] });
-    expect(codes(found)).toContain("BROKER_POSITIONS_MISSING");
+    const missing = found.find((f) => f.code === "BROKER_POSITIONS_MISSING");
+    expect(missing?.severity).toBe("warn");
+    expect(codes(found)).not.toContain("BROKER_POSITIONS_SUBSHARE");
+  });
+
+  it("reports a sub-one-share sim position as info, not a warning", () => {
+    const found = reconcileBroker({ ...base, simLong: [{ ticker: "AAPL", qty: 0.6 }] });
+    const sub = found.find((f) => f.code === "BROKER_POSITIONS_SUBSHARE");
+    expect(sub?.severity).toBe("info");
+    expect(codes(found)).not.toContain("BROKER_POSITIONS_MISSING");
   });
 
   it("flags a broker position the sim book has exited", () => {

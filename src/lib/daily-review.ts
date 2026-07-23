@@ -540,15 +540,34 @@ export function reconcileBroker(args: {
     return tickers.length > 12 ? `${shown}, +${tickers.length - 12} more` : shown;
   };
 
-  const missing = simLong.filter((s) => !bySymbol.has(s.ticker)).map((s) => s.ticker);
+  // A sim position under one whole share can't be mirrored by the live book, which
+  // only holds whole shares (planBrokerAction floors qty, so the broker enters 0). The
+  // sim sizes fractionally on purpose — it measures signal quality, not capital — so
+  // that gap is an expected sizing artifact, not drift. Split it out as info so the
+  // warning is left to name genuine problems (unfilled, risk-gated, or closed outside
+  // the app), which are actually fixable.
+  const missingAll = simLong.filter((s) => !bySymbol.has(s.ticker));
+  const missing = missingAll.filter((s) => s.qty >= 1).map((s) => s.ticker);
+  const subShare = missingAll.filter((s) => s.qty < 1).map((s) => s.ticker);
   if (missing.length > 0) {
     out.push(
       finding(
         "warn",
         "BROKER_POSITIONS_MISSING",
         `${missing.length} sim position(s) the broker isn't holding`,
-        `COMBINED_RM is long ${list(missing)}, but the paper account is flat in them. Either those entries never filled, they were closed outside the app, or whole-share sizing skipped a name whose risk budget came to under one share. Live and sim P&L diverge for as long as this persists.`,
+        `COMBINED_RM is long ${list(missing)} at a full share or more, but the paper account is flat in them. Either those entries never filled, they were gated by the risk caps, or they were closed outside the app. Live and sim P&L diverge for as long as this persists.`,
         { count: missing.length, tickers: missing.join(",") }
+      )
+    );
+  }
+  if (subShare.length > 0) {
+    out.push(
+      finding(
+        "info",
+        "BROKER_POSITIONS_SUBSHARE",
+        `${subShare.length} sub-one-share sim position(s) the live book can't mirror`,
+        `COMBINED_RM holds a fractional position (<1 share) in ${list(subShare)}, so whole-share sizing enters 0 at the broker and it stays flat. Expected on a small book — the sim sizes fractionally to measure signal quality — not a fault to fix.`,
+        { count: subShare.length, tickers: subShare.join(",") }
       )
     );
   }

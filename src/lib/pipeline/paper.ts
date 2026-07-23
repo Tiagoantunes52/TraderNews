@@ -801,6 +801,28 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         // a protective order on a name we just handled.
         const managedSymbols = new Set<string>();
 
+        // Has the broker already placed an entry for each COMBINED_RM episode? A BUY
+        // order dated at/after the sim's entry means yes — so if the broker is now flat
+        // in it, it was exited/stopped out and the re-entry guard must leave it alone.
+        // No such order means the entry never took hold (risk-gated, or a sub-share
+        // that has since grown), which planBrokerAction may then *catch up*.
+        const rmOpens = openPositions.filter((p) => p.strategy === "COMBINED_RM");
+        const everAttemptedByStock = new Map<string, boolean>();
+        if (rmOpens.length > 0) {
+          const rmEntryByStock = new Map(rmOpens.map((p) => [p.stockId, p.entryDate]));
+          const buys = await db.paperOrder.findMany({
+            where: { side: "BUY", stockId: { in: rmOpens.map((p) => p.stockId) } },
+            select: { stockId: true, submittedAt: true },
+            orderBy: { submittedAt: "desc" },
+          });
+          const lastBuyByStock = new Map<string, Date>();
+          for (const b of buys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+          for (const [stockId, entryDate] of rmEntryByStock) {
+            const last = lastBuyByStock.get(stockId);
+            everAttemptedByStock.set(stockId, last != null && last >= entryDate);
+          }
+        }
+
         for (const est of estimates) {
           const ticker = est.stock.ticker;
           const price = priceByStock.get(est.stockId);
@@ -815,6 +837,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             stillLong: combinedRmLong.has(est.stockId),
             exitReason: combinedRmExit.get(est.stockId) ?? null,
             held: !!held,
+            everAttempted: everAttemptedByStock.get(est.stockId) ?? true,
             avgEntryPrice: held?.avgEntryPrice ?? null,
             currentPrice: held?.currentPrice ?? null,
             restingProtectiveType: protective?.type === "trailing_stop" ? "trailing_stop" : protective ? "stop" : null,
