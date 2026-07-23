@@ -757,19 +757,32 @@ export function auditHealth(h: HealthInput): Finding[] {
     );
   }
 
+  // Estimate warnings split into two kinds. Genuine *degraded inputs* — missing price
+  // data, too few articles — mean the score rested on thin/missing evidence, so a
+  // widespread occurrence is worth a warning. The rest ("signal disagreement", "high
+  // volatility", "earnings soon") are normal market *conditions* the estimate already
+  // prices into confidence (each docks it 0.1–0.15), not data faults — so they stay
+  // informational even when common, and never carry the "degraded inputs" framing.
+  // Anything unrecognized keeps the widespread → warn default, so new input problems
+  // still surface.
+  const isPricedCondition = (w: string) =>
+    w.includes("Signal disagreement") || w.includes("High volatility") || w.includes("Earnings in");
   const warned = Object.entries(h.dataWarningCounts).sort((a, b) => b[1] - a[1]);
   for (const [warning, count] of warned.slice(0, 5)) {
-    if (count > 0) {
-      out.push(
-        finding(
-          count > h.estimatesToday * 0.25 ? "warn" : "info",
-          "DATA_WARNING",
-          `${count} estimate(s) carried "${warning}"`,
-          `Estimates flagged this today. Widespread warnings mean the scores that drove trading were built on degraded inputs.`,
-          { warning, count }
-        )
-      );
-    }
+    if (count <= 0) continue;
+    const condition = isPricedCondition(warning);
+    const widespread = count > h.estimatesToday * 0.25;
+    out.push(
+      finding(
+        !condition && widespread ? "warn" : "info",
+        "DATA_WARNING",
+        `${count} estimate(s) carried "${warning}"`,
+        condition
+          ? `Estimates flagged this today. It's a market condition the estimate already discounts in its confidence, not a degraded input.`
+          : `Estimates flagged this today. Widespread warnings mean the scores that drove trading were built on degraded inputs.`,
+        { warning, count }
+      )
+    );
   }
 
   for (const a of h.alertsToday) {

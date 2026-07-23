@@ -479,6 +479,22 @@ describe("auditHealth", () => {
     expect(isolated.find((f) => f.code === "DATA_WARNING")?.severity).toBe("info");
   });
 
+  it("keeps a priced-in market condition as info even when widespread", () => {
+    const found = auditHealth({
+      ...healthy,
+      dataWarningCounts: { "Signal disagreement between sentiment and quant": 60 },
+    });
+    const f = found.find((x) => x.code === "DATA_WARNING");
+    expect(f?.severity).toBe("info");
+    expect(f?.detail).toContain("market condition");
+    expect(f?.detail).not.toContain("degraded inputs");
+  });
+
+  it("still warns on widespread genuine input degradation", () => {
+    const found = auditHealth({ ...healthy, dataWarningCounts: { "No price data — sentiment only": 60 } });
+    expect(found.find((x) => x.code === "DATA_WARNING")?.severity).toBe("warn");
+  });
+
   it("surfaces account-health alerts and ignores watchlist ones", () => {
     const found = auditHealth({
       ...healthy,
