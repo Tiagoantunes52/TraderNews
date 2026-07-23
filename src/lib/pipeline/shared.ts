@@ -1,5 +1,5 @@
 import { db } from "@/lib/db";
-import { type AlertDraft } from "@/lib/alerts";
+import { EMAIL_ALLOWED_ALERT_TYPES, type AlertDraft } from "@/lib/alerts";
 import { isEmailConfigured, sendEmail, buildAlertEmail } from "@/lib/email";
 
 // Per-invocation work budget. Stages stop scheduling new stocks once the budget
@@ -55,13 +55,15 @@ export async function processAlerts(pending: PendingAlert[]): Promise<{ count: n
     select: { stockId: true, user: { select: { id: true, email: true } } },
   });
 
-  // Group alerts per recipient so each user gets a single digest.
+  // Group alerts per recipient so each user gets a single digest. Only the emailable
+  // types (open-market insider buys) go in — every other per-stock alert is persisted
+  // above and surfaces in the dashboard feed, but is kept out of inboxes.
   const byUser = new Map<string, { email: string; drafts: AlertDraft[] }>();
   for (const w of watchers) {
     if (!w.user.email) continue;
     const entry = byUser.get(w.user.id) ?? { email: w.user.email, drafts: [] };
     for (const p of pending) {
-      if (p.stockId === w.stockId) entry.drafts.push(p.draft);
+      if (p.stockId === w.stockId && EMAIL_ALLOWED_ALERT_TYPES.has(p.draft.type)) entry.drafts.push(p.draft);
     }
     byUser.set(w.user.id, entry);
   }

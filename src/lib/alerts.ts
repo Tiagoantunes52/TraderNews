@@ -23,6 +23,16 @@ export type AlertDraft = {
   value: number | null;
 };
 
+// The ONLY per-stock alert types emailed to watchers: open-market insider buys.
+// Every other per-stock alert (signal change, news spike, RSI extreme, and the
+// bidirectional insider flow-shift) is still detected and persisted — so it shows in
+// the dashboard's "Recent alerts" feed — but proved low-signal as an inbox alert.
+// (Account / trading-health alerts are a separate admin path, unaffected by this.)
+export const EMAIL_ALLOWED_ALERT_TYPES: ReadonlySet<AlertType> = new Set<AlertType>([
+  "INSIDER_CLUSTER_BUY",
+  "INSIDER_CSUITE_BUY",
+]);
+
 export const VELOCITY_SPIKE_THRESHOLD = 2.5;
 
 const SIGNAL_RANK: Record<string, number> = {

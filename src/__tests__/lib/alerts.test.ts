@@ -9,6 +9,7 @@ import {
   detectStalePipeline,
   detectMissedPaperDays,
   humanizeSignal,
+  EMAIL_ALLOWED_ALERT_TYPES,
 } from "@/lib/alerts";
 
 describe("humanizeSignal", () => {
@@ -201,5 +202,20 @@ describe("account-health alerts (issue #56)", () => {
     it("is silent with no prior snapshot (nothing to miss yet)", () => {
       expect(detectMissedPaperDays(null, d("2026-07-04"))).toBeNull();
     });
+  });
+});
+
+describe("EMAIL_ALLOWED_ALERT_TYPES", () => {
+  it("emails only open-market insider buys", () => {
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("INSIDER_CLUSTER_BUY")).toBe(true);
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("INSIDER_CSUITE_BUY")).toBe(true);
+  });
+
+  it("suppresses every other per-stock alert type from email", () => {
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("SIGNAL_CHANGE")).toBe(false);
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("VELOCITY_SPIKE")).toBe(false);
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("RSI_EXTREME")).toBe(false);
+    // bidirectional (also fires on insiders turning sellers) — not a "buy"
+    expect(EMAIL_ALLOWED_ALERT_TYPES.has("INSIDER_FLOW_SHIFT")).toBe(false);
   });
 });
