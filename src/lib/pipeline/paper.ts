@@ -26,6 +26,7 @@ import {
   confidenceNotional,
   riskSizedNotional,
   riskDistancePct,
+  cents,
   realizedFromFills,
   isPaperTradeEligible,
   isEntrySignal,
@@ -795,6 +796,10 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         for (const o of openOrders) {
           if (o.side === "sell" && (o.type === "stop" || o.type === "trailing_stop")) protectiveBySymbol.set(o.symbol, o);
         }
+        // Symbols the estimates loop below touches (entered, exited, armed, or
+        // repaired) — the final safety-net sweep skips these so it never double-places
+        // a protective order on a name we just handled.
+        const managedSymbols = new Set<string>();
 
         for (const est of estimates) {
           const ticker = est.stock.ticker;
@@ -837,6 +842,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                   data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty: action.qty, alpacaOrderId: stopOrderId, status: "held" },
                 });
               }
+              managedSymbols.add(ticker);
               ordersSubmitted++;
             } else if (action.type === "EXIT" && held) {
               if (protective) await cancelOrder(protective.id);
@@ -845,6 +851,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               await db.paperOrder.create({
                 data: { stockId: est.stockId, side: "SELL", signal: action.reason, qty, alpacaOrderId: order.id, status: order.status },
               });
+              managedSymbols.add(ticker);
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
               // Protective (stop/trailing) orders must be whole-share — Alpaca rejects
@@ -857,6 +864,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 await db.paperOrder.create({
                   data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
                 });
+                managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             } else if (action.type === "REPAIR_STOP" && held) {
@@ -866,12 +874,59 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 await db.paperOrder.create({
                   data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
                 });
+                managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             }
           } catch (e) {
             alpacaOrderFailures++;
             errors.push(`Alpaca broker action failed for ${ticker}: ${String(e)}`);
+          }
+        }
+
+        // Safety-net sweep: the loop above only visits names with a fresh estimate
+        // today, so a held position that produced no estimate this run (no fresh
+        // news/quant, or dropped from the watched universe) would never have its
+        // missing protective order repaired — it would sit unprotected against a gap
+        // indefinitely (the failure the daily review keeps flagging). Guarantee every
+        // held long carries a resting stop by repairing any that the loop didn't
+        // already handle. Distance uses the fixed fallback stop (no sim-twin ATR is
+        // available for an off-universe name); precision matters less than coverage.
+        const unswept = [...posBySymbol.keys()].filter(
+          (symbol) => !managedSymbols.has(symbol) && !protectiveBySymbol.has(symbol)
+        );
+        if (unswept.length > 0) {
+          const fallbackStopPct = riskDistancePct(cfg, null, cfg.stopLossPct);
+          // Resolve stockIds for every held ticker (PaperOrder.stockId is required),
+          // including off-universe names absent from today's estimates.
+          const sweepStocks = await db.stock.findMany({
+            where: { ticker: { in: unswept } },
+            select: { id: true, ticker: true },
+          });
+          const stockIdByTicker = new Map(sweepStocks.map((s) => [s.ticker, s.id]));
+          for (const symbol of unswept) {
+            const pos = posBySymbol.get(symbol)!;
+            const qty = Math.floor(pos.qty);
+            if (qty < 1) continue; // long, whole-share only (Alpaca rejects stops otherwise)
+            const anchor = pos.avgEntryPrice ?? pos.currentPrice;
+            if (anchor == null || anchor <= 0) continue;
+            const stockId = stockIdByTicker.get(symbol);
+            try {
+              const order = await submitStopSell({ symbol, qty, stopPrice: cents(anchor * (1 - fallbackStopPct)) });
+              // Protection is placed at the broker either way; only persist the order
+              // record when we can attach it to a known stock (near-always true).
+              if (stockId) {
+                await db.paperOrder.create({
+                  data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
+                });
+              } else {
+                errors.push(`Protective-stop sweep placed a stop for ${symbol} but found no Stock row to record it`);
+              }
+              ordersSubmitted++;
+            } catch (e) {
+              alpacaOrderFailures++;
+              errors.push(`Alpaca protective-stop sweep failed for ${symbol}: ${String(e)}`);
+            }
           }
         }
       } else {
