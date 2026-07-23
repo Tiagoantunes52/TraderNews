@@ -483,7 +483,7 @@ export function reconcileRiskManaged(args: {
 // is the pure decision; the stage executes it via the alpaca-trading client.
 
 /** Cents-rounded price for Alpaca limit/stop fields. */
-function cents(v: number): number {
+export function cents(v: number): number {
   return Math.round(v * 100) / 100;
 }
 

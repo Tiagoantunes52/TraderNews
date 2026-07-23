@@ -26,6 +26,7 @@ import {
   getOpenOrders,
 } from "@/lib/alpaca-trading";
 import { isEmailConfigured, sendEmail, buildReviewEmail } from "@/lib/email";
+import { isReviewSlackConfigured, interpretAndPostReview } from "@/lib/review-interpret";
 import { reportError } from "@/lib/observability";
 import { dateStr, startOfUtcDay, universeWhere } from "./shared";
 
@@ -425,12 +426,14 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     notes,
   };
 
+  let persisted = false;
   try {
     await db.dailyReview.upsert({
       where: { date: todayUTC },
       create: { date: todayUTC, report, status, findingCount: ranked.length },
       update: { report, status, findingCount: ranked.length },
     });
+    persisted = true;
   } catch (e) {
     errors.push(`Review persist failed: ${String(e)}`);
     reportError("daily_review_persist_failed", e, { stage: "review" });
@@ -452,6 +455,32 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       }
     } catch (e) {
       errors.push(`Review email failed: ${String(e)}`);
+    }
+  }
+
+  // Interpret the report with an LLM and post it to Slack. Runs here — inside the
+  // reliably-triggered review stage — rather than from a separate GitHub Actions cron,
+  // whose drift/skips would make the Slack summary miss days (see review.yml). Gated on
+  // `persisted` so a persist failure (which re-runs the whole stage next tick) can't
+  // double-post. Best-effort, exactly like the email: never fails the stage.
+  if (persisted && isReviewSlackConfigured()) {
+    try {
+      const recent = await db.dailyReview.findMany({
+        where: { status: { not: null } },
+        orderBy: { date: "desc" },
+        take: 10,
+        select: { date: true, status: true, findingCount: true },
+      });
+      const history = recent.map((r) => ({
+        date: dateStr(r.date),
+        status: r.status ?? "",
+        findingCount: r.findingCount ?? 0,
+      }));
+      const res = await interpretAndPostReview(report, history);
+      if (!res.ok) errors.push(`Review Slack post failed: ${res.error}`);
+      else if (res.usedFallback) notes.push("Slack review posted with the deterministic fallback (LLM unavailable).");
+    } catch (e) {
+      errors.push(`Review Slack interpretation failed: ${String(e)}`);
     }
   }
 
