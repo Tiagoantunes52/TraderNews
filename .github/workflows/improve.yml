@@ -1,0 +1,124 @@
+name: Improvement Agent
+
+# Closes the observe → interpret → ACT loop: after the daily post-close review lands,
+# read the latest findings, pick ONE code-addressable finding not already handled, and
+# run the Claude Code Action to implement a minimal fix and open a PR. CI gates the PR;
+# a human reviews and merges — nothing here reaches main on its own.
+#
+# Trigger: once per trading day, after the review window (the review's pg_cron tick
+# produces the report ~1h after the close, and the interpret step posts to Slack right
+# after). GH cron drift is low-impact — a skipped run just defers a fix; findings persist.
+on:
+  schedule:
+    - cron: "30 23 * * 1-5"   # after the review lands + the interpret post
+  workflow_dispatch:           # manual trigger for rollout / testing
+
+concurrency:
+  group: improve-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # the action commits the fix to a branch
+  pull-requests: write   # …and opens the PR
+
+jobs:
+  improve:
+    runs-on: ubuntu-latest
+    environment: Production
+    # Kill-switch: the schedule only runs when the repo variable is explicitly enabled,
+    # but manual dispatch always runs so PRs can be reviewed during rollout with the
+    # schedule still off.
+    if: github.event_name == 'workflow_dispatch' || vars.IMPROVE_AGENT_ENABLED == 'true'
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check secrets are set
+        run: |
+          if [ -z "$APP_URL" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "$PIPELINE_SECRET" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+
+      # tsx (to run the selector) + the deps the agent needs to run npm test / tsc.
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Fetch latest daily review
+        run: |
+          curl -fsS "$APP_URL/api/reports/daily-review" \
+            -H "x-pipeline-secret: $PIPELINE_SECRET" -o report.json
+          echo "status=$(jq -r '.status' report.json), findings=$(jq -r '.findings | length' report.json)"
+
+      # Codes already covered by an open auto-improve PR, or one closed within 14 days —
+      # so we neither duplicate in-flight work nor immediately re-PR a just-merged/closed fix.
+      - name: Collect already-handled finding codes
+        id: handled
+        run: |
+          gh pr list --label auto-improve --state all --json title,state,closedAt --limit 100 > prs.json
+          codes=$(jq -r '
+            [ .[]
+              | select(.state == "OPEN" or (.closedAt != null and ((now - (.closedAt | fromdate)) < 1209600)))
+              | .title | sub("^auto-improve: "; "") ]
+            | unique | join(",")' prs.json)
+          echo "codes=$codes" >> "$GITHUB_OUTPUT"
+          echo "already handled: ${codes:-<none>}"
+
+      - name: Pick one finding
+        id: pick
+        run: |
+          npx tsx scripts/pick-finding.ts --report report.json --handled "${{ steps.handled.outputs.codes }}" > finding.txt
+          if [ "$(cat finding.txt)" = "none" ]; then
+            echo "has_finding=false" >> "$GITHUB_OUTPUT"
+            echo "No actionable finding this run — nothing to do."
+          else
+            echo "has_finding=true" >> "$GITHUB_OUTPUT"
+            echo "Picked: $(cat finding.txt)"
+          fi
+
+      # Combine the standing instructions with the chosen finding into one prompt.
+      - name: Build agent prompt
+        id: prompt
+        if: steps.pick.outputs.has_finding == 'true'
+        run: |
+          {
+            echo "prompt<<PROMPT_EOF"
+            cat .github/agent/improve-prompt.md
+            echo ""
+            echo "FINDING:"
+            cat finding.txt
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The agentic coding loop: reads the repo, diagnoses, edits, runs tests, opens the PR.
+      # Subscription auth via CLAUDE_CODE_OAUTH_TOKEN; ANTHROPIC_API_KEY is a drop-in fallback.
+      - name: Run improvement agent
+        if: steps.pick.outputs.has_finding == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+
+      # Optional end-to-end visibility. SLACK_WEBHOOK_URL is an app-server env var today,
+      # NOT a GitHub Actions secret — add it to the Production environment to enable this;
+      # otherwise the step self-skips.
+      - name: Notify Slack
+        if: steps.pick.outputs.has_finding == 'true' && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          code=$(jq -r '.code' finding.txt)
+          curl -fsS -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"🤖 Improvement agent ran for finding \`${code}\` — check open PRs labelled auto-improve.\"}" || true
