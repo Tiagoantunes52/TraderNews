@@ -20,6 +20,8 @@ concurrency:
 permissions:
   contents: write        # the action commits the fix to a branch
   pull-requests: write   # …and opens the PR
+  id-token: write        # OIDC exchange for the Claude GitHub App token (required for the
+                         # default GitHub auth — see anthropics/claude-code-action FAQ)
 
 jobs:
   improve:
@@ -32,7 +34,6 @@ jobs:
     env:
       APP_URL: ${{ secrets.APP_URL }}
       PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
 
@@ -61,8 +62,15 @@ jobs:
 
       # Codes already covered by an open auto-improve PR, or one closed within 14 days —
       # so we neither duplicate in-flight work nor immediately re-PR a just-merged/closed fix.
+      # The DEFAULT token is fine here — this only READS PRs. It is deliberately NOT set
+      # job-wide: if it leaked into the agent's shell, a PR opened by `gh` under the
+      # github-actions identity would not trigger CI (GitHub blocks that identity from
+      # starting workflows). The agent instead opens its PR via the Claude GitHub App
+      # token, which does trigger CI.
       - name: Collect already-handled finding codes
         id: handled
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh pr list --label auto-improve --state all --json title,state,closedAt --limit 100 > prs.json
           codes=$(jq -r '
@@ -100,7 +108,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # The agentic coding loop: reads the repo, diagnoses, edits, runs tests, opens the PR.
-      # Subscription auth via CLAUDE_CODE_OAUTH_TOKEN; ANTHROPIC_API_KEY is a drop-in fallback.
+      #
+      #  - MODEL auth: the user's Claude subscription via CLAUDE_CODE_OAUTH_TOKEN
+      #    (ANTHROPIC_API_KEY is a drop-in fallback). This is unrelated to GitHub auth.
+      #  - GITHUB auth: intentionally NO `github_token` — the action mints a Claude
+      #    GitHub App token via OIDC (hence `id-token: write` above). PRs opened by the
+      #    App trigger CI; PRs opened by the default GITHUB_TOKEN would NOT.
+      #  - TOOLS: Claude gets no Bash by default (only Edit/Read/Write). The agent needs
+      #    Bash to run `npm test`/`tsc`, git, and `gh pr create`, so grant it here.
+      #    `--max-turns` bounds the loop (and the cost) per run.
       - name: Run improvement agent
         if: steps.pick.outputs.has_finding == 'true'
         uses: anthropics/claude-code-action@v1
@@ -108,7 +124,9 @@ jobs:
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
+          claude_args: |
+            --allowedTools Edit,Read,Write,Bash
+            --max-turns 40
 
       # Optional end-to-end visibility. SLACK_WEBHOOK_URL is an app-server env var today,
       # NOT a GitHub Actions secret — add it to the Production environment to enable this;
