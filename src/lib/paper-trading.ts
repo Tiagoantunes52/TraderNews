@@ -270,7 +270,10 @@ export type ExitReason = "STOP" | "TRAIL" | "SIGNAL" | "DECAY" | "TIME";
 
 export type PositionAction =
   | { type: "OPEN"; qty: number; price: number }
-  | { type: "CLOSE"; price: number; realizedPnl: number; reason?: ExitReason }
+  // _RM closes carry the streak that triggered SIGNAL/DECAY (or held steady for the
+  // others) so the stage persists the value the decision actually fired on, not the
+  // prior run's — otherwise an audit reading the closed row sees a stale streak.
+  | { type: "CLOSE"; price: number; realizedPnl: number; reason?: ExitReason; bearishStreak?: number; staleStreak?: number }
   // _RM marks carry the running peak (for the trailing stop) plus the bearish-signal
   // and stale-signal streaks (confirmed-signal / decay exits) so the stage can persist them.
   | { type: "MARK"; price: number; peakPrice?: number; bearishStreak?: number; staleStreak?: number }
@@ -420,6 +423,8 @@ export function reconcileRiskManaged(args: {
       price,
       realizedPnl: realizedPnl(qty, entryPrice, price),
       reason,
+      bearishStreak,
+      staleStreak,
     });
 
     // 1. Hard stop-loss — never suppressed (capital protection comes first).

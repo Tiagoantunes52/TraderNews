@@ -326,6 +326,8 @@ describe("reconcileRiskManaged()", () => {
         price: 92,
         realizedPnl: -80,
         reason: "STOP",
+        bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -344,7 +346,7 @@ describe("reconcileRiskManaged()", () => {
       // well below the stop. We must realize the gapped 80, not pretend we got 92,
       // so the equity-curve drawdown isn't understated.
       const action = rm({ price: 80, runsSinceEntry: 0, signal: "BUY", open: long() });
-      expect(action).toEqual({ type: "CLOSE", price: 80, realizedPnl: -200, reason: "STOP" });
+      expect(action).toEqual({ type: "CLOSE", price: 80, realizedPnl: -200, reason: "STOP", bearishStreak: 0, staleStreak: 0 });
       // The gapped loss (−200) is strictly worse than a fill-at-the-stop (−80).
       expect((action as { realizedPnl: number }).realizedPnl).toBeLessThan(-80);
     });
@@ -358,6 +360,8 @@ describe("reconcileRiskManaged()", () => {
         price: 105,
         realizedPnl: 50,
         reason: "TRAIL",
+        bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -391,6 +395,10 @@ describe("reconcileRiskManaged()", () => {
         price: 98,
         realizedPnl: -20,
         reason: "SIGNAL",
+        // The streak that actually cleared confirmation, not the prior run's value
+        // — the audit reads this off the closed row (regression: was left unset).
+        bearishStreak: 2,
+        staleStreak: 0,
       });
     });
 
@@ -437,6 +445,8 @@ describe("reconcileRiskManaged()", () => {
         price: 101,
         realizedPnl: 10,
         reason: "TIME",
+        bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -502,6 +512,8 @@ describe("reconcileRiskManaged()", () => {
         price: 120,
         realizedPnl: 200,
         reason: "TRAIL",
+        bearishStreak: 0,
+        staleStreak: 0,
       });
     });
 
@@ -532,6 +544,10 @@ describe("reconcileRiskManaged()", () => {
         price: 106,
         realizedPnl: 60,
         reason: "DECAY",
+        // The matured streak (5), not the prior run's (4) — the daily-review audit
+        // reads this off the closed row and flags it as unconfirmed if it's stale.
+        bearishStreak: 0,
+        staleStreak: 5,
       });
     });
 

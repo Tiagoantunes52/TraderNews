@@ -554,6 +554,10 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               // The pure books have only one way out — the signal flipped off a buy —
               // so they carry SIGNAL; the _RM ladder names the rung that fired.
               exitReason: action.reason ?? "SIGNAL",
+              // Persist the streak the exit decision fired on (SIGNAL/DECAY), not the
+              // prior run's value, so the closed-position audit sees what actually happened.
+              ...(action.bearishStreak != null ? { bearishStreak: action.bearishStreak } : {}),
+              ...(action.staleStreak != null ? { staleStreak: action.staleStreak } : {}),
             },
           });
           simClosed++;
