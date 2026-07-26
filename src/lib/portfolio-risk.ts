@@ -292,3 +292,50 @@ export function evaluateBuy(
 
   return { allowed: true, reason: null };
 }
+
+/**
+ * The largest notional of `candidate` this book would accept, or 0 if no size is
+ * acceptable.
+ *
+ * `evaluateBuy` is all-or-nothing, which is right for the sim books: they measure
+ * signal quality, so a trade is either taken as sized or not taken. The LIVE book is
+ * different — it mirrors a sim decision, and vetoing it outright means the two books
+ * hold different names for reasons that have nothing to do with the signal. Since the
+ * live book runs its own gate against its own exposure, an all-or-nothing veto there
+ * double-counts risk the sim gate already applied.
+ *
+ * So the three SIZE caps (gross, per-name, per-cluster) clamp to their headroom
+ * instead of refusing, while the three caps that no amount of downsizing can satisfy
+ * — the kill-switch and the two count caps — still refuse. Callers must re-apply
+ * whole-share flooring afterwards; a clamp can round to zero shares, which is a
+ * legitimate "cannot take it".
+ */
+export function maxAllowedNotional(
+  book: BookExposure,
+  candidate: BuyCandidate,
+  limits: RiskLimits = DEFAULT_RISK_LIMITS,
+  regimeMult = 1
+): number {
+  const { equity } = book;
+  if (equity <= 0 || candidate.notional <= 0) return 0;
+
+  const dd = book.peakEquity > 0 ? Math.max(0, (book.peakEquity - book.equity) / book.peakEquity) : 0;
+
+  // Binary rules — downsizing cannot satisfy these.
+  if (dd >= limits.killSwitchDrawdownPct) return 0;
+  if (book.positions.length >= limits.maxPositions) return 0;
+  const clusterPositions = book.positions.filter((p) => p.cluster === candidate.cluster);
+  if (limits.maxClusterPositions > 0 && clusterPositions.length >= limits.maxClusterPositions) return 0;
+
+  // Size rules — take the tightest headroom.
+  const deployed = book.positions.reduce((s, p) => s + p.notional, 0);
+  const grossCap = limits.maxGrossExposurePct * deriskMultiplier(dd, limits) * regimeMult * equity;
+  const clusterDeployed = clusterPositions.reduce((s, p) => s + p.notional, 0);
+
+  const headroom = Math.min(
+    grossCap - deployed,
+    limits.maxPositionPct * equity,
+    limits.maxClusterPct * equity - clusterDeployed
+  );
+  return Math.max(0, Math.min(candidate.notional, headroom));
+}

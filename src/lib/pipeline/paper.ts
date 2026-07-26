@@ -37,6 +37,7 @@ import {
 import {
   isRiskLimitsEnabled,
   evaluateBuy,
+  maxAllowedNotional,
   regimeMultiplier,
   correlationClusters,
   clusterKeyFor,
@@ -280,6 +281,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       bearishStreak: true,
       staleStreak: true,
       entryAtrPct: true,
+      // Sizing input for the convergence sweep: a name it retries has no estimate
+      // this run, so the entry-day confidence is the only one available.
+      confidence: true,
     },
   });
   const openByKey = new Map(openPositions.map((p) => [`${p.stockId}|${p.strategy}`, p]));
@@ -500,12 +504,40 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         const br = bookRisk.get(strategy);
         if (br) {
           const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
-          if (evaluateBuy(br, candidate, limits, regimeMult).allowed) {
+          const verdict = evaluateBuy(br, candidate, limits, regimeMult);
+          if (verdict.allowed) {
             br.positions.push(candidate); // reserve so later opens this run see it
           } else {
             action = { type: "NONE" };
             decision.riskBlocked = true;
+            // Record WHICH rule vetoed it: without the reason a silently-halted book
+            // can only be diagnosed by rebuilding its equity from closed-position P&L.
+            decision.riskBlockReason = verdict.reason;
           }
+        }
+      }
+
+      // A close frees a slot. `bookRisk` is a snapshot taken at run start, so without
+      // this an exit and an entry on the same day can't trade places — the book waits
+      // for tomorrow's rebuild to notice the capacity. Mirrors the reservation above.
+      if (riskLimitsOn && action.type === "CLOSE" && STRATEGY_IS_RM[strategy] && open) {
+        const br = bookRisk.get(strategy);
+        if (br) {
+          const cluster = clusterKeyFor(est.stock.ticker, clusterByTicker);
+          const freed = open.qty * action.price;
+          // Same cluster (cluster caps care), then closest notional, so releasing one
+          // leg of a multi-position cluster doesn't free the wrong-sized slot.
+          let best = -1;
+          let bestDelta = Infinity;
+          for (let i = 0; i < br.positions.length; i++) {
+            if (br.positions[i].cluster !== cluster) continue;
+            const delta = Math.abs(br.positions[i].notional - freed);
+            if (delta < bestDelta) {
+              best = i;
+              bestDelta = delta;
+            }
+          }
+          if (best >= 0) br.positions.splice(best, 1);
         }
       }
 
@@ -715,15 +747,16 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // ── Alpaca book (only when paper keys are configured) ──────────────────────
   if (isPaperTradingConfigured()) {
     try {
-      // Reconcile fills for orders still pending from a previous run.
+      // Reconcile fills for orders still pending from a previous run. Filtered on
+      // status rather than taking the most recent N: the old window silently dropped
+      // any non-terminal order that fell outside it, stranding it at `new` forever
+      // and leaving every reader of PaperOrder working from a book that never closed.
       const pending = await db.paperOrder.findMany({
-        where: { alpacaOrderId: { not: null } },
+        where: { alpacaOrderId: { not: null }, status: { notIn: [...TERMINAL_ORDER_STATUS] } },
         orderBy: { submittedAt: "desc" },
-        take: 100,
         select: { id: true, alpacaOrderId: true, status: true },
       });
       for (const o of pending) {
-        if (TERMINAL_ORDER_STATUS.has(o.status)) continue;
         try {
           const remote = await getOrder(o.alpacaOrderId!);
           await db.paperOrder.update({
@@ -779,13 +812,26 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }
       }
       // Gate a live buy through the portfolio caps + kill-switch, reserving exposure
-      // when allowed. A no-op (always allows) when the risk limits are off.
-      const gateAlpacaBuy = (symbol: string, notional: number): boolean => {
-        if (!riskLimitsOn || !alpacaRisk) return true;
+      // when allowed. Returns the notional the book will accept — which may be LESS
+      // than asked. The sim gate has already vetoed on signal grounds by the time a
+      // decision reaches here, so refusing outright a second time (against a different
+      // book's exposure) drops names for reasons unrelated to the signal and silently
+      // widens live-vs-sim tracking error. Size caps clamp; the kill-switch and the
+      // count caps still refuse outright, since no smaller size satisfies them.
+      // Returns 0 when nothing is acceptable. A no-op (accepts in full) when the risk
+      // limits are off.
+      // Allowance and reservation are deliberately separate. A clamped notional can
+      // still floor to zero whole shares, and reserving before that is known would
+      // consume a position slot for a trade that never happened — blocking a later,
+      // viable name. Callers reserve only once they commit.
+      const allowedAlpacaBuy = (symbol: string, notional: number): number => {
+        if (!riskLimitsOn || !alpacaRisk) return notional;
         const candidate = { cluster: clusterKeyFor(symbol, clusterByTicker), notional };
-        if (!evaluateBuy(alpacaRisk, candidate, limits, regimeMult).allowed) return false;
-        alpacaRisk.positions.push(candidate);
-        return true;
+        return maxAllowedNotional(alpacaRisk, candidate, limits, regimeMult);
+      };
+      const reserveAlpacaBuy = (symbol: string, notional: number): void => {
+        if (!riskLimitsOn || !alpacaRisk) return;
+        alpacaRisk.positions.push({ cluster: clusterKeyFor(symbol, clusterByTicker), notional });
       };
 
       if (brokerStops) {
@@ -812,6 +858,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         // that has since grown), which planBrokerAction may then *catch up*.
         const rmOpens = openPositions.filter((p) => p.strategy === "COMBINED_RM");
         const everAttemptedByStock = new Map<string, boolean>();
+        // How long ago that attempt was, so the re-entry guard can expire rather than
+        // stranding a name for as long as the sim keeps holding it.
+        const runsSinceAttemptByStock = new Map<string, number>();
         if (rmOpens.length > 0) {
           const rmEntryByStock = new Map(rmOpens.map((p) => [p.stockId, p.entryDate]));
           const buys = await db.paperOrder.findMany({
@@ -823,7 +872,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           for (const b of buys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
           for (const [stockId, entryDate] of rmEntryByStock) {
             const last = lastBuyByStock.get(stockId);
-            everAttemptedByStock.set(stockId, last != null && last >= entryDate);
+            const attempted = last != null && last >= entryDate;
+            everAttemptedByStock.set(stockId, attempted);
+            if (attempted) runsSinceAttemptByStock.set(stockId, utcDaysBetween(last!, todayUTC));
           }
         }
 
@@ -842,6 +893,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             exitReason: combinedRmExit.get(est.stockId) ?? null,
             held: !!held,
             everAttempted: everAttemptedByStock.get(est.stockId) ?? true,
+            runsSinceAttempt: runsSinceAttemptByStock.get(est.stockId) ?? null,
             avgEntryPrice: held?.avgEntryPrice ?? null,
             currentPrice: held?.currentPrice ?? null,
             restingProtectiveType: protective?.type === "trailing_stop" ? "trailing_stop" : protective ? "stop" : null,
@@ -852,15 +904,23 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             cfg,
           });
           try {
-            if (action.type === "ENTER" && gateAlpacaBuy(ticker, action.qty * price)) {
+            // The gate may hand back less than asked; re-floor to whole shares (the
+            // stop leg needs them) and take the smaller size rather than skipping the
+            // name — a partial mirror tracks the sim better than an absent one.
+            const enterQty =
+              action.type === "ENTER"
+                ? Math.min(action.qty, Math.floor(allowedAlpacaBuy(ticker, action.qty * price) / price))
+                : 0;
+            if (action.type === "ENTER" && enterQty >= 1) {
+              reserveAlpacaBuy(ticker, enterQty * price);
               const { order, stopOrderId } = await submitEntryWithStop({
                 symbol: ticker,
-                qty: action.qty,
+                qty: enterQty,
                 limitPrice: action.limitPrice,
                 stopPrice: action.stopPrice,
               });
               await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: action.qty, alpacaOrderId: order.id, status: order.status },
+                data: { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: enterQty, alpacaOrderId: order.id, status: order.status },
               });
               if (stopOrderId) {
                 // Record the protective leg so the pending-fill reconcile loop catches
@@ -985,6 +1045,109 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             }
           }
         }
+
+        // Converse sweep — the missing half of convergence. Everything above starts
+        // from what the BROKER holds, so it can only ever repair "the broker has too
+        // much". A name the sim is long that the broker is flat in, and that produced
+        // no estimate this run, is visited by nothing: its entry is never retried and
+        // the divergence persists until the sim exits. That asymmetry is why the live
+        // book drifted to 3 of 8 names while only ever selling.
+        //
+        // Desired state is the sim's long set, so walk the names still missing after
+        // the loop and try to enter them. Same guard, gate and whole-share rules as a
+        // normal entry — this is a retry, not a bypass.
+        try {
+          // Desired state is EVERY open COMBINED_RM position, not just the ones with a
+          // fresh estimate — `combinedRmLong`, `tickerByStock` and `openByKey` are all
+          // built from today's estimates, so a name that dropped out of the universe or
+          // produced no news/quant today appears in none of them. Those are precisely
+          // the names nothing else visits, so they're queried directly here.
+          const simLongAll = await db.simPosition.findMany({
+            where: { strategy: "COMBINED_RM", status: "OPEN" },
+            select: { stockId: true, entryDate: true, entryAtrPct: true, confidence: true, stock: { select: { ticker: true } } },
+          });
+          const estimatedStockIds = new Set(estimates.map((e) => e.stockId));
+          const missing = simLongAll.filter(
+            (p) =>
+              !posBySymbol.has(p.stock.ticker) &&
+              !managedSymbols.has(p.stock.ticker) &&
+              // Names with an estimate were already decided above on fresher inputs;
+              // re-deciding them here on a stale close would second-guess that.
+              !estimatedStockIds.has(p.stockId)
+          );
+          if (missing.length > 0) {
+            // No fresh estimate by construction, so price and ATR come from the last
+            // known quant close rather than this run's inputs.
+            const lastQuant = await db.quantAnalysis.findMany({
+              where: { stockId: { in: missing.map((p) => p.stockId) }, price: { not: null } },
+              orderBy: { date: "desc" },
+              select: { stockId: true, price: true, atrPct: true },
+            });
+            const quantByStock = new Map<string, { price: number; atrPct: number | null }>();
+            for (const q of lastQuant) {
+              if (!quantByStock.has(q.stockId)) quantByStock.set(q.stockId, { price: q.price!, atrPct: q.atrPct ?? null });
+            }
+            // Attempt history for THIS set — the maps built above only cover names with
+            // an estimate today, so reusing them would leave the guard permanently
+            // unexpired for every name this sweep exists to reach.
+            const sweepBuys = await db.paperOrder.findMany({
+              where: { side: "BUY", stockId: { in: missing.map((p) => p.stockId) } },
+              select: { stockId: true, submittedAt: true },
+              orderBy: { submittedAt: "desc" },
+            });
+            const lastBuyByStock = new Map<string, Date>();
+            for (const b of sweepBuys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+
+            for (const { stockId, stock, entryDate, entryAtrPct, confidence } of missing) {
+              const ticker = stock.ticker;
+              const quant = quantByStock.get(stockId);
+              if (!quant || quant.price <= 0) continue;
+              const lastBuy = lastBuyByStock.get(stockId);
+              const attempted = lastBuy != null && lastBuy >= entryDate;
+              const action = planBrokerAction({
+                opened: false,
+                stillLong: true,
+                exitReason: null,
+                held: false,
+                everAttempted: attempted,
+                runsSinceAttempt: attempted ? utcDaysBetween(lastBuy!, todayUTC) : null,
+                avgEntryPrice: null,
+                currentPrice: quant.price,
+                restingProtectiveType: null,
+                price: quant.price,
+                atrPct: entryAtrPct ?? quant.atrPct,
+                confidence,
+                cfg,
+              });
+              if (action.type !== "ENTER") continue;
+              const qty = Math.min(action.qty, Math.floor(allowedAlpacaBuy(ticker, action.qty * quant.price) / quant.price));
+              if (qty < 1) continue;
+              try {
+                reserveAlpacaBuy(ticker, qty * quant.price);
+                const { order, stopOrderId } = await submitEntryWithStop({
+                  symbol: ticker,
+                  qty,
+                  limitPrice: action.limitPrice,
+                  stopPrice: action.stopPrice,
+                });
+                await db.paperOrder.create({
+                  data: { stockId, side: "BUY", signal: "CONVERGE_ENTRY", qty, alpacaOrderId: order.id, status: order.status },
+                });
+                if (stopOrderId) {
+                  await db.paperOrder.create({
+                    data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: stopOrderId, status: "new" },
+                  });
+                }
+                ordersSubmitted++;
+              } catch (e) {
+                alpacaOrderFailures++;
+                errors.push(`Convergence entry failed for ${ticker}: ${String(e)}`);
+              }
+            }
+          }
+        } catch (e) {
+          errors.push(`Convergence sweep failed: ${String(e)}`);
+        }
       } else {
         for (const est of estimates) {
           const ticker = est.stock.ticker;
@@ -1004,10 +1167,14 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                     cfg.riskPerTrade
                   )
                 : confidenceNotional(est.confidence);
-              if (gateAlpacaBuy(ticker, notional)) {
-                const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional });
+              // No stop leg here, so fractional notional is fine and the clamp can be
+              // taken as-is — no whole-share flooring to lose it to.
+              const allowed = allowedAlpacaBuy(ticker, notional);
+              if (allowed > 0) {
+                reserveAlpacaBuy(ticker, allowed);
+                const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional: allowed });
                 await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional, alpacaOrderId: order.id, status: order.status },
+                  data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional: allowed, alpacaOrderId: order.id, status: order.status },
                 });
                 ordersSubmitted++;
               }

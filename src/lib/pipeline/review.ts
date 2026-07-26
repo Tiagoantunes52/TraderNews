@@ -5,6 +5,8 @@ import {
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
+  auditRiskBlocks,
+  auditTrackingError,
   reconcileBroker,
   auditHealth,
   summarizeStrategies,
@@ -49,6 +51,12 @@ const WINDOW_TO_MIN = Number(process.env.REVIEW_WINDOW_TO_MIN) || 115;
 
 /** Trailing window for the strategy rollups — enough closes to mean something. */
 const TUNING_LOOKBACK_DAYS = Number(process.env.REVIEW_TUNING_LOOKBACK_DAYS) || 90;
+
+// Fraction of the sim's trackable names the live book must actually hold before its
+// P&L stops being evidence about the strategy. 0.7 tolerates the ordinary one- or
+// two-name lag from a pending fill while still failing the state that went unnoticed
+// for 17 trading days (3 of 8 names = 0.38).
+const LIVE_TRACKING_MIN_COVERAGE = Number(process.env.REVIEW_TRACKING_MIN_COVERAGE) || 0.7;
 
 /**
  * True when we're in the post-close window. Prefers the broker calendar, which
@@ -150,7 +158,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
 
   const findings: Finding[] = [];
   const notes: string[] = [];
-  const { risk: cfg, issues: configIssues } = await loadTradingConfig();
+  const { risk: cfg, limits, issues: configIssues } = await loadTradingConfig();
   if (configIssues.length > 0) errors.push(`Trading config: ${configIssues.join("; ")}`);
 
   const runLog = (existing?.paperRun ?? null) as PaperRunLog | null;
@@ -160,6 +168,9 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   if (runLog?.decisions) {
     try {
       findings.push(...replayDecisions(runLog));
+      // Separate from the replay: the replay asks "did the rules produce the right
+      // decision?", this asks "was the decision allowed to happen at all?".
+      findings.push(...auditRiskBlocks(runLog.decisions, limits));
       replayed = runLog.decisions.length;
       for (const err of runLog.errors ?? []) notes.push(`paper: ${err}`);
     } catch (e) {
@@ -274,6 +285,18 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
             filledAvgPrice: o.filledAvgPrice,
           })),
           brokerStopsEnabled: runLog?.flags.brokerStops ?? false,
+        })
+      );
+      // reconcileBroker names the divergent tickers per category; this scores the
+      // drift as one number, so a live book quietly holding a fraction of the sim
+      // reads as a single fail instead of a list a reader has to add up.
+      findings.push(
+        ...auditTrackingError({
+          simLong: openPositions
+            .filter((p) => p.strategy === "COMBINED_RM")
+            .map((p) => ({ ticker: p.ticker, qty: p.qty })),
+          brokerSymbols: brokerPositions.map((p) => p.symbol),
+          minCoverage: LIVE_TRACKING_MIN_COVERAGE,
         })
       );
     } catch (e) {

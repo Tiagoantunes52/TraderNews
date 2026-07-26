@@ -121,6 +121,7 @@ export type RiskConfig = {
   riskPerTrade: number; // $ lost if the stop fires at confidence 1 — drives sizing
   insiderHoldDays: number; // event-book fixed holding period (UTC days ≈ 40 trading days)
   insiderNotional: number; // $ per insider-event position (flat — no confidence weighting)
+  brokerReentryRuns: number; // runs before the live book may re-enter a name it exited (0 = never)
 };
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
@@ -146,6 +147,13 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   // of the research-backed 20–60-day drift window for insider cluster buys.
   insiderHoldDays: 56,
   insiderNotional: 1000,
+  // Runs after a broker entry attempt before the live book may re-enter a name the
+  // sim still holds. The re-entry guard exists so a stopped-out name isn't bought
+  // straight back, but an unbounded guard leaves the live book flat for as long as
+  // the sim keeps riding the position — which is how MA/SNOW/TMO/UNH (the sim's
+  // best performers) ended up missing from the live book for weeks. 0 disables
+  // re-entry entirely (the old unbounded behaviour).
+  brokerReentryRuns: 10,
 };
 
 /** The active risk overlay, with each field overridable by its PAPER_* env var. */
@@ -169,6 +177,7 @@ export function riskConfig(): RiskConfig {
     riskPerTrade: numEnv("PAPER_RISK_PER_TRADE", DEFAULT_RISK_CONFIG.riskPerTrade),
     insiderHoldDays: numEnv("PAPER_INSIDER_HOLD_DAYS", DEFAULT_RISK_CONFIG.insiderHoldDays),
     insiderNotional: numEnv("PAPER_INSIDER_NOTIONAL", DEFAULT_RISK_CONFIG.insiderNotional),
+    brokerReentryRuns: numEnv("PAPER_BROKER_REENTRY_RUNS", DEFAULT_RISK_CONFIG.brokerReentryRuns),
   };
 }
 
@@ -509,7 +518,8 @@ export type BrokerAction =
  *   placed this episode (`everAttempted` false) — e.g. the risk caps gated the buy
  *   when the sim opened, or a sub-share position has since grown to a whole share.
  *   A name the broker DID enter and then stopped out has `everAttempted` true and is
- *   left flat until the sim also exits — never re-bought (the re-entry guard).
+ *   left flat (the re-entry guard) until either the sim exits, or `brokerReentryRuns`
+ *   runs pass — the bound that stops the guard stranding the sim's winners forever.
  * - While held & still-long: arm the trailing stop once up `trailActivatePct` (a fixed
  *   stop is resting), tighten a resting trailing stop once up `trailRatchetActivatePct`
  *   (only when strictly tighter, so it never churns), or repair a missing protective
@@ -521,6 +531,7 @@ export function planBrokerAction(input: {
   exitReason: string | null; // COMBINED_RM close reason this run (STOP|TRAIL|SIGNAL|DECAY|TIME)
   held: boolean; // live Alpaca position exists
   everAttempted?: boolean; // broker already placed an entry order this episode (default true = re-entry guard on)
+  runsSinceAttempt?: number | null; // UTC days since that entry attempt; null/undefined = unknown (guard never expires)
   avgEntryPrice: number | null;
   currentPrice: number | null;
   restingProtectiveType: "stop" | "trailing_stop" | null; // resting protective order, if any
@@ -537,15 +548,28 @@ export function planBrokerAction(input: {
   // Unknown history ⇒ assume the broker already acted, so we never catch-up-buy a name
   // that was actually stopped out. Only an explicit `false` unlocks a catch-up entry.
   const everAttempted = input.everAttempted ?? true;
+  // Unknown age ⇒ the guard cannot expire, so a caller that doesn't track attempt
+  // dates keeps exactly the old behaviour.
+  const runsSinceAttempt = input.runsSinceAttempt ?? null;
 
   const infoExit = exitReason === "SIGNAL" || exitReason === "DECAY" || exitReason === "TIME";
   if (held && infoExit) return { type: "EXIT", reason: exitReason! };
 
   if (!held) {
     // Fresh open, or a catch-up for an entry that never took hold (gated / sub-share
-    // that grew). Never a name the broker entered then stopped out — that keeps
-    // `everAttempted` true and stays flat until the sim exits (the re-entry guard).
-    const catchUp = stillLong && !everAttempted;
+    // that grew), or a name whose re-entry guard has since expired.
+    //
+    // The guard stops the live book buying straight back into a name it just stopped
+    // out of. Unbounded, though, it also strands every name the broker exited while
+    // the sim kept holding — the live book then tracks the sim's *losers* (which the
+    // sim exits, resetting the episode) and misses its *winners* (which the sim keeps
+    // riding). `brokerReentryRuns` bounds it: after that many runs the live book is
+    // allowed to converge back onto the sim. 0 keeps the old unbounded behaviour.
+    const guardExpired =
+      cfg.brokerReentryRuns > 0 &&
+      runsSinceAttempt != null &&
+      runsSinceAttempt >= cfg.brokerReentryRuns;
+    const catchUp = stillLong && (!everAttempted || guardExpired);
     if ((opened || catchUp) && price > 0) {
       const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
       const qty = Math.floor(riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price);

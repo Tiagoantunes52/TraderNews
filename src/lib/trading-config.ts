@@ -53,6 +53,7 @@ export const TRADING_KNOBS: Record<TradingKnobKey, TradingKnobSpec> = {
   atrStopCapPct: { env: "PAPER_ATR_STOP_CAP_PCT", def: DEFAULT_RISK_CONFIG.atrStopCapPct, min: 0.01, max: 0.5, group: "exits", label: "Cap for the ATR-scaled distance" },
   signalConfirmRuns: { env: "PAPER_SIGNAL_CONFIRM_RUNS", def: DEFAULT_RISK_CONFIG.signalConfirmRuns, min: 1, max: 30, int: true, group: "exits", label: "Consecutive bearish days before a signal exit" },
   decayRuns: { env: "PAPER_DECAY_RUNS", def: DEFAULT_RISK_CONFIG.decayRuns, min: 0, max: 60, int: true, group: "exits", label: "No-conviction days before a profitable exit (0 disables)" },
+  brokerReentryRuns: { env: "PAPER_BROKER_REENTRY_RUNS", def: DEFAULT_RISK_CONFIG.brokerReentryRuns, min: 0, max: 120, int: true, group: "entry", label: "Days before the live book may re-enter a name it exited (0 = never)" },
   minHoldRuns: { env: "PAPER_MIN_HOLD_RUNS", def: DEFAULT_RISK_CONFIG.minHoldRuns, min: 0, max: 30, int: true, group: "exits", label: "Days suppressing trail/signal/decay exits (stop stays live)" },
   timeStopRuns: { env: "PAPER_TIME_STOP_RUNS", def: DEFAULT_RISK_CONFIG.timeStopRuns, min: 0, max: 120, int: true, group: "exits", label: "Days of dead money before a time stop (0 disables)" },
   timeStopBandPct: { env: "PAPER_TIME_STOP_BAND_PCT", def: DEFAULT_RISK_CONFIG.timeStopBandPct, min: 0, max: 0.2, group: "exits", label: "± band around entry that counts as dead money" },

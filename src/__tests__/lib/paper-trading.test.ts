@@ -617,7 +617,38 @@ describe("planBrokerAction()", () => {
     cfg: DEFAULT_RISK_CONFIG,
     entryLimitBufferPct: 0.005,
   };
-  const plan = (o: Partial<typeof base>) => planBrokerAction({ ...base, ...o });
+  const plan = (o: Partial<typeof base> & { runsSinceAttempt?: number | null }) =>
+    planBrokerAction({ ...base, ...o });
+
+  describe("re-entry guard expiry", () => {
+    // The guard leaves a stopped-out name flat so it isn't bought straight back.
+    // Unbounded it also strands the sim's winners, which the live book then never
+    // holds — bounded, it converges back once brokerReentryRuns have passed.
+    it("stays flat while the guard is young", () => {
+      const cfg = { ...DEFAULT_RISK_CONFIG, brokerReentryRuns: 10 };
+      expect(plan({ cfg, everAttempted: true, runsSinceAttempt: 9 }).type).toBe("NONE");
+    });
+
+    it("re-enters once the guard has expired", () => {
+      const cfg = { ...DEFAULT_RISK_CONFIG, brokerReentryRuns: 10 };
+      expect(plan({ cfg, everAttempted: true, runsSinceAttempt: 10 }).type).toBe("ENTER");
+    });
+
+    it("never expires when brokerReentryRuns is 0 (old unbounded behaviour)", () => {
+      const cfg = { ...DEFAULT_RISK_CONFIG, brokerReentryRuns: 0 };
+      expect(plan({ cfg, everAttempted: true, runsSinceAttempt: 999 }).type).toBe("NONE");
+    });
+
+    it("never expires when the attempt age is unknown", () => {
+      const cfg = { ...DEFAULT_RISK_CONFIG, brokerReentryRuns: 10 };
+      expect(plan({ cfg, everAttempted: true, runsSinceAttempt: null }).type).toBe("NONE");
+    });
+
+    it("does not re-enter a name the sim has exited, however old the attempt", () => {
+      const cfg = { ...DEFAULT_RISK_CONFIG, brokerReentryRuns: 10 };
+      expect(plan({ cfg, stillLong: false, everAttempted: true, runsSinceAttempt: 99 }).type).toBe("NONE");
+    });
+  });
 
   describe("entry (whole-share, marketable-limit + ATR stop)", () => {
     it("enters on a fresh sim OPEN when flat, flooring to whole shares", () => {

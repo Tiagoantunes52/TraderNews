@@ -20,6 +20,7 @@ import {
   type RiskConfig,
   type Strategy,
 } from "@/lib/paper-trading";
+import { type RiskBlockReason, type RiskLimits } from "@/lib/portfolio-risk";
 
 export type Severity = "info" | "warn" | "fail";
 
@@ -96,6 +97,12 @@ export type DecisionRecord = {
   action: LoggedAction;
   /** True when the portfolio gate vetoed a would-be OPEN (so nothing was persisted). */
   riskBlocked?: boolean;
+  /**
+   * WHICH gate rule vetoed it. Without this the log says a book stopped trading but
+   * not why, and telling "at the position cap" apart from "kill-switch tripped" means
+   * reconstructing book equity by hand from closed-position P&L.
+   */
+  riskBlockReason?: RiskBlockReason | null;
 };
 
 export type PaperRunLog = {
@@ -510,6 +517,107 @@ export function auditEntries(openedToday: AuditPosition[], cfg: RiskConfig): Fin
     }
   }
   return out;
+}
+
+/**
+ * A book whose every would-be entry is vetoed by the portfolio gate has silently
+ * stopped trading. The reconciler keeps producing OPENs and the gate keeps dropping
+ * them, so nothing looks broken: no error, no failed stage, just a book that only
+ * ever shrinks. COMBINED_RM went 17 trading days that way (2026-07-01 onward) and
+ * took the live Alpaca book with it — the live book mirrors COMBINED_RM, so it
+ * submitted sells only and drained to three names before anyone noticed.
+ *
+ * One fully-blocked day is not itself a fault — a book sitting at maxPositions is
+ * the cap doing its job. What this surfaces is the *state*, so a run of them is
+ * visible rather than inferred. It escalates to `fail` when the book holds MORE
+ * than maxPositions, because a book above its own cap cannot open anything until
+ * it drains, and nothing in the system trims it back.
+ */
+export function auditRiskBlocks(decisions: DecisionRecord[], limits: RiskLimits): Finding[] {
+  const out: Finding[] = [];
+  const byStrategy = new Map<Strategy, DecisionRecord[]>();
+  for (const d of decisions) {
+    if (!STRATEGY_IS_RM[d.strategy]) continue;
+    const list = byStrategy.get(d.strategy) ?? [];
+    list.push(d);
+    byStrategy.set(d.strategy, list);
+  }
+
+  for (const [strategy, ds] of [...byStrategy].sort(([a], [b]) => a.localeCompare(b))) {
+    const wanted = ds.filter((d) => d.action.type === "OPEN");
+    if (wanted.length === 0) continue;
+    const blocked = wanted.filter((d) => d.riskBlocked);
+    if (blocked.length < wanted.length) continue; // some got through — the book still trades
+
+    // MARK/CLOSE are the names the book was already holding when the run started,
+    // which is what the gate counted against maxPositions.
+    const held = ds.filter((d) => d.action.type === "MARK" || d.action.type === "CLOSE").length;
+    const overCap = held > limits.maxPositions;
+
+    // Report the dominant reason; a book is usually blocked by one rule, and naming
+    // it is the difference between "at the cap" and "kill-switch tripped".
+    const tally = new Map<string, number>();
+    for (const d of blocked) {
+      const r = d.riskBlockReason ?? "UNKNOWN";
+      tally.set(r, (tally.get(r) ?? 0) + 1);
+    }
+    const [reason] = [...tally].sort((a, b) => b[1] - a[1])[0] ?? ["UNKNOWN"];
+
+    out.push(
+      finding(
+        overCap ? "fail" : "warn",
+        "ENTRIES_ALL_RISK_BLOCKED",
+        `${strategy}: every entry blocked by the portfolio gate`,
+        `All ${wanted.length} would-be entries were vetoed (${reason}). The book holds ${held} of a ${limits.maxPositions} maximum` +
+          (overCap
+            ? `, which is ABOVE the cap — it cannot open anything until exits drain it below ${limits.maxPositions}, and nothing trims it automatically.`
+            : `. It resumes trading as soon as a slot frees.`),
+        { strategy, blocked: blocked.length, held, maxPositions: limits.maxPositions, reason }
+      )
+    );
+  }
+  return out;
+}
+
+/**
+ * One number for how far the live book has drifted from the sim book it mirrors.
+ *
+ * `reconcileBroker` already names the divergent tickers, but it emits one finding per
+ * *category* — and a reader scanning "COMBINED_RM is long MA, SNOW, TMO, UNH but the
+ * paper account is flat in them" cannot tell a routine one-name lag from a live book
+ * holding three of eight names and missing its four best. That distinction is the
+ * whole point: the live book existing to track the sim is only true while it does.
+ *
+ * Coverage = sim names the broker actually holds ÷ sim names it should. Sub-share
+ * names are excluded from the denominator: whole-share sizing structurally cannot
+ * hold them, so counting them as drift would make the metric permanently red for a
+ * reason no fix addresses.
+ */
+export function auditTrackingError(args: {
+  simLong: { ticker: string; qty: number }[];
+  brokerSymbols: string[];
+  minCoverage: number; // fraction below which this is a fail (e.g. 0.7)
+}): Finding[] {
+  const held = new Set(args.brokerSymbols);
+  // A sim leg under one share can never be mirrored — not drift, just granularity.
+  const trackable = args.simLong.filter((p) => p.qty >= 1);
+  if (trackable.length === 0) return [];
+
+  const missing = trackable.filter((p) => !held.has(p.ticker)).map((p) => p.ticker);
+  const coverage = (trackable.length - missing.length) / trackable.length;
+  if (missing.length === 0) return [];
+
+  const pct = (coverage * 100).toFixed(0);
+  return [
+    finding(
+      coverage < args.minCoverage ? "fail" : "warn",
+      "LIVE_TRACKING_ERROR",
+      `Live book tracks ${pct}% of the COMBINED_RM names it mirrors`,
+      `Holding ${trackable.length - missing.length} of ${trackable.length} trackable sim names; missing ${missing.join(", ")}. ` +
+        `The live book only means anything while it tracks the sim — below ${(args.minCoverage * 100).toFixed(0)}% its P&L stops being evidence about the strategy.`,
+      { coverage: Number(coverage.toFixed(3)), missing: missing.join(","), trackable: trackable.length }
+    ),
+  ];
 }
 
 // ── 3. Broker reconciliation ─────────────────────────────────────────────────
