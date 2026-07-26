@@ -6,6 +6,7 @@ import {
   auditOpenPositions,
   auditEntries,
   auditRiskBlocks,
+  auditTrackingError,
   reconcileBroker,
   auditHealth,
   summarizeStrategies,
@@ -429,6 +430,57 @@ describe("auditRiskBlocks", () => {
     );
     expect(found).toHaveLength(2);
     expect(found.map((f) => f.refs?.strategy)).toEqual(["COMBINED_RM", "SENTIMENT_RM"]);
+  });
+});
+
+describe("auditTrackingError", () => {
+  const sim = (...names: string[]) => names.map((ticker) => ({ ticker, qty: 5 }));
+
+  it("is silent when the live book holds every trackable name", () => {
+    const found = auditTrackingError({ simLong: sim("A", "B"), brokerSymbols: ["A", "B"], minCoverage: 0.7 });
+    expect(found).toEqual([]);
+  });
+
+  it("warns on a small gap that still clears the threshold", () => {
+    // 3 of 4 = 0.75, above 0.7.
+    const found = auditTrackingError({
+      simLong: sim("A", "B", "C", "D"),
+      brokerSymbols: ["A", "B", "C"],
+      minCoverage: 0.7,
+    });
+    expect(codes(found)).toEqual(["LIVE_TRACKING_ERROR"]);
+    expect(found[0].severity).toBe("warn");
+    expect(found[0].detail).toContain("D");
+  });
+
+  it("fails once coverage drops below the threshold", () => {
+    // The observed state: 3 of 8 = 0.375.
+    const found = auditTrackingError({
+      simLong: sim("SCHW", "JNJ", "PM", "TMO", "UNH", "SNOW", "MA", "QQQ"),
+      brokerSymbols: ["SCHW", "JNJ", "PM"],
+      minCoverage: 0.7,
+    });
+    expect(found[0].severity).toBe("fail");
+    expect(found[0].refs).toMatchObject({ coverage: 0.375, trackable: 8 });
+  });
+
+  it("excludes sub-share legs — whole-share sizing can never hold them", () => {
+    // QQQ at 0.75 shares is granularity, not drift, so coverage stays 1/1.
+    const found = auditTrackingError({
+      simLong: [{ ticker: "A", qty: 5 }, { ticker: "QQQ", qty: 0.75 }],
+      brokerSymbols: ["A"],
+      minCoverage: 0.7,
+    });
+    expect(found).toEqual([]);
+  });
+
+  it("is silent when nothing is trackable at all", () => {
+    const found = auditTrackingError({
+      simLong: [{ ticker: "QQQ", qty: 0.4 }],
+      brokerSymbols: [],
+      minCoverage: 0.7,
+    });
+    expect(found).toEqual([]);
   });
 });
 

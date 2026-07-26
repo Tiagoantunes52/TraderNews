@@ -579,6 +579,47 @@ export function auditRiskBlocks(decisions: DecisionRecord[], limits: RiskLimits)
   return out;
 }
 
+/**
+ * One number for how far the live book has drifted from the sim book it mirrors.
+ *
+ * `reconcileBroker` already names the divergent tickers, but it emits one finding per
+ * *category* — and a reader scanning "COMBINED_RM is long MA, SNOW, TMO, UNH but the
+ * paper account is flat in them" cannot tell a routine one-name lag from a live book
+ * holding three of eight names and missing its four best. That distinction is the
+ * whole point: the live book existing to track the sim is only true while it does.
+ *
+ * Coverage = sim names the broker actually holds ÷ sim names it should. Sub-share
+ * names are excluded from the denominator: whole-share sizing structurally cannot
+ * hold them, so counting them as drift would make the metric permanently red for a
+ * reason no fix addresses.
+ */
+export function auditTrackingError(args: {
+  simLong: { ticker: string; qty: number }[];
+  brokerSymbols: string[];
+  minCoverage: number; // fraction below which this is a fail (e.g. 0.7)
+}): Finding[] {
+  const held = new Set(args.brokerSymbols);
+  // A sim leg under one share can never be mirrored — not drift, just granularity.
+  const trackable = args.simLong.filter((p) => p.qty >= 1);
+  if (trackable.length === 0) return [];
+
+  const missing = trackable.filter((p) => !held.has(p.ticker)).map((p) => p.ticker);
+  const coverage = (trackable.length - missing.length) / trackable.length;
+  if (missing.length === 0) return [];
+
+  const pct = (coverage * 100).toFixed(0);
+  return [
+    finding(
+      coverage < args.minCoverage ? "fail" : "warn",
+      "LIVE_TRACKING_ERROR",
+      `Live book tracks ${pct}% of the COMBINED_RM names it mirrors`,
+      `Holding ${trackable.length - missing.length} of ${trackable.length} trackable sim names; missing ${missing.join(", ")}. ` +
+        `The live book only means anything while it tracks the sim — below ${(args.minCoverage * 100).toFixed(0)}% its P&L stops being evidence about the strategy.`,
+      { coverage: Number(coverage.toFixed(3)), missing: missing.join(","), trackable: trackable.length }
+    ),
+  ];
+}
+
 // ── 3. Broker reconciliation ─────────────────────────────────────────────────
 
 export type BrokerPosition = { symbol: string; qty: number; avgEntryPrice: number | null; currentPrice: number | null };

@@ -11,6 +11,7 @@ import {
   currentDrawdown,
   deriskMultiplier,
   evaluateBuy,
+  maxAllowedNotional,
   regimeMultiplier,
   type BookExposure,
   type RiskLimits,
@@ -123,6 +124,72 @@ describe("deriskMultiplier", () => {
     expect(deriskMultiplier(0.15, limits)).toBeCloseTo(0.5, 5); // halfway
     expect(deriskMultiplier(0.2, limits)).toBe(0);
     expect(deriskMultiplier(0.3, limits)).toBe(0);
+  });
+});
+
+describe("maxAllowedNotional", () => {
+  const limits = DEFAULT_RISK_LIMITS;
+  const book = (over: Partial<BookExposure> = {}): BookExposure => ({
+    equity: 100_000,
+    peakEquity: 100_000,
+    positions: [],
+    ...over,
+  });
+
+  it("passes a request that already fits, unchanged", () => {
+    expect(maxAllowedNotional(book(), { cluster: "AAA", notional: 1000 }, limits)).toBe(1000);
+  });
+
+  it("clamps to gross headroom instead of refusing", () => {
+    // 95% of 100k = 95k cap; 94.5k deployed leaves 500 of the 1000 asked.
+    const b = book({ positions: [{ cluster: "ZZZ", notional: 94_500 }] });
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 1000 }, limits)).toBe(500);
+  });
+
+  it("clamps to the per-name cap", () => {
+    // maxPositionPct 0.15 → 15k ceiling on any single name.
+    expect(maxAllowedNotional(book(), { cluster: "AAA", notional: 20_000 }, limits)).toBe(15_000);
+  });
+
+  it("clamps to cluster headroom", () => {
+    // maxClusterPct 0.4 → 40k per cluster; 38k already there leaves 2k.
+    const b = book({ positions: [{ cluster: "AAA", notional: 38_000 }] });
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 10_000 }, limits)).toBe(2000);
+  });
+
+  it("refuses outright on the kill-switch — no size is acceptable", () => {
+    const b = book({ equity: 70_000, peakEquity: 100_000 }); // 30% dd vs 20% limit
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 100 }, limits)).toBe(0);
+  });
+
+  it("refuses outright at the position cap", () => {
+    const b = book({ positions: Array.from({ length: limits.maxPositions }, (_, i) => ({ cluster: `C${i}`, notional: 10 })) });
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 100 }, limits)).toBe(0);
+  });
+
+  it("refuses outright at the per-cluster name cap", () => {
+    const b = book({
+      positions: Array.from({ length: limits.maxClusterPositions }, () => ({ cluster: "AAA", notional: 10 })),
+    });
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 100 }, limits)).toBe(0);
+  });
+
+  it("never exceeds what was asked for", () => {
+    expect(maxAllowedNotional(book(), { cluster: "AAA", notional: 5 }, limits)).toBe(5);
+  });
+
+  it("agrees with evaluateBuy on whether anything is allowed at all", () => {
+    // The clamp must not admit a trade the binary gate would refuse outright.
+    const cases: BookExposure[] = [
+      book(),
+      book({ equity: 70_000, peakEquity: 100_000 }),
+      book({ positions: Array.from({ length: limits.maxPositions }, (_, i) => ({ cluster: `C${i}`, notional: 10 })) }),
+    ];
+    for (const b of cases) {
+      const candidate = { cluster: "AAA", notional: 1000 };
+      const binary = evaluateBuy(b, candidate, limits).allowed;
+      expect(maxAllowedNotional(b, candidate, limits) > 0).toBe(binary);
+    }
   });
 });
 
