@@ -28,7 +28,12 @@ understand exactly what invariant was violated.
    Do not open the PR while either is red.
 5. **Open a PR to `main`:**
    - Title: `auto-improve: <code>` (the finding's `code`).
-   - Apply the label `auto-improve`.
+   - Create the PR **first**, then add the label as a separate step:
+     `gh pr create ...` followed by `gh pr edit <n> --add-label auto-improve`.
+     Never pass `--label` to `gh pr create` — if the label is missing from the repo the
+     whole command fails and the PR is lost along with the work. If the `--add-label`
+     step fails, the PR still stands: say so in your final message and move on. Do not
+     retry it more than once.
    - Body: quote the finding (code, title, detail), explain the **root cause** you found
      and the **fix** you made, and describe the test you added.
    - If your diff touches core trading or order-execution paths —
