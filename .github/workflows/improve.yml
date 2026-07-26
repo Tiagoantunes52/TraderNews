@@ -116,7 +116,11 @@ jobs:
       #    App trigger CI; PRs opened by the default GITHUB_TOKEN would NOT.
       #  - TOOLS: Claude gets no Bash by default (only Edit/Read/Write). The agent needs
       #    Bash to run `npm test`/`tsc`, git, and `gh pr create`, so grant it here.
-      #    `--max-turns` bounds the loop (and the cost) per run.
+      #    `--max-turns` bounds the loop (and the cost) per run. 40 proved too tight:
+      #    the first live run (30212464048) diagnosed the finding, wrote the fix and
+      #    pushed the branch, then exhausted its turns before `gh pr create` — leaving
+      #    a branch with no PR. Diagnose→edit→`npm test`→`tsc`→commit→PR costs turns,
+      #    and each red test iteration costs several more.
       - name: Run improvement agent
         if: steps.pick.outputs.has_finding == 'true'
         uses: anthropics/claude-code-action@v1
@@ -126,7 +130,19 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
             --allowedTools Edit,Read,Write,Bash
-            --max-turns 40
+            --max-turns 80
+
+      # Without this the turn-by-turn record dies with the runner, and a failed run
+      # (max-turns, a tool error, a bad edit loop) can't be diagnosed after the fact.
+      # `always()` so it survives the failure that makes it worth reading.
+      - name: Upload agent execution log
+        if: always() && steps.pick.outputs.has_finding == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-execution-output
+          path: ${{ runner.temp }}/claude-execution-output.json
+          if-no-files-found: warn
+          retention-days: 30
 
       # Optional end-to-end visibility. SLACK_WEBHOOK_URL is an app-server env var today,
       # NOT a GitHub Actions secret — add it to the Production environment to enable this;
