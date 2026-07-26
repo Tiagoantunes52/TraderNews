@@ -211,12 +211,29 @@ export type AuditPosition = {
 };
 
 /**
+ * Config to check today's closes against: the run log's, when today's paper stage
+ * left one, since that's the config that actually decided every exit in `closed`
+ * (every row is filtered to `exitDate` today, so it's the same run). Falls back to
+ * a freshly loaded config on days with no log at all.
+ *
+ * A naive fresh reload can differ from decision time even within the same day —
+ * a DB-backed override edited between the two stages, or a knob pinned by its
+ * env var (which wins over the DB and leaves no edit trace `cfgChangedAt` could
+ * ever catch) — and either would manufacture a confirmed-streak/min-hold/etc.
+ * mismatch against an exit that was perfectly correct when it fired.
+ */
+export function closedPositionAuditConfig(runLog: PaperRunLog | null, freshCfg: RiskConfig): RiskConfig {
+  return runLog?.cfg ?? freshCfg;
+}
+
+/**
  * Check closed positions against the rung they claim to have exited on.
  *
  * This is the second, independent layer: the replay above proves the stage agreed
  * with the rules *at decision time*, while these invariants hold against whatever
  * ended up in the table — so they still catch a bad write, and they work on days
- * with no run log at all.
+ * with no run log at all. Callers should still pass the config via
+ * `closedPositionAuditConfig` so a knob change can't manufacture a false positive.
  *
  * `cfgChangedAt` downgrades findings for positions whose life spans a config edit:
  * the audit necessarily uses today's knobs, and a mid-flight change makes an
