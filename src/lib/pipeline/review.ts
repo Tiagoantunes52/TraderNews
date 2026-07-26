@@ -5,6 +5,7 @@ import {
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
+  auditRiskBlocks,
   reconcileBroker,
   auditHealth,
   summarizeStrategies,
@@ -150,7 +151,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
 
   const findings: Finding[] = [];
   const notes: string[] = [];
-  const { risk: cfg, issues: configIssues } = await loadTradingConfig();
+  const { risk: cfg, limits, issues: configIssues } = await loadTradingConfig();
   if (configIssues.length > 0) errors.push(`Trading config: ${configIssues.join("; ")}`);
 
   const runLog = (existing?.paperRun ?? null) as PaperRunLog | null;
@@ -160,6 +161,9 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   if (runLog?.decisions) {
     try {
       findings.push(...replayDecisions(runLog));
+      // Separate from the replay: the replay asks "did the rules produce the right
+      // decision?", this asks "was the decision allowed to happen at all?".
+      findings.push(...auditRiskBlocks(runLog.decisions, limits));
       replayed = runLog.decisions.length;
       for (const err of runLog.errors ?? []) notes.push(`paper: ${err}`);
     } catch (e) {

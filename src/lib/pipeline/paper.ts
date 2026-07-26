@@ -500,12 +500,40 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         const br = bookRisk.get(strategy);
         if (br) {
           const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
-          if (evaluateBuy(br, candidate, limits, regimeMult).allowed) {
+          const verdict = evaluateBuy(br, candidate, limits, regimeMult);
+          if (verdict.allowed) {
             br.positions.push(candidate); // reserve so later opens this run see it
           } else {
             action = { type: "NONE" };
             decision.riskBlocked = true;
+            // Record WHICH rule vetoed it: without the reason a silently-halted book
+            // can only be diagnosed by rebuilding its equity from closed-position P&L.
+            decision.riskBlockReason = verdict.reason;
           }
+        }
+      }
+
+      // A close frees a slot. `bookRisk` is a snapshot taken at run start, so without
+      // this an exit and an entry on the same day can't trade places — the book waits
+      // for tomorrow's rebuild to notice the capacity. Mirrors the reservation above.
+      if (riskLimitsOn && action.type === "CLOSE" && STRATEGY_IS_RM[strategy] && open) {
+        const br = bookRisk.get(strategy);
+        if (br) {
+          const cluster = clusterKeyFor(est.stock.ticker, clusterByTicker);
+          const freed = open.qty * action.price;
+          // Same cluster (cluster caps care), then closest notional, so releasing one
+          // leg of a multi-position cluster doesn't free the wrong-sized slot.
+          let best = -1;
+          let bestDelta = Infinity;
+          for (let i = 0; i < br.positions.length; i++) {
+            if (br.positions[i].cluster !== cluster) continue;
+            const delta = Math.abs(br.positions[i].notional - freed);
+            if (delta < bestDelta) {
+              best = i;
+              bestDelta = delta;
+            }
+          }
+          if (best >= 0) br.positions.splice(best, 1);
         }
       }
 

@@ -42,6 +42,9 @@ export const NON_CODE_CODES: ReadonlySet<string> = new Set([
   "ACCOUNT_ALERT",
   // Position marking (auditOpenPositions) — a data gap, not a ladder bug
   "POSITIONS_NOT_MARKED",
+  // Portfolio gate halted a book (auditRiskBlocks) — the caps working as designed.
+  // The fix is operating the book or retuning the limits, never an LLM code edit.
+  "ENTRIES_ALL_RISK_BLOCKED",
   // Broker reconciliation (reconcileBroker) — operate the account, don't edit code
   "BROKER_POSITIONS_MISSING",
   "BROKER_POSITIONS_SUBSHARE",

@@ -5,6 +5,7 @@ import {
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
+  auditRiskBlocks,
   reconcileBroker,
   auditHealth,
   summarizeStrategies,
@@ -19,6 +20,7 @@ import {
   type PaperRunLog,
 } from "@/lib/daily-review";
 import { DEFAULT_RISK_CONFIG, type RiskConfig, type Strategy } from "@/lib/paper-trading";
+import { DEFAULT_RISK_LIMITS, type RiskBlockReason } from "@/lib/portfolio-risk";
 
 const cfg: RiskConfig = { ...DEFAULT_RISK_CONFIG };
 const day = (n: number) => new Date(Date.UTC(2026, 6, n));
@@ -367,6 +369,66 @@ describe("auditEntries", () => {
 
   it("accepts a well-formed entry", () => {
     expect(auditEntries([position({ status: "OPEN" })], cfg)).toEqual([]);
+  });
+});
+
+describe("auditRiskBlocks", () => {
+  const limits = { ...DEFAULT_RISK_LIMITS };
+  const open = (over: Partial<DecisionRecord> = {}) =>
+    decision({ action: { type: "OPEN", qty: 1, price: 100 }, ...over });
+  const blocked = (reason: RiskBlockReason) =>
+    open({ riskBlocked: true, riskBlockReason: reason });
+  // MARK/CLOSE stand in for the names the book already held at run start.
+  const holding = (n: number) =>
+    Array.from({ length: n }, () => decision({ action: { type: "MARK", price: 100 } }));
+
+  it("stays silent while some entries get through", () => {
+    const found = auditRiskBlocks([blocked("MAX_POSITIONS"), open()], limits);
+    expect(found).toEqual([]);
+  });
+
+  it("stays silent when the book wanted no entries at all", () => {
+    expect(auditRiskBlocks(holding(3), limits)).toEqual([]);
+  });
+
+  it("warns when every entry is blocked but the book is within its cap", () => {
+    const found = auditRiskBlocks([...holding(4), blocked("CLUSTER_CAP")], limits);
+    expect(codes(found)).toEqual(["ENTRIES_ALL_RISK_BLOCKED"]);
+    expect(found[0].severity).toBe("warn");
+    expect(found[0].detail).toContain("CLUSTER_CAP");
+    expect(found[0].refs).toMatchObject({ strategy: "COMBINED_RM", held: 4, blocked: 1 });
+  });
+
+  it("escalates to fail when the book holds more than maxPositions", () => {
+    // Above the cap it can only drain — this is the COMBINED_RM lockout.
+    const held = holding(limits.maxPositions + 3);
+    const found = auditRiskBlocks([...held, blocked("MAX_POSITIONS")], limits);
+    expect(found[0].severity).toBe("fail");
+    expect(found[0].detail).toContain("ABOVE the cap");
+    expect(found[0].refs).toMatchObject({ held: limits.maxPositions + 3 });
+  });
+
+  it("reports the dominant block reason", () => {
+    const found = auditRiskBlocks(
+      [blocked("GROSS_CAP"), blocked("MAX_POSITIONS"), blocked("MAX_POSITIONS")],
+      limits
+    );
+    expect(found[0].detail).toContain("MAX_POSITIONS");
+    expect(found[0].detail).not.toContain("GROSS_CAP");
+  });
+
+  it("ignores the pure books — the gate only applies to _RM", () => {
+    const pure = decision({ strategy: "COMBINED", action: { type: "OPEN", qty: 1, price: 100 } });
+    expect(auditRiskBlocks([pure], limits)).toEqual([]);
+  });
+
+  it("reports each blocked book separately", () => {
+    const found = auditRiskBlocks(
+      [blocked("MAX_POSITIONS"), open({ strategy: "SENTIMENT_RM", riskBlocked: true, riskBlockReason: "GROSS_CAP" })],
+      limits
+    );
+    expect(found).toHaveLength(2);
+    expect(found.map((f) => f.refs?.strategy)).toEqual(["COMBINED_RM", "SENTIMENT_RM"]);
   });
 });
 
