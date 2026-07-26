@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import {
   replayDecisions,
   auditClosedPositions,
+  closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
   reconcileBroker,
@@ -223,7 +224,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     // Config edits mid-position make an honest exit look wrong; the audit knows to
     // soften those findings rather than cry wolf.
     const cfgRow = await db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { updatedAt: true } });
-    findings.push(...auditClosedPositions(closedToday, cfg, cfgRow?.updatedAt ?? null));
+    findings.push(...auditClosedPositions(closedToday, closedPositionAuditConfig(runLog, cfg), cfgRow?.updatedAt ?? null));
     findings.push(...auditOpenPositions(openPositions, cfg, todayUTC));
     findings.push(...auditEntries(openedToday, cfg));
   } catch (e) {

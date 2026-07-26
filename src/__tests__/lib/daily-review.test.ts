@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   replayDecisions,
   auditClosedPositions,
+  closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
   reconcileBroker,
@@ -234,6 +235,37 @@ describe("auditClosedPositions", () => {
     const pure = position({ strategy: "COMBINED" as Strategy, exitReason: "SIGNAL", exitPrice: 50 });
     const legacy = position({ exitReason: null, exitPrice: 50 });
     expect(auditClosedPositions([pure, legacy], cfg, null)).toEqual([]);
+  });
+});
+
+describe("closedPositionAuditConfig", () => {
+  it("prefers the run log's config over a freshly reloaded one", () => {
+    const log = runLog([]);
+    log.cfg = { ...cfg, signalConfirmRuns: 1 };
+    expect(closedPositionAuditConfig(log, cfg).signalConfirmRuns).toBe(1);
+  });
+
+  it("falls back to the fresh config when there's no run log for today", () => {
+    expect(closedPositionAuditConfig(null, cfg)).toBe(cfg);
+  });
+
+  it("stops a signal-confirm knob change from manufacturing EXIT_SIGNAL_UNCONFIRMED", () => {
+    // The position closed under a run log where signalConfirmRuns was 1 (so a
+    // single-run bearish streak was a legitimate confirmed exit); today's freshly
+    // reloaded config has since moved to 2 — e.g. an env-pinned override changed
+    // between the paper stage and the review stage, which leaves no DB edit trace
+    // for cfgChangedAt to catch.
+    const log = runLog([]);
+    log.cfg = { ...cfg, signalConfirmRuns: 1 };
+    const freshCfg = { ...cfg, signalConfirmRuns: 2 };
+    const p = position({ exitReason: "SIGNAL", exitPrice: 95, bearishStreak: 1, realizedPnl: 10 * (95 - 100) });
+
+    expect(codes(auditClosedPositions([p], closedPositionAuditConfig(log, freshCfg), null))).not.toContain(
+      "EXIT_SIGNAL_UNCONFIRMED"
+    );
+    // Sanity check: without the fix (auditing against the fresh config directly),
+    // this same position would have been flagged.
+    expect(codes(auditClosedPositions([p], freshCfg, null))).toContain("EXIT_SIGNAL_UNCONFIRMED");
   });
 });
 
