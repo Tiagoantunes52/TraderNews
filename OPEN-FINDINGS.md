@@ -42,67 +42,38 @@ it cannot establish is *executable* performance — and only the latter is evide
   now refuses any `*.alpaca.markets` host that isn't `paper-api`. Non-Alpaca hosts still
   pass so tests can use stubs. Deliberately **no env escape hatch** — an override would
   restore the exact foot-gun being closed. Trading live must be a reviewed code change.
+- **Plan item 2 — durable order intents.** `PaperOrder.clientOrderId` is assigned and
+  persisted *before* submission and sent to Alpaca as `client_order_id`. All eleven
+  submission sites now go through one `submitTracked()` wrapper: write intent
+  (`PENDING_SUBMIT`) → submit under the key → record the broker id. A crash in between
+  leaves a recoverable row, and a startup sweep resolves it by asking Alpaca for the key
+  (found → adopt the real id; a definite 404 → `ABANDONED`; an *error* leaves it pending,
+  because guessing would hide a live order). Alpaca also rejects a duplicate
+  `client_order_id`, so a retry cannot double-submit. Counted as `intentsRecovered`.
+  Two exceptions, both deliberate: OTO stop legs arrive with their parent and so cannot
+  be independently duplicated, and the orphan-exit sweep can hit a symbol with no
+  `Stock` row, where no intent is storable (`stockId` is required) — that one submission
+  stays unrecorded, as before.
+- **Plan item 3 — run lease + partial unique index.** `PipelineLease` with a single
+  atomic upsert that only steals an *expired* lease (`lib/pipeline-lease.ts`), wrapping
+  the whole stage — including the marker read, which is what makes read-then-act atomic.
+  Fails open if the lease table is unreachable. The per-day marker is untouched and
+  still written last. Plus the partial unique index on `SimPosition`, with a `DO` block
+  that fails loudly and names the offending rows rather than letting `CREATE INDEX`
+  raise something opaque.
+
+  **The migration is written but NOT applied** — `20260727190000_add_pipeline_lease`.
+  Its precheck was validated read-only against prod (no duplicate OPEN rows as of
+  2026-07-27), but applying it is a deploy decision.
 
 ---
 
 ## Priority plan
 
-### 2. Deterministic `client_order_id` + durable order intent
-
-`client_order_id` appears nowhere in the codebase. `PaperOrder` stores only
-`alpacaOrderId`, assigned *after* submission — so a crash between broker-accept and
-DB-write leaves an order that cannot be recognised on retry.
-
-Write the intent (with a deterministic id) *before* submitting. This is the
-prerequisite that makes any retry or lease logic safe, so it lands before item 3.
-
-### 3. Run lease + partial unique index
-
-Two separate problems that must not be solved with one object:
-
-- **Marker ≠ lease.** The end-of-run `SIM_COMBINED` snapshot is correctly a *completion*
-  marker written last, so a crashed run retries. A *lease* must be taken first. Taking
-  the marker first would fix the race and break crash-retry. You need both.
-- **The guard is read-then-act** (`pipeline/paper.ts:163`).
-
-The race is **scheduled, not hypothetical**: GH Actions `30 19 * * 1-5` and
-`30 20 * * 1-5` (`.github/workflows/pipeline.yml`) align exactly with the pg_cron tick
-`*/5 16-21 * * 1-5` at 19:30 and 20:30 UTC, every weekday.
-
-Note: **advisory locks are the wrong primitive here.** `pg_try_advisory_lock` is
-session-scoped and unreliable through Supabase's pooler; `pg_try_advisory_xact_lock` is
-transaction-scoped and you cannot hold a transaction across a 300s stage. Use a lease
-row with atomic insert + TTL/heartbeat. The atomic primitive already exists —
-`PaperEquitySnapshot_book_date_key` is a real unique index; a failed INSERT is your
-compare-and-swap.
-
-The invariant "one OPEN row per (stock, strategy)" is unenforced (prod has only two
-plain btree indexes on `SimPosition`). Prisma cannot express a partial unique index —
-needs raw SQL, and this repo has precedent (5 migrations with hand-written
-`CREATE INDEX`):
-
-```sql
-CREATE UNIQUE INDEX IF NOT EXISTS "SimPosition_open_unique"
-  ON "SimPosition" ("stockId", strategy) WHERE status = 'OPEN';
-```
-
-A plain `@@unique([stockId, strategy])` would be **wrong** — it forbids re-entering a
-name after closing it.
-
-**Precondition:** Postgres refuses to build a unique index over existing duplicates, so
-check first and reconcile any it finds before the migration runs:
-
-```sql
-select "stockId", strategy, count(*) from "SimPosition"
-where status = 'OPEN' group by 1,2 having count(*) > 1;
-```
-
-(Clean as of 2026-07-27, but the migration must not assume that on the day it deploys.)
-
-### 4. Widen `ENTRY_LIMIT_BUFFER_PCT` — interim mitigation only
+### 1. Widen `ENTRY_LIMIT_BUFFER_PCT` — interim mitigation only
 
 `paper-trading.ts:206`, currently `0.005`. Widening (~0.05) keeps the OTO+GTC
-architecture untouched and collapses most of the selection bias in item 5.
+architecture untouched and collapses most of the selection bias in item 2.
 
 Honest caveat: this is asymptotic, not a fix. It is weakest exactly where it matters,
 since names that gap >5% are the high-volatility momentum names that dominate the
@@ -114,7 +85,7 @@ unfilled-winners set.
 expire the attached stop and leave positions naked overnight — the review's own
 highest-severity failure mode (`BROKER_STOPS_MISSING`).
 
-### 5. Intraday execution — the structural fix
+### 2. Intraday execution — the structural fix
 
 **Three findings share one root cause: the system decides after the close and executes
 against a market that isn't open.**
@@ -123,7 +94,7 @@ against a market that isn't open.**
   both filter `{ none: { date: { gte: todayUTC } } }`, so a stock that already has
   today's row is skipped — a second run never recomputes.
 - Fills are *conditional*, producing the winner-selection bias (evidence below).
-- Entry orders rest indefinitely (item 1).
+- Entry orders rest indefinitely (fixed — see Shipped).
 
 You cannot be both unbiased and protected while deciding after the close — every
 alternative trades measurement bias against a protection gap. Intraday execution
@@ -135,10 +106,10 @@ is read back from Alpaca *positions* — names already held, not a quote source 
 to buy. This is a new market-data integration, which reframes it from "expensive
 nice-to-have" to "the change that resolves the majority of critical findings."
 
-### 6. Measurement correctness
+### 3. Measurement correctness
 
 - **Fills become the primary record; sim demoted to diagnostic.** Largely follows from
-  4–5. The right split: signal research evaluated against a point-in-time executable
+  1–2. The right split: signal research evaluated against a point-in-time executable
   price model; strategy performance from actual orders, fills, cancels, and exposure.
 - **`open` missing from the price contract.** `tiingo-prices.ts:3` `DailyPrice` carries
   `{ date, close, volume, high, low }`. Needed to model next-open fills. Adapters,
@@ -155,7 +126,7 @@ nice-to-have" to "the change that resolves the majority of critical findings."
   names keep slots while stronger current candidates are rejected. That may be
   intentional — but then the strategy is "hold until exit", not "own the best current
   signals", and should be evaluated as such. Decide *after* measurement is trustworthy.
-  See "unfinished work" — the ranking change does **not** address this.
+  See "known gaps" — the ranking change does **not** address this.
 
 ---
 
@@ -207,7 +178,7 @@ listed so they are not silently forgotten.
   test harness at all, which is why the pure helpers were extracted — but the
   integration path remains unverified.
 - **Ranking allocates, it does not rotate.** It decides which *new* candidate wins a
-  free slot. It never evicts a held name for a stronger candidate — see item 6.
+  free slot. It never evicts a held name for a stronger candidate — see item 3.
 - **The live mirror is still updated before the DB write.** `combinedRmOpened` /
   `combinedRmLong` are set before `simPosition.create`, so a write failure can leave
   the broker targeting an intended-but-unpersisted position. Pre-existing behaviour,

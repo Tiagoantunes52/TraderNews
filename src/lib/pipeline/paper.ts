@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
+import { acquireLease, releaseLease } from "@/lib/pipeline-lease";
 import { scoreToSignal } from "@/lib/indicators";
 import {
   detectDrawdownBreach,
@@ -55,6 +57,7 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  getOrderByClientOrderId,
   getClock,
   getCalendar,
   getOpenOrders,
@@ -75,13 +78,31 @@ export type PaperStageResult = {
   simOpened: number; // internal sim positions opened
   simClosed: number; // internal sim positions closed
   entryOrdersExpired: number; // stale unfilled BUY entries cancelled at the broker
+  intentsRecovered: number; // orders found at the broker that a crash left unrecorded
   done: true;
   errors: string[];
 };
 
+// A recorded intent that has NOT yet been confirmed at the broker. Written before the
+// submission so a crash in between leaves something to recover from, and cleared to the
+// real Alpaca status the moment the broker responds.
+const PENDING_SUBMIT_STATUS = "PENDING_SUBMIT";
+// An intent the broker never received (looked up by client_order_id on a later run and
+// not found). Terminal: there is nothing at the broker, so nothing to reconcile.
+const ABANDONED_STATUS = "ABANDONED";
+
 // Terminal Alpaca order states — once an order reaches one, there's nothing left
 // to reconcile, so it drops out of the pending-fill recheck.
-const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced"]);
+const TERMINAL_ORDER_STATUS = new Set([
+  "filled",
+  "canceled",
+  "cancelled",
+  "expired",
+  "rejected",
+  "done_for_day",
+  "replaced",
+  ABANDONED_STATUS,
+]);
 
 // ── Near-close trade window (PAPER_TRADE_NEAR_CLOSE) ──────────────────────────
 // Act only in the final minutes before the US close: deepest liquidity of the day
@@ -144,12 +165,50 @@ async function inCloseWindow(): Promise<boolean> {
 // day. Single-shot (`done: true`); the watchlist is small enough for one pass and
 // the wall-clock budget isn't needed, but errors are isolated so one bad ticker or
 // an Alpaca hiccup never sinks the run. US-equities only (foreign/crypto filtered).
+/**
+ * Mutual exclusion around the whole stage.
+ *
+ * The per-day marker (today's SIM_COMBINED snapshot) answers "has today's work been
+ * done?" but cannot answer "is it being done right now": it's a read-then-act check,
+ * and it is written LAST on purpose so a run that dies half-way is retried rather than
+ * skipped. Two invocations could therefore both read "not run", both open positions and
+ * both submit broker orders. Not hypothetical — the GitHub Actions crons (`30 19`,
+ * `30 20` weekdays) land on the same minute as the Supabase pg_cron tick (every 5
+ * minutes, 16:00-21:59 weekdays), twice every weekday.
+ *
+ * The lease wraps the marker read too, which is the point: that's what makes
+ * read-then-act atomic. Losing the race is a clean no-op, exactly like losing to the
+ * marker. `finally` releases on every path, and the lease TTL covers a hard crash.
+ */
 export async function runPaperStage(): Promise<PaperStageResult> {
+  const lease = await acquireLease("paper");
+  if (!lease) {
+    return {
+      stage: "paper",
+      rebalanced: false,
+      ordersSubmitted: 0,
+      simOpened: 0,
+      simClosed: 0,
+      entryOrdersExpired: 0,
+      intentsRecovered: 0,
+      done: true,
+      errors: [],
+    };
+  }
+  try {
+    return await runPaperStageLocked();
+  } finally {
+    await releaseLease(lease);
+  }
+}
+
+async function runPaperStageLocked(): Promise<PaperStageResult> {
   const errors: string[] = [];
   let ordersSubmitted = 0;
   let simOpened = 0;
   let simClosed = 0;
   let entryOrdersExpired = 0;
+  let intentsRecovered = 0;
   // Account / trading-health alerts (issue #56) accumulated across the run, then
   // persisted + emailed to admins once at the end (the daily guard fires them once).
   const accountAlerts: AlertDraft[] = [];
@@ -168,14 +227,15 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     select: { id: true },
   });
   if (alreadyRan) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
   }
 
   // Near-close gate: when enabled, out-of-window runs no-op WITHOUT writing the
   // idempotency snapshot, so the day's first in-window run does all the work.
   if (isTradeNearCloseEnabled() && !(await inCloseWindow())) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
   }
+
 
   // Dead-man's check: any trading day between the previous snapshot and today with
   // no snapshot means the scheduler missed that day's whole trade window (the
@@ -840,6 +900,38 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // ── Alpaca book (only when paper keys are configured) ──────────────────────
   if (isPaperTradingConfigured()) {
     try {
+      // Recover intents that were written but never confirmed. A row sits at
+      // PENDING_SUBMIT only if the process died between "about to submit" and "broker
+      // answered" — the order may or may not exist at Alpaca, and before client_order_id
+      // there was no way to tell, so it would have gone on living at the broker unseen.
+      // Ask by the key we assigned: found → adopt the real id, 404 → it never landed.
+      const orphans = await db.paperOrder.findMany({
+        where: { status: PENDING_SUBMIT_STATUS, clientOrderId: { not: null } },
+        select: { id: true, clientOrderId: true },
+      });
+      for (const o of orphans) {
+        try {
+          const remote = await getOrderByClientOrderId(o.clientOrderId!);
+          await db.paperOrder.update({
+            where: { id: o.id },
+            data: remote
+              ? {
+                  alpacaOrderId: remote.id,
+                  status: remote.status,
+                  filledQty: remote.filledQty,
+                  filledAvgPrice: remote.filledAvgPrice,
+                  filledAt: remote.filledAt ? new Date(remote.filledAt) : null,
+                }
+              : { status: ABANDONED_STATUS },
+          });
+          if (remote) intentsRecovered++;
+        } catch (e) {
+          // Leave it PENDING_SUBMIT — a later run retries. Never guess ABANDONED from a
+          // transport error: that would hide a real, live order at the broker.
+          errors.push(`Intent recovery failed (${o.clientOrderId}): ${String(e)}`);
+        }
+      }
+
       // Reconcile fills for orders still pending from a previous run. Filtered on
       // status rather than taking the most recent N: the old window silently dropped
       // any non-terminal order that fell outside it, stranding it at `new` forever
@@ -882,6 +974,43 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           errors.push(`Order reconcile failed (${o.alpacaOrderId}): ${String(e)}`);
         }
       }
+
+      /**
+       * Record the intent, submit under its key, then record the outcome.
+       *
+       * The old order was submit-then-record, which has a window where the broker holds
+       * a live order the app has no row for — invisible to every reader of PaperOrder,
+       * and unrecoverable because the only handle (alpacaOrderId) is what was lost.
+       * Writing first inverts that: the worst case is a row with no broker order, which
+       * the recovery sweep above resolves by asking Alpaca for the key.
+       *
+       * A throw deliberately leaves the row at PENDING_SUBMIT rather than marking it
+       * failed — an error here does NOT prove the order didn't land.
+       */
+      const submitTracked = async <T extends { id: string; status: string }>(
+        intent: { stockId: string; side: "BUY" | "SELL"; signal: string; qty?: number; notional?: number },
+        submit: (clientOrderId: string) => Promise<T>
+      ): Promise<T> => {
+        const clientOrderId = randomUUID();
+        const row = await db.paperOrder.create({
+          data: {
+            stockId: intent.stockId,
+            side: intent.side,
+            signal: intent.signal,
+            qty: intent.qty,
+            notional: intent.notional,
+            clientOrderId,
+            status: PENDING_SUBMIT_STATUS,
+          },
+          select: { id: true },
+        });
+        const order = await submit(clientOrderId);
+        await db.paperOrder.update({
+          where: { id: row.id },
+          data: { alpacaOrderId: order.id, status: order.status },
+        });
+        return order;
+      };
 
       // Desired state per stock. Two modes:
       //  • Broker stops ON: entries go in as whole-share marketable-limit buys with a
@@ -1023,15 +1152,21 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 : 0;
             if (action.type === "ENTER" && enterQty >= 1) {
               reserveAlpacaBuy(ticker, enterQty * price);
-              const { order, stopOrderId } = await submitEntryWithStop({
-                symbol: ticker,
-                qty: enterQty,
-                limitPrice: action.limitPrice,
-                stopPrice: action.stopPrice,
-              });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: enterQty, alpacaOrderId: order.id, status: order.status },
-              });
+              let stopOrderId: string | null = null;
+              await submitTracked(
+                { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: enterQty },
+                async (clientOrderId) => {
+                  const res = await submitEntryWithStop({
+                    symbol: ticker,
+                    qty: enterQty,
+                    limitPrice: action.limitPrice,
+                    stopPrice: action.stopPrice,
+                    clientOrderId,
+                  });
+                  stopOrderId = res.stopOrderId;
+                  return res.order;
+                }
+              );
               if (stopOrderId) {
                 // Record the protective leg so the pending-fill reconcile loop catches
                 // a broker stop-out (and a cancel/replace) with no extra code.
@@ -1044,10 +1179,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             } else if (action.type === "EXIT" && held) {
               if (protective) await cancelOrder(protective.id);
               const qty = Math.abs(held.qty);
-              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: action.reason, qty, alpacaOrderId: order.id, status: order.status },
-              });
+              await submitTracked({ stockId: est.stockId, side: "SELL", signal: action.reason, qty }, (clientOrderId) =>
+                submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
+              );
               managedSymbols.add(ticker);
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
@@ -1057,20 +1191,18 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               const qty = Math.floor(Math.abs(held.qty));
               if (qty >= 1) {
                 await cancelOrder(protective.id);
-                const order = await submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked({ stockId: est.stockId, side: "SELL", signal: "TRAIL", qty }, (clientOrderId) =>
+                  submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent, clientOrderId })
+                );
                 managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             } else if (action.type === "REPAIR_STOP" && held) {
               const qty = Math.floor(Math.abs(held.qty));
               if (qty >= 1) {
-                const order = await submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked({ stockId: est.stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
+                  submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice, clientOrderId })
+                );
                 managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
@@ -1124,12 +1256,14 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 // fine, unlike a stop), after cancelling any resting protective order.
                 if (protective) await cancelOrder(protective.id);
                 const qty = Math.abs(pos.qty);
-                const order = await submitMarketOrder({ symbol, side: "sell", qty });
                 if (stockId) {
-                  await db.paperOrder.create({
-                    data: { stockId, side: "SELL", signal: "ORPHAN_EXIT", qty, alpacaOrderId: order.id, status: order.status },
-                  });
+                  await submitTracked({ stockId, side: "SELL", signal: "ORPHAN_EXIT", qty }, (clientOrderId) =>
+                    submitMarketOrder({ symbol, side: "sell", qty, clientOrderId })
+                  );
                 } else {
+                  // No Stock row → no intent row is possible (stockId is required), so
+                  // this one submission stays unrecorded and unrecoverable, as before.
+                  await submitMarketOrder({ symbol, side: "sell", qty });
                   errors.push(`Orphan-exit sold ${symbol} but found no Stock row to record it`);
                 }
                 ordersSubmitted++;
@@ -1139,12 +1273,13 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 if (qty < 1) continue; // whole-share only (Alpaca rejects fractional stops)
                 const anchor = pos.avgEntryPrice ?? pos.currentPrice;
                 if (anchor == null || anchor <= 0) continue;
-                const order = await submitStopSell({ symbol, qty, stopPrice: cents(anchor * (1 - fallbackStopPct)) });
+                const stopPrice = cents(anchor * (1 - fallbackStopPct));
                 if (stockId) {
-                  await db.paperOrder.create({
-                    data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-                  });
+                  await submitTracked({ stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
+                    submitStopSell({ symbol, qty, stopPrice, clientOrderId })
+                  );
                 } else {
+                  await submitStopSell({ symbol, qty, stopPrice });
                   errors.push(`Protective-stop sweep placed a stop for ${symbol} but found no Stock row to record it`);
                 }
                 ordersSubmitted++;
@@ -1234,14 +1369,17 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               if (qty < 1) continue;
               try {
                 reserveAlpacaBuy(ticker, qty * quant.price);
-                const { order, stopOrderId } = await submitEntryWithStop({
-                  symbol: ticker,
-                  qty,
-                  limitPrice: action.limitPrice,
-                  stopPrice: action.stopPrice,
-                });
-                await db.paperOrder.create({
-                  data: { stockId, side: "BUY", signal: "CONVERGE_ENTRY", qty, alpacaOrderId: order.id, status: order.status },
+                let stopOrderId: string | null = null;
+                await submitTracked({ stockId, side: "BUY", signal: "CONVERGE_ENTRY", qty }, async (clientOrderId) => {
+                  const res = await submitEntryWithStop({
+                    symbol: ticker,
+                    qty,
+                    limitPrice: action.limitPrice,
+                    stopPrice: action.stopPrice,
+                    clientOrderId,
+                  });
+                  stopOrderId = res.stopOrderId;
+                  return res.order;
                 });
                 if (stopOrderId) {
                   await db.paperOrder.create({
@@ -1282,18 +1420,17 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               const allowed = allowedAlpacaBuy(ticker, notional);
               if (allowed > 0) {
                 reserveAlpacaBuy(ticker, allowed);
-                const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional: allowed });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional: allowed, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked(
+                  { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional: allowed },
+                  (clientOrderId) => submitMarketOrder({ symbol: ticker, side: "buy", notional: allowed, clientOrderId })
+                );
                 ordersSubmitted++;
               }
             } else if (!wantLong && held && held.qty > 0) {
               const qty = Math.abs(held.qty);
-              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: sellSignal, qty, alpacaOrderId: order.id, status: order.status },
-              });
+              await submitTracked({ stockId: est.stockId, side: "SELL", signal: sellSignal, qty }, (clientOrderId) =>
+                submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
+              );
               ordersSubmitted++;
             }
           } catch (e) {
@@ -1355,7 +1492,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       cfg,
       decisions,
       errors,
-      counts: { simOpened, simClosed, ordersSubmitted, entryOrdersExpired },
+      counts: { simOpened, simClosed, ordersSubmitted, entryOrdersExpired, intentsRecovered },
     };
     await db.dailyReview.upsert({
       where: { date: todayUTC },
@@ -1377,5 +1514,5 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     }
   }
 
-  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
+  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
 }

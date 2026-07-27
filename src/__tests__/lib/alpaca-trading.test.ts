@@ -5,6 +5,7 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  getOrderByClientOrderId,
   submitEntryWithStop,
   submitTrailingStop,
   submitStopSell,
@@ -39,6 +40,52 @@ describe("alpaca-trading client", () => {
       expect(isPaperTradingConfigured()).toBe(true);
       delete process.env.ALPACA_PAPER_API_SECRET_KEY;
       expect(isPaperTradingConfigured()).toBe(false);
+    });
+  });
+
+  describe("client_order_id (durable order intents)", () => {
+    const bodyOf = (mockFetch: ReturnType<typeof vi.fn>) =>
+      JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+
+    it("sends the caller's key on every submission path", async () => {
+      for (const submit of [
+        () => submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100, clientOrderId: "k1" }),
+        () => submitEntryWithStop({ symbol: "AAPL", qty: 2, limitPrice: 10, stopPrice: 9, clientOrderId: "k1" }),
+        () => submitTrailingStop({ symbol: "AAPL", qty: 2, trailPercent: 5, clientOrderId: "k1" }),
+        () => submitStopSell({ symbol: "AAPL", qty: 2, stopPrice: 9, clientOrderId: "k1" }),
+      ]) {
+        const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "o1", status: "new" }));
+        vi.stubGlobal("fetch", mockFetch);
+        await submit();
+        expect(bodyOf(mockFetch).client_order_id).toBe("k1");
+      }
+    });
+
+    it("omits the field entirely when no key is given", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "o1", status: "new" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100 });
+      expect(bodyOf(mockFetch)).not.toHaveProperty("client_order_id");
+    });
+
+    it("resolves an unconfirmed intent: found at the broker", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "real-id", status: "filled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      const order = await getOrderByClientOrderId("k1");
+      expect(order?.id).toBe("real-id");
+      expect(mockFetch.mock.calls[0][0]).toContain("/v2/orders:by_client_order_id?client_order_id=k1");
+    });
+
+    it("resolves an unconfirmed intent: 404 means it never landed", async () => {
+      // Distinct from an error — only a definite 404 may mark an intent abandoned,
+      // because guessing would hide a live order sitting at the broker.
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 } as Response));
+      expect(await getOrderByClientOrderId("k1")).toBeNull();
+    });
+
+    it("throws on a transport/server error rather than reporting 'not found'", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response));
+      await expect(getOrderByClientOrderId("k1")).rejects.toThrow(/500/);
     });
   });
 

@@ -245,6 +245,12 @@ export type MarketOrderInput = {
   notional?: number;
   /** Share count (used to sell a whole position to close). */
   qty?: number;
+  /**
+   * Caller-assigned idempotency key, persisted BEFORE this call. Alpaca rejects a
+   * duplicate, so a retry after an ambiguous failure cannot double-submit, and the
+   * order stays findable by it if the process dies before recording the broker id.
+   */
+  clientOrderId?: string;
 };
 
 /**
@@ -252,7 +258,7 @@ export type MarketOrderInput = {
  * must be set (notional for confidence-weighted buys, qty to sell-to-close).
  */
 export async function submitMarketOrder(input: MarketOrderInput): Promise<AlpacaOrder> {
-  const { symbol, side, notional, qty } = input;
+  const { symbol, side, notional, qty, clientOrderId } = input;
   if ((notional == null) === (qty == null)) {
     throw new Error("submitMarketOrder requires exactly one of notional or qty");
   }
@@ -264,6 +270,7 @@ export async function submitMarketOrder(input: MarketOrderInput): Promise<Alpaca
   };
   if (notional != null) body.notional = notional.toFixed(2);
   if (qty != null) body.qty = String(qty);
+  if (clientOrderId) body.client_order_id = clientOrderId;
 
   const res = await fetchWithRetry(`${baseUrl()}/v2/orders`, {
     method: "POST",
@@ -281,6 +288,24 @@ export async function submitMarketOrder(input: MarketOrderInput): Promise<Alpaca
 /** Fetch a single order by id — used to reconcile pending orders' fills next run. */
 export async function getOrder(id: string): Promise<AlpacaOrder> {
   return toOrder(await apiGet(`/v2/orders/${encodeURIComponent(id)}`));
+}
+
+/**
+ * Look an order up by the client_order_id we assigned before submitting. This is how
+ * an intent recorded but never confirmed gets resolved: if the broker has it, the
+ * submission landed and we adopt the real id; `null` means it never did.
+ */
+export async function getOrderByClientOrderId(clientOrderId: string): Promise<AlpacaOrder | null> {
+  const res = await fetchWithRetry(
+    `${baseUrl()}/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`,
+    { headers: { ...authHeaders(), Accept: "application/json" }, cache: "no-store" }
+  );
+  if (res.status === 404) return null; // never reached the broker
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Alpaca trading error: ${res.status} — ${body}`);
+  }
+  return toOrder(await res.json());
 }
 
 // ── Broker-enforced protective orders (PAPER_BROKER_STOPS) ────────────────────
@@ -305,7 +330,7 @@ async function postOrder(body: Record<string, unknown>): Promise<RawOrder> {
   return (await res.json()) as RawOrder;
 }
 
-export type EntryWithStopInput = { symbol: string; qty: number; limitPrice: number; stopPrice: number };
+export type EntryWithStopInput = { symbol: string; qty: number; limitPrice: number; stopPrice: number; clientOrderId?: string };
 
 /**
  * Marketable-limit BUY with an attached GTC stop-loss (One-Triggers-Other).
@@ -319,7 +344,7 @@ export type EntryWithStopInput = { symbol: string; qty: number; limitPrice: numb
 export async function submitEntryWithStop(
   input: EntryWithStopInput
 ): Promise<{ order: AlpacaOrder; stopOrderId: string | null }> {
-  const { symbol, qty, limitPrice, stopPrice } = input;
+  const { symbol, qty, limitPrice, stopPrice, clientOrderId } = input;
   const raw = await postOrder({
     symbol,
     qty: String(qty),
@@ -329,13 +354,21 @@ export async function submitEntryWithStop(
     time_in_force: "gtc",
     order_class: "oto",
     stop_loss: { stop_price: stopPrice.toFixed(2) },
+    // Only the parent carries the key; the stop leg arrives with it and so cannot be
+    // independently duplicated by a retry.
+    ...(clientOrderId ? { client_order_id: clientOrderId } : {}),
   });
   const stopLeg = raw.legs?.find((l) => l.type === "stop") ?? raw.legs?.[0] ?? null;
   return { order: toOrder(raw), stopOrderId: stopLeg?.id ?? null };
 }
 
 /** Replace a fixed stop with a native GTC trailing stop once a position is up enough. */
-export async function submitTrailingStop(input: { symbol: string; qty: number; trailPercent: number }): Promise<AlpacaOrder> {
+export async function submitTrailingStop(input: {
+  symbol: string;
+  qty: number;
+  trailPercent: number;
+  clientOrderId?: string;
+}): Promise<AlpacaOrder> {
   return toOrder(
     await postOrder({
       symbol: input.symbol,
@@ -344,12 +377,18 @@ export async function submitTrailingStop(input: { symbol: string; qty: number; t
       type: "trailing_stop",
       trail_percent: input.trailPercent.toFixed(2),
       time_in_force: "gtc",
+      ...(input.clientOrderId ? { client_order_id: input.clientOrderId } : {}),
     })
   );
 }
 
 /** Standalone GTC stop-sell — used to repair a missing protective order. */
-export async function submitStopSell(input: { symbol: string; qty: number; stopPrice: number }): Promise<AlpacaOrder> {
+export async function submitStopSell(input: {
+  symbol: string;
+  qty: number;
+  stopPrice: number;
+  clientOrderId?: string;
+}): Promise<AlpacaOrder> {
   return toOrder(
     await postOrder({
       symbol: input.symbol,
@@ -358,6 +397,7 @@ export async function submitStopSell(input: { symbol: string; qty: number; stopP
       type: "stop",
       stop_price: input.stopPrice.toFixed(2),
       time_in_force: "gtc",
+      ...(input.clientOrderId ? { client_order_id: input.clientOrderId } : {}),
     })
   );
 }
