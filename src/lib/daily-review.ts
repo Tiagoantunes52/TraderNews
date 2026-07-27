@@ -118,7 +118,9 @@ export type PaperRunLog = {
   cfg: RiskConfig;
   decisions: DecisionRecord[];
   errors: string[];
-  counts: { simOpened: number; simClosed: number; ordersSubmitted: number };
+  // `entryOrdersExpired` is optional: run logs written before stale-entry expiry
+  // existed have no such field, and the review must still read them.
+  counts: { simOpened: number; simClosed: number; ordersSubmitted: number; entryOrdersExpired?: number; intentsRecovered?: number };
 };
 
 // ── 1. Decision replay ───────────────────────────────────────────────────────

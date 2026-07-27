@@ -293,6 +293,48 @@ export function evaluateBuy(
   return { allowed: true, reason: null };
 }
 
+/** The fields `rankEntryCandidates` orders on; callers pass their own richer rows. */
+export type RankableEntry = { score: number; confidence: number; ticker: string };
+
+/**
+ * Order candidate entries by conviction, strongest first, for a book whose slots are
+ * scarce. `evaluateBuy` is a first-come allocator — once the position count, gross
+ * cap or a cluster cap binds, whoever asked first holds the slot — so the sequence
+ * candidates arrive in decides which names the book ends up owning. Feeding them in
+ * source order (whatever the estimate query returned) hands the slots to an arbitrary
+ * subset; ranking first makes the book the best N candidates rather than the first N.
+ *
+ * Score is the whole ranking signal. Confidence and ticker only break ties, so the
+ * order is total and the run log replays identically — position size already scales
+ * with confidence, and double-counting it here would quietly re-weight the strategy.
+ *
+ * Scores compare only within one book (each reads a different source score), but the
+ * gate is per-book, so a mixed list sorts safely: every book's candidates keep their
+ * descending order relative to each other. Returns a new array; input is untouched.
+ */
+export function rankEntryCandidates<T extends RankableEntry>(candidates: readonly T[]): T[] {
+  return [...candidates].sort(
+    (a, b) => descFinite(a.score, b.score) || descFinite(a.confidence, b.confidence) || a.ticker.localeCompare(b.ticker)
+  );
+}
+
+/**
+ * Descending compare that stays a total order when a value isn't finite. A plain
+ * `b - a` returns NaN against NaN/±Infinity, and a comparator that returns NaN makes
+ * the sort order implementation-defined — which would silently break the determinism
+ * the run-log replay depends on. Non-finite values sort last (and tie with each
+ * other): a corrupt score is data to investigate, not a candidate that should win a
+ * scarce slot.
+ */
+function descFinite(a: number, b: number): number {
+  const aOk = Number.isFinite(a);
+  const bOk = Number.isFinite(b);
+  if (aOk && bOk) return b - a;
+  if (aOk) return -1;
+  if (bOk) return 1;
+  return 0;
+}
+
 /**
  * The largest notional of `candidate` this book would accept, or 0 if no size is
  * acceptable.

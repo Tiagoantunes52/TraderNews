@@ -311,14 +311,44 @@ model PaperOrder {
   signal         String // scoreToSignal label that triggered the order (combined book)
   notional       Float? // requested notional ($) — set on confidence-weighted buys
   qty            Float? // requested quantity — set on sell-to-close
-  alpacaOrderId  String? @unique // Alpaca order id; null only if submission failed pre-id
-  status         String // Alpaca order status (new|accepted|filled|canceled|...)
+  alpacaOrderId  String? @unique // Alpaca order id; null while the intent is unsubmitted
+  // Idempotency key, assigned and PERSISTED BEFORE the order is submitted, and sent to
+  // Alpaca as client_order_id. Two jobs: (1) a crash between "broker accepted" and
+  // "row written" leaves a recoverable intent — the next run looks the order up by this
+  // id and adopts it, instead of the order existing only at the broker; (2) Alpaca
+  // rejects a duplicate client_order_id, so a retry cannot double-submit. Null on rows
+  // predating durable intents, and on protective legs (which arrive with their OTO
+  // parent and so cannot be independently duplicated).
+  clientOrderId  String? @unique
+  status         String // PENDING_SUBMIT (intent, not yet at the broker) | ABANDONED | Alpaca status
   filledQty      Float?
   filledAvgPrice Float?
   submittedAt    DateTime @default(now())
   filledAt       DateTime?
 
   @@index([stockId, submittedAt])
+  @@index([status]) // the pending-submit recovery sweep
+}
+
+// Mutual exclusion for a pipeline stage. Distinct from the per-day idempotency marker
+// (the SIM_COMBINED PaperEquitySnapshot row), and the two must not be merged: the
+// MARKER is written LAST so a run that crashes half-way is retried rather than skipped,
+// while a LEASE must be taken FIRST or it excludes nothing. Taking the marker first
+// would fix the race and break crash-retry.
+//
+// Needed because the paper stage has two schedulers deliberately aligned on the same
+// minute: GH Actions (`30 19` / `30 20` weekdays) and the Supabase pg_cron tick
+// (`*/5 16-21` weekdays). The old guard was read-then-act, so both could see "not run"
+// and both submit broker orders.
+//
+// Acquired with a single atomic upsert that only steals an EXPIRED lease (see
+// lib/pipeline-lease.ts) — the expiry is what stops a crashed run from blocking the
+// stage forever.
+model PipelineLease {
+  stage      String   @id // "paper" | ... — one row per stage
+  holder     String // opaque per-run id, so only the holder can release it
+  acquiredAt DateTime @default(now())
+  expiresAt  DateTime
 }
 
 // Internal mark-to-market position per (stock, strategy). At most one OPEN row per
@@ -359,6 +389,11 @@ model SimPosition {
 
   @@index([strategy, status])
   @@index([stockId, strategy])
+  // NOTE: the "at most one OPEN row per (stock, strategy)" invariant in the comment
+  // above is enforced by a PARTIAL unique index — `("stockId", strategy) WHERE status =
+  // 'OPEN'` — created in raw SQL (see the add_pipeline_lease migration). Prisma cannot
+  // express a partial index, so it does NOT appear here. A plain @@unique would be
+  // wrong: it forbids ever re-entering a name after closing it.
 }
 
 // Daily equity point per book — drives the performance equity curves and the

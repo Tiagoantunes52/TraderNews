@@ -5,6 +5,7 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  getOrderByClientOrderId,
   submitEntryWithStop,
   submitTrailingStop,
   submitStopSell,
@@ -39,6 +40,91 @@ describe("alpaca-trading client", () => {
       expect(isPaperTradingConfigured()).toBe(true);
       delete process.env.ALPACA_PAPER_API_SECRET_KEY;
       expect(isPaperTradingConfigured()).toBe(false);
+    });
+  });
+
+  describe("client_order_id (durable order intents)", () => {
+    const bodyOf = (mockFetch: ReturnType<typeof vi.fn>) =>
+      JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string);
+
+    it("sends the caller's key on every submission path", async () => {
+      for (const submit of [
+        () => submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100, clientOrderId: "k1" }),
+        () => submitEntryWithStop({ symbol: "AAPL", qty: 2, limitPrice: 10, stopPrice: 9, clientOrderId: "k1" }),
+        () => submitTrailingStop({ symbol: "AAPL", qty: 2, trailPercent: 5, clientOrderId: "k1" }),
+        () => submitStopSell({ symbol: "AAPL", qty: 2, stopPrice: 9, clientOrderId: "k1" }),
+      ]) {
+        const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "o1", status: "new" }));
+        vi.stubGlobal("fetch", mockFetch);
+        await submit();
+        expect(bodyOf(mockFetch).client_order_id).toBe("k1");
+      }
+    });
+
+    it("omits the field entirely when no key is given", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "o1", status: "new" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100 });
+      expect(bodyOf(mockFetch)).not.toHaveProperty("client_order_id");
+    });
+
+    it("resolves an unconfirmed intent: found at the broker", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ id: "real-id", status: "filled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      const order = await getOrderByClientOrderId("k1");
+      expect(order?.id).toBe("real-id");
+      expect(mockFetch.mock.calls[0][0]).toContain("/v2/orders:by_client_order_id?client_order_id=k1");
+    });
+
+    it("resolves an unconfirmed intent: 404 means it never landed", async () => {
+      // Distinct from an error — only a definite 404 may mark an intent abandoned,
+      // because guessing would hide a live order sitting at the broker.
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 } as Response));
+      expect(await getOrderByClientOrderId("k1")).toBeNull();
+    });
+
+    it("throws on a transport/server error rather than reporting 'not found'", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response));
+      await expect(getOrderByClientOrderId("k1")).rejects.toThrow(/500/);
+    });
+  });
+
+  describe("live-endpoint safety boundary", () => {
+    // ALPACA_PAPER_BASE_URL was the only thing between this app and real money:
+    // nothing validated the endpoint, and isPaperTradingConfigured() only checks that
+    // the vars exist, not that they belong to a paper account.
+    it("refuses the live Alpaca trading host", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://api.alpaca.markets";
+      await expect(getAccount()).rejects.toThrow(/Refusing to trade against a live Alpaca host/);
+      expect(mockFetch).not.toHaveBeenCalled(); // refused before any request left the process
+    });
+
+    it("refuses any non-paper alpaca.markets host, including on writes", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://broker-api.alpaca.markets";
+      await expect(submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100 })).rejects.toThrow(
+        /Refusing to trade against a live Alpaca host/
+      );
+      await expect(cancelOrder("abc")).rejects.toThrow(/Refusing to trade against a live Alpaca host/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("allows the paper host and non-Alpaca stub hosts (tests need the latter)", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ equity: "1", cash: "1" }));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
+      await expect(getAccount()).resolves.toBeTruthy();
+      process.env.ALPACA_PAPER_BASE_URL = "http://localhost:9999";
+      await expect(getAccount()).resolves.toBeTruthy();
+    });
+
+    it("rejects a malformed override rather than silently falling back", async () => {
+      vi.stubGlobal("fetch", vi.fn());
+      process.env.ALPACA_PAPER_BASE_URL = "not-a-url";
+      await expect(getAccount()).rejects.toThrow(/not a valid URL/);
     });
   });
 

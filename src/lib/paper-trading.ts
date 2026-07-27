@@ -205,6 +205,40 @@ export function isBrokerStopsEnabled(): boolean {
 // persists). The cap, not the fill price — you still fill at the market price.
 const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.005);
 
+/**
+ * Days an unfilled BUY entry may rest at the broker before it's cancelled.
+ *
+ * Entries go in `gtc` (the attached stop leg needs it), and nothing used to cancel
+ * them — `cancelOrder` was only ever called on protective legs. Nine entries were
+ * found resting 28–33 days, still live: a signal from four weeks ago that could fill
+ * at any moment, for a book that had long since re-evaluated the name. The re-entry
+ * guard doesn't help — it governs new submissions, not orders already working.
+ *
+ * 1 = an order gets the next session to fill and is cancelled at the following run.
+ * Anything longer is acting on a signal the strategy has already replaced. 0 disables.
+ */
+export const ENTRY_ORDER_TTL_DAYS = numEnv("PAPER_ENTRY_ORDER_TTL_DAYS", 1);
+
+/**
+ * Should this resting broker order be cancelled for age? Pure — the stage supplies
+ * the order's side, whether the broker already considers it done, and its age.
+ *
+ * SELLs are deliberately exempt at any age. An unfilled exit still *wants* to happen:
+ * cancelling one would strand a position the strategy has already decided to leave,
+ * turning a measurement problem into an unwanted holding. Only entries go stale.
+ */
+export function shouldExpireEntryOrder(input: {
+  side: string;
+  terminal: boolean; // broker already reports a terminal state — nothing to cancel
+  ageDays: number;
+  ttlDays?: number;
+}): boolean {
+  const { side, terminal, ageDays, ttlDays = ENTRY_ORDER_TTL_DAYS } = input;
+  if (side !== "BUY" || terminal) return false;
+  if (!Number.isFinite(ttlDays) || ttlDays <= 0) return false; // 0 / bad value disables
+  return ageDays >= ttlDays;
+}
+
 // US exchanges in the app's market taxonomy (see market-utils). Paper trading is
 // US-equity only — same coverage gate as the congress feature.
 const US_MARKETS = new Set(["NYSE", "NASDAQ"]);

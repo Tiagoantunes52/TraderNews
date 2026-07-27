@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
+import { acquireLease, releaseLease } from "@/lib/pipeline-lease";
 import { scoreToSignal } from "@/lib/indicators";
 import {
   detectDrawdownBreach,
@@ -30,6 +32,7 @@ import {
   realizedFromFills,
   isPaperTradeEligible,
   isEntrySignal,
+  shouldExpireEntryOrder,
   SIM_STARTING_EQUITY,
   type Strategy,
   type PositionAction,
@@ -37,6 +40,7 @@ import {
 import {
   isRiskLimitsEnabled,
   evaluateBuy,
+  rankEntryCandidates,
   maxAllowedNotional,
   regimeMultiplier,
   correlationClusters,
@@ -53,6 +57,7 @@ import {
   getPositions,
   submitMarketOrder,
   getOrder,
+  getOrderByClientOrderId,
   getClock,
   getCalendar,
   getOpenOrders,
@@ -72,13 +77,32 @@ export type PaperStageResult = {
   ordersSubmitted: number; // real Alpaca paper orders placed this run
   simOpened: number; // internal sim positions opened
   simClosed: number; // internal sim positions closed
+  entryOrdersExpired: number; // stale unfilled BUY entries cancelled at the broker
+  intentsRecovered: number; // orders found at the broker that a crash left unrecorded
   done: true;
   errors: string[];
 };
 
+// A recorded intent that has NOT yet been confirmed at the broker. Written before the
+// submission so a crash in between leaves something to recover from, and cleared to the
+// real Alpaca status the moment the broker responds.
+const PENDING_SUBMIT_STATUS = "PENDING_SUBMIT";
+// An intent the broker never received (looked up by client_order_id on a later run and
+// not found). Terminal: there is nothing at the broker, so nothing to reconcile.
+const ABANDONED_STATUS = "ABANDONED";
+
 // Terminal Alpaca order states — once an order reaches one, there's nothing left
 // to reconcile, so it drops out of the pending-fill recheck.
-const TERMINAL_ORDER_STATUS = new Set(["filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced"]);
+const TERMINAL_ORDER_STATUS = new Set([
+  "filled",
+  "canceled",
+  "cancelled",
+  "expired",
+  "rejected",
+  "done_for_day",
+  "replaced",
+  ABANDONED_STATUS,
+]);
 
 // ── Near-close trade window (PAPER_TRADE_NEAR_CLOSE) ──────────────────────────
 // Act only in the final minutes before the US close: deepest liquidity of the day
@@ -141,11 +165,50 @@ async function inCloseWindow(): Promise<boolean> {
 // day. Single-shot (`done: true`); the watchlist is small enough for one pass and
 // the wall-clock budget isn't needed, but errors are isolated so one bad ticker or
 // an Alpaca hiccup never sinks the run. US-equities only (foreign/crypto filtered).
+/**
+ * Mutual exclusion around the whole stage.
+ *
+ * The per-day marker (today's SIM_COMBINED snapshot) answers "has today's work been
+ * done?" but cannot answer "is it being done right now": it's a read-then-act check,
+ * and it is written LAST on purpose so a run that dies half-way is retried rather than
+ * skipped. Two invocations could therefore both read "not run", both open positions and
+ * both submit broker orders. Not hypothetical — the GitHub Actions crons (`30 19`,
+ * `30 20` weekdays) land on the same minute as the Supabase pg_cron tick (every 5
+ * minutes, 16:00-21:59 weekdays), twice every weekday.
+ *
+ * The lease wraps the marker read too, which is the point: that's what makes
+ * read-then-act atomic. Losing the race is a clean no-op, exactly like losing to the
+ * marker. `finally` releases on every path, and the lease TTL covers a hard crash.
+ */
 export async function runPaperStage(): Promise<PaperStageResult> {
+  const lease = await acquireLease("paper");
+  if (!lease) {
+    return {
+      stage: "paper",
+      rebalanced: false,
+      ordersSubmitted: 0,
+      simOpened: 0,
+      simClosed: 0,
+      entryOrdersExpired: 0,
+      intentsRecovered: 0,
+      done: true,
+      errors: [],
+    };
+  }
+  try {
+    return await runPaperStageLocked();
+  } finally {
+    await releaseLease(lease);
+  }
+}
+
+async function runPaperStageLocked(): Promise<PaperStageResult> {
   const errors: string[] = [];
   let ordersSubmitted = 0;
   let simOpened = 0;
   let simClosed = 0;
+  let entryOrdersExpired = 0;
+  let intentsRecovered = 0;
   // Account / trading-health alerts (issue #56) accumulated across the run, then
   // persisted + emailed to admins once at the end (the daily guard fires them once).
   const accountAlerts: AlertDraft[] = [];
@@ -164,14 +227,15 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     select: { id: true },
   });
   if (alreadyRan) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
   }
 
   // Near-close gate: when enabled, out-of-window runs no-op WITHOUT writing the
   // idempotency snapshot, so the day's first in-window run does all the work.
   if (isTradeNearCloseEnabled() && !(await inCloseWindow())) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
   }
+
 
   // Dead-man's check: any trading day between the previous snapshot and today with
   // no snapshot means the scheduler missed that day's whole trade window (the
@@ -265,6 +329,22 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   const combinedRmLong = new Set<string>(); // stockIds long after this run
   const combinedRmOpened = new Set<string>(); // fresh OPEN this run (drives broker entries + re-entry guard)
   const combinedRmExit = new Map<string, string>(); // stockId → exit reason on close
+
+  // Fresh _RM entries are buffered here instead of acting inline; the ranked pass
+  // below gates and persists them. See the comment on that pass for why.
+  type RmEntryCandidate = {
+    strategy: Strategy;
+    stockId: string;
+    ticker: string;
+    qty: number;
+    price: number;
+    score: number;
+    signal: ReturnType<typeof scoreToSignal>;
+    confidence: number;
+    atrPct: number | null;
+    decision: DecisionRecord; // annotated in place when the gate vetoes the entry
+  };
+  const rmEntries: RmEntryCandidate[] = [];
 
   // Index open positions by (stock, strategy) for O(1) reconciliation.
   const openPositions = await db.simPosition.findMany({
@@ -497,24 +577,24 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       };
       decisions.push(decision);
 
-      // Portfolio-level gate: block a fresh _RM open that would breach a cap or the
-      // drawdown kill-switch. Must run before the COMBINED_RM capture so a blocked
-      // open isn't mirrored to the live Alpaca book either. Pure books are unaffected.
-      if (riskLimitsOn && action.type === "OPEN" && STRATEGY_IS_RM[strategy]) {
-        const br = bookRisk.get(strategy);
-        if (br) {
-          const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
-          const verdict = evaluateBuy(br, candidate, limits, regimeMult);
-          if (verdict.allowed) {
-            br.positions.push(candidate); // reserve so later opens this run see it
-          } else {
-            action = { type: "NONE" };
-            decision.riskBlocked = true;
-            // Record WHICH rule vetoed it: without the reason a silently-halted book
-            // can only be diagnosed by rebuilding its equity from closed-position P&L.
-            decision.riskBlockReason = verdict.reason;
-          }
-        }
+      // Fresh _RM opens don't act here. The portfolio gate hands out a bounded number
+      // of slots, so the order candidates reach it decides which names the book holds;
+      // buffer them and run the gate in score order once this loop has booked every
+      // close (see the ranked pass below). Pure books are ungated and open inline.
+      if (action.type === "OPEN" && STRATEGY_IS_RM[strategy]) {
+        rmEntries.push({
+          strategy,
+          stockId: est.stockId,
+          ticker: est.stock.ticker,
+          qty: action.qty,
+          price: action.price,
+          score,
+          signal,
+          confidence: decisionConfidence,
+          atrPct,
+          decision,
+        });
+        continue;
       }
 
       // A close frees a slot. `bookRisk` is a snapshot taken at run start, so without
@@ -541,10 +621,11 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }
       }
 
-      // Capture the COMBINED_RM decision so the Alpaca book can mirror it.
+      // Capture the COMBINED_RM decision so the Alpaca book can mirror it. Fresh opens
+      // never reach here (they're buffered above); the ranked pass captures the ones
+      // that clear the gate, so a blocked entry still isn't mirrored to the live book.
       if (strategy === "COMBINED_RM") {
-        if (action.type === "OPEN") combinedRmOpened.add(est.stockId);
-        if (action.type === "OPEN" || action.type === "MARK") combinedRmLong.add(est.stockId);
+        if (action.type === "MARK") combinedRmLong.add(est.stockId);
         else if (action.type === "CLOSE" && action.reason) combinedRmExit.set(est.stockId, action.reason);
       }
 
@@ -609,6 +690,78 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       } catch (e) {
         errors.push(`Sim ${strategy} failed for ${est.stock.ticker}: ${String(e)}`);
       }
+    }
+  }
+
+  // ── Ranked _RM entry pass ──────────────────────────────────────────────────
+  // The portfolio gate is a scarce-slot allocator (position count, gross exposure,
+  // cluster caps), so whichever candidates reach it first take the slots. Gating
+  // inline meant that order was `estimates` order — `date desc` off the estimate
+  // query, i.e. arbitrary — so a book at its cap filled with whatever names the query
+  // happened to return first rather than the ones it rated highest. Ranking by score
+  // makes the held book the *best* N candidates instead of the first N.
+  //
+  // Deferring past the main loop also lets today's exits pay for today's entries: the
+  // close handler frees a slot in `bookRisk`, but inline that only helped candidates
+  // later in estimate order, so a book that closed and re-filled on the same day
+  // usually blocked every entry and waited for tomorrow's rebuild.
+  //
+  // See rankEntryCandidates for how ties and cross-book comparability are handled.
+  for (const entry of rankEntryCandidates(rmEntries)) {
+    if (riskLimitsOn) {
+      const br = bookRisk.get(entry.strategy);
+      if (br) {
+        const candidate = {
+          cluster: clusterKeyFor(entry.ticker, clusterByTicker),
+          notional: entry.qty * entry.price,
+        };
+        const verdict = evaluateBuy(br, candidate, limits, regimeMult);
+        if (!verdict.allowed) {
+          // The decision was logged with its OPEN action so the replay compares like
+          // with like; these two fields record the override. Without the reason a
+          // silently-halted book can only be diagnosed by rebuilding its equity from
+          // closed-position P&L.
+          entry.decision.riskBlocked = true;
+          entry.decision.riskBlockReason = verdict.reason;
+          continue;
+        }
+        br.positions.push(candidate); // reserve so lower-ranked candidates see it
+      }
+    }
+
+    // Capture before the write, matching the pre-ranking behaviour: a create that
+    // throws still leaves the live book pointed at the name the sim meant to hold.
+    if (entry.strategy === "COMBINED_RM") {
+      combinedRmOpened.add(entry.stockId);
+      combinedRmLong.add(entry.stockId);
+    }
+
+    try {
+      await db.simPosition.create({
+        data: {
+          stockId: entry.stockId,
+          strategy: entry.strategy,
+          status: "OPEN",
+          qty: entry.qty,
+          entryDate: to,
+          entryPrice: entry.price,
+          // Persist the confidence that actually sized the position.
+          confidence: entry.confidence,
+          // The justification for the entry, frozen here: today's estimate row gets
+          // overwritten, so a later join can't recover what we acted on.
+          entrySignal: entry.signal,
+          entryScore: entry.score,
+          lastMarkDate: to,
+          lastMarkPrice: entry.price,
+          peakPrice: entry.price,
+          // Freeze the entry-day ATR so exit distances never widen with a later
+          // volatility spike.
+          entryAtrPct: entry.atrPct,
+        },
+      });
+      simOpened++;
+    } catch (e) {
+      errors.push(`Sim ${entry.strategy} failed for ${entry.ticker}: ${String(e)}`);
     }
   }
 
@@ -747,6 +900,38 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   // ── Alpaca book (only when paper keys are configured) ──────────────────────
   if (isPaperTradingConfigured()) {
     try {
+      // Recover intents that were written but never confirmed. A row sits at
+      // PENDING_SUBMIT only if the process died between "about to submit" and "broker
+      // answered" — the order may or may not exist at Alpaca, and before client_order_id
+      // there was no way to tell, so it would have gone on living at the broker unseen.
+      // Ask by the key we assigned: found → adopt the real id, 404 → it never landed.
+      const orphans = await db.paperOrder.findMany({
+        where: { status: PENDING_SUBMIT_STATUS, clientOrderId: { not: null } },
+        select: { id: true, clientOrderId: true },
+      });
+      for (const o of orphans) {
+        try {
+          const remote = await getOrderByClientOrderId(o.clientOrderId!);
+          await db.paperOrder.update({
+            where: { id: o.id },
+            data: remote
+              ? {
+                  alpacaOrderId: remote.id,
+                  status: remote.status,
+                  filledQty: remote.filledQty,
+                  filledAvgPrice: remote.filledAvgPrice,
+                  filledAt: remote.filledAt ? new Date(remote.filledAt) : null,
+                }
+              : { status: ABANDONED_STATUS },
+          });
+          if (remote) intentsRecovered++;
+        } catch (e) {
+          // Leave it PENDING_SUBMIT — a later run retries. Never guess ABANDONED from a
+          // transport error: that would hide a real, live order at the broker.
+          errors.push(`Intent recovery failed (${o.clientOrderId}): ${String(e)}`);
+        }
+      }
+
       // Reconcile fills for orders still pending from a previous run. Filtered on
       // status rather than taking the most recent N: the old window silently dropped
       // any non-terminal order that fell outside it, stranding it at `new` forever
@@ -754,11 +939,28 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const pending = await db.paperOrder.findMany({
         where: { alpacaOrderId: { not: null }, status: { notIn: [...TERMINAL_ORDER_STATUS] } },
         orderBy: { submittedAt: "desc" },
-        select: { id: true, alpacaOrderId: true, status: true },
+        select: { id: true, alpacaOrderId: true, status: true, side: true, submittedAt: true },
       });
       for (const o of pending) {
         try {
-          const remote = await getOrder(o.alpacaOrderId!);
+          let remote = await getOrder(o.alpacaOrderId!);
+          // Expire a stale entry. Entries rest `gtc` so the attached stop survives the
+          // close, but nothing ever cancelled them — an unfilled BUY kept working
+          // indefinitely and could fill weeks later on a signal the book had already
+          // replaced. Sells are exempt: an unfilled exit still WANTS to happen, and
+          // cancelling one would strand a position the strategy has decided to leave.
+          const staleEntry = shouldExpireEntryOrder({
+            side: o.side,
+            terminal: TERMINAL_ORDER_STATUS.has(remote.status),
+            ageDays: utcDaysBetween(o.submittedAt, todayUTC),
+          });
+          if (staleEntry) {
+            await cancelOrder(o.alpacaOrderId!);
+            // Re-read rather than assuming "canceled": the order may have filled
+            // between the fetch above and the cancel, and cancelOrder tolerates that.
+            remote = await getOrder(o.alpacaOrderId!);
+            entryOrdersExpired++;
+          }
           await db.paperOrder.update({
             where: { id: o.id },
             data: {
@@ -772,6 +974,43 @@ export async function runPaperStage(): Promise<PaperStageResult> {
           errors.push(`Order reconcile failed (${o.alpacaOrderId}): ${String(e)}`);
         }
       }
+
+      /**
+       * Record the intent, submit under its key, then record the outcome.
+       *
+       * The old order was submit-then-record, which has a window where the broker holds
+       * a live order the app has no row for — invisible to every reader of PaperOrder,
+       * and unrecoverable because the only handle (alpacaOrderId) is what was lost.
+       * Writing first inverts that: the worst case is a row with no broker order, which
+       * the recovery sweep above resolves by asking Alpaca for the key.
+       *
+       * A throw deliberately leaves the row at PENDING_SUBMIT rather than marking it
+       * failed — an error here does NOT prove the order didn't land.
+       */
+      const submitTracked = async <T extends { id: string; status: string }>(
+        intent: { stockId: string; side: "BUY" | "SELL"; signal: string; qty?: number; notional?: number },
+        submit: (clientOrderId: string) => Promise<T>
+      ): Promise<T> => {
+        const clientOrderId = randomUUID();
+        const row = await db.paperOrder.create({
+          data: {
+            stockId: intent.stockId,
+            side: intent.side,
+            signal: intent.signal,
+            qty: intent.qty,
+            notional: intent.notional,
+            clientOrderId,
+            status: PENDING_SUBMIT_STATUS,
+          },
+          select: { id: true },
+        });
+        const order = await submit(clientOrderId);
+        await db.paperOrder.update({
+          where: { id: row.id },
+          data: { alpacaOrderId: order.id, status: order.status },
+        });
+        return order;
+      };
 
       // Desired state per stock. Two modes:
       //  • Broker stops ON: entries go in as whole-share marketable-limit buys with a
@@ -913,15 +1152,21 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 : 0;
             if (action.type === "ENTER" && enterQty >= 1) {
               reserveAlpacaBuy(ticker, enterQty * price);
-              const { order, stopOrderId } = await submitEntryWithStop({
-                symbol: ticker,
-                qty: enterQty,
-                limitPrice: action.limitPrice,
-                stopPrice: action.stopPrice,
-              });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: enterQty, alpacaOrderId: order.id, status: order.status },
-              });
+              let stopOrderId: string | null = null;
+              await submitTracked(
+                { stockId: est.stockId, side: "BUY", signal: scoreToSignal(est.combinedScore), qty: enterQty },
+                async (clientOrderId) => {
+                  const res = await submitEntryWithStop({
+                    symbol: ticker,
+                    qty: enterQty,
+                    limitPrice: action.limitPrice,
+                    stopPrice: action.stopPrice,
+                    clientOrderId,
+                  });
+                  stopOrderId = res.stopOrderId;
+                  return res.order;
+                }
+              );
               if (stopOrderId) {
                 // Record the protective leg so the pending-fill reconcile loop catches
                 // a broker stop-out (and a cancel/replace) with no extra code.
@@ -934,10 +1179,9 @@ export async function runPaperStage(): Promise<PaperStageResult> {
             } else if (action.type === "EXIT" && held) {
               if (protective) await cancelOrder(protective.id);
               const qty = Math.abs(held.qty);
-              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: action.reason, qty, alpacaOrderId: order.id, status: order.status },
-              });
+              await submitTracked({ stockId: est.stockId, side: "SELL", signal: action.reason, qty }, (clientOrderId) =>
+                submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
+              );
               managedSymbols.add(ticker);
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
@@ -947,20 +1191,18 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               const qty = Math.floor(Math.abs(held.qty));
               if (qty >= 1) {
                 await cancelOrder(protective.id);
-                const order = await submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "SELL", signal: "TRAIL", qty, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked({ stockId: est.stockId, side: "SELL", signal: "TRAIL", qty }, (clientOrderId) =>
+                  submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent, clientOrderId })
+                );
                 managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             } else if (action.type === "REPAIR_STOP" && held) {
               const qty = Math.floor(Math.abs(held.qty));
               if (qty >= 1) {
-                const order = await submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked({ stockId: est.stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
+                  submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice, clientOrderId })
+                );
                 managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
@@ -1014,12 +1256,14 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 // fine, unlike a stop), after cancelling any resting protective order.
                 if (protective) await cancelOrder(protective.id);
                 const qty = Math.abs(pos.qty);
-                const order = await submitMarketOrder({ symbol, side: "sell", qty });
                 if (stockId) {
-                  await db.paperOrder.create({
-                    data: { stockId, side: "SELL", signal: "ORPHAN_EXIT", qty, alpacaOrderId: order.id, status: order.status },
-                  });
+                  await submitTracked({ stockId, side: "SELL", signal: "ORPHAN_EXIT", qty }, (clientOrderId) =>
+                    submitMarketOrder({ symbol, side: "sell", qty, clientOrderId })
+                  );
                 } else {
+                  // No Stock row → no intent row is possible (stockId is required), so
+                  // this one submission stays unrecorded and unrecoverable, as before.
+                  await submitMarketOrder({ symbol, side: "sell", qty });
                   errors.push(`Orphan-exit sold ${symbol} but found no Stock row to record it`);
                 }
                 ordersSubmitted++;
@@ -1029,12 +1273,13 @@ export async function runPaperStage(): Promise<PaperStageResult> {
                 if (qty < 1) continue; // whole-share only (Alpaca rejects fractional stops)
                 const anchor = pos.avgEntryPrice ?? pos.currentPrice;
                 if (anchor == null || anchor <= 0) continue;
-                const order = await submitStopSell({ symbol, qty, stopPrice: cents(anchor * (1 - fallbackStopPct)) });
+                const stopPrice = cents(anchor * (1 - fallbackStopPct));
                 if (stockId) {
-                  await db.paperOrder.create({
-                    data: { stockId, side: "SELL", signal: "STOP", qty, alpacaOrderId: order.id, status: order.status },
-                  });
+                  await submitTracked({ stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
+                    submitStopSell({ symbol, qty, stopPrice, clientOrderId })
+                  );
                 } else {
+                  await submitStopSell({ symbol, qty, stopPrice });
                   errors.push(`Protective-stop sweep placed a stop for ${symbol} but found no Stock row to record it`);
                 }
                 ordersSubmitted++;
@@ -1124,14 +1369,17 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               if (qty < 1) continue;
               try {
                 reserveAlpacaBuy(ticker, qty * quant.price);
-                const { order, stopOrderId } = await submitEntryWithStop({
-                  symbol: ticker,
-                  qty,
-                  limitPrice: action.limitPrice,
-                  stopPrice: action.stopPrice,
-                });
-                await db.paperOrder.create({
-                  data: { stockId, side: "BUY", signal: "CONVERGE_ENTRY", qty, alpacaOrderId: order.id, status: order.status },
+                let stopOrderId: string | null = null;
+                await submitTracked({ stockId, side: "BUY", signal: "CONVERGE_ENTRY", qty }, async (clientOrderId) => {
+                  const res = await submitEntryWithStop({
+                    symbol: ticker,
+                    qty,
+                    limitPrice: action.limitPrice,
+                    stopPrice: action.stopPrice,
+                    clientOrderId,
+                  });
+                  stopOrderId = res.stopOrderId;
+                  return res.order;
                 });
                 if (stopOrderId) {
                   await db.paperOrder.create({
@@ -1172,18 +1420,17 @@ export async function runPaperStage(): Promise<PaperStageResult> {
               const allowed = allowedAlpacaBuy(ticker, notional);
               if (allowed > 0) {
                 reserveAlpacaBuy(ticker, allowed);
-                const order = await submitMarketOrder({ symbol: ticker, side: "buy", notional: allowed });
-                await db.paperOrder.create({
-                  data: { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional: allowed, alpacaOrderId: order.id, status: order.status },
-                });
+                await submitTracked(
+                  { stockId: est.stockId, side: "BUY", signal: combinedSignal, notional: allowed },
+                  (clientOrderId) => submitMarketOrder({ symbol: ticker, side: "buy", notional: allowed, clientOrderId })
+                );
                 ordersSubmitted++;
               }
             } else if (!wantLong && held && held.qty > 0) {
               const qty = Math.abs(held.qty);
-              const order = await submitMarketOrder({ symbol: ticker, side: "sell", qty });
-              await db.paperOrder.create({
-                data: { stockId: est.stockId, side: "SELL", signal: sellSignal, qty, alpacaOrderId: order.id, status: order.status },
-              });
+              await submitTracked({ stockId: est.stockId, side: "SELL", signal: sellSignal, qty }, (clientOrderId) =>
+                submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
+              );
               ordersSubmitted++;
             }
           } catch (e) {
@@ -1245,7 +1492,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       cfg,
       decisions,
       errors,
-      counts: { simOpened, simClosed, ordersSubmitted },
+      counts: { simOpened, simClosed, ordersSubmitted, entryOrdersExpired, intentsRecovered },
     };
     await db.dailyReview.upsert({
       where: { date: todayUTC },
@@ -1267,5 +1514,5 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     }
   }
 
-  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, done: true, errors };
+  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, intentsRecovered, done: true, errors };
 }
