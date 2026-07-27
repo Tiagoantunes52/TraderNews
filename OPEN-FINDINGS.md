@@ -108,31 +108,47 @@ it cannot establish is *executable* performance — and only the latter is evide
   built from this morning's data. Re-running sentiment near the close means LLM calls
   over the whole universe inside a 300s budget, which is a separate piece of work.
 
+- **Fills are now the primary evidence.** The go-live gate certified
+  `SIM_COMBINED_RM` — a book that never paid a spread, never missed a fill and never had
+  an order rest unfilled for a month. Those are exactly the points where sim and broker
+  diverge, and one-sidedly: the sim books trades the broker could not execute, and the
+  ones it could not execute were disproportionately the winners. `selectGatedBook()`
+  (pure, tested) now certifies the **broker's** book whenever one exists, and a sim book
+  only before any broker history does. A *short* live history deliberately does not fall
+  back to the sim — it is judged as the short live record it is and fails on coverage.
+  Round-trips are counted as SELL orders that actually **filled**, not sim closes. Gate
+  coverage is measured from the gated book's own snapshot span rather than from the age
+  of the estimate data, so a book that starts trading later is not credited with history
+  it does not have. The sim books remain in the report as diagnostics.
+- **Gate enforcement — resolved as "the boundary enforces, the gate reports."** Wiring
+  the gate into the order path would have halted the paper book (it reads
+  INSUFFICIENT_DATA), and the paper book is the only thing generating the history the
+  gate needs — it would have permanently prevented itself from being satisfiable.
+  Meanwhile its actual subject, real money, is already unreachable via `baseUrl()`, which
+  is a stronger guarantee than a status check: a code-level boundary rather than a value
+  that must be computed correctly and then respected. This reasoning is recorded in
+  `calibration.ts` above `GATE_THRESHOLDS` so it is not "fixed" by a later reader.
+
 ---
 
 ## Priority plan
 
-### 1. Measurement correctness
+### 1. Rotation policy — the last open item, and deliberately still open
 
-- **Fills become the primary record; sim demoted to diagnostic.** Now unblocked: with
-  live-quote pricing on, the sim and the broker finally price the same event. The right
-  split: signal research evaluated against a point-in-time executable
-  price model; strategy performance from actual orders, fills, cancels, and exposure.
-- **Gate is not enforced — and enforcing it naively would halt the experiment.**
-  `evaluateGate` is imported only by `calibration.ts`, `calibration-data.ts` and its
-  test; nothing in the order path checks it. But the gate currently reads
-  INSUFFICIENT_DATA (`minMonths: 6` against ~1.3 months), so wiring it into the order
-  path as-is would stop the paper book trading — killing the data collection that is the
-  only route to ever passing it. The gate's real subject is *live* trading, and live is
-  now refused in code by the `baseUrl()` boundary, which is a strictly stronger
-  guarantee than a gate check. **Needs a decision:** either (a) treat the boundary as the
-  enforcement point and demote the gate to reporting, or (b) define an explicit
-  paper-vs-live split so the gate blocks only the latter. Do not simply "wire it in".
-- **Rotation policy.** The cap is *admission control*, not portfolio construction: held
-  names keep slots while stronger current candidates are rejected. That may be
-  intentional — but then the strategy is "hold until exit", not "own the best current
-  signals", and should be evaluated as such. Decide *after* measurement is trustworthy.
-  See "known gaps" — the ranking change does **not** address this.
+The portfolio cap is *admission control*, not portfolio construction: held names keep
+their slots while stronger current candidates are turned away. The ranking change
+allocates *free* slots well; it never evicts a holding for a better candidate.
+
+That may be the right strategy — but then it is "hold until exit", not "own the best
+current signals", and it should be stated and evaluated as such rather than being an
+accident of how the gate happens to work.
+
+**Not blocked on effort — blocked on evidence.** Rotation is a strategy change, and the
+entire point of everything above it is that strategy changes could not be evaluated:
+the sim booked trades the broker never made. That is now fixed, so the right sequence is
+to let the corrected pipeline accumulate a few weeks of fill-based history, then decide
+rotation against evidence instead of intuition. Deciding it now would be the same
+mistake this register was written to stop.
 
 ---
 

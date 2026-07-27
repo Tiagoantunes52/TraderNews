@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  selectGatedBook,
   roundTripCost,
   computeForwardReturns,
   nonOverlapping,
@@ -349,5 +350,28 @@ describe("evaluateGate", () => {
   it("treats an uncomputed (null) metric as not-yet-confirmed → NO_GO", () => {
     const r = evaluateGate({ ...passing, alphaTStat: null });
     expect(r.status).toBe("NO_GO");
+  });
+});
+
+describe("selectGatedBook() — what the go-live gate certifies", () => {
+  it("certifies the broker's book whenever there is one", () => {
+    expect(selectGatedBook({ liveSnapshots: 24, rmSnapshots: 21 })).toEqual({ book: "ALPACA", isLive: true });
+  });
+
+  it("does NOT fall back to the flattering sim book on a short live history", () => {
+    // Judged as the short live record it is, and failed on coverage — the sim never
+    // paid a spread or missed a fill, so it cannot stand in for real execution.
+    expect(selectGatedBook({ liveSnapshots: 2, rmSnapshots: 500 }).isLive).toBe(true);
+  });
+
+  it("uses a sim book only before any broker history exists", () => {
+    expect(selectGatedBook({ liveSnapshots: 1, rmSnapshots: 21 })).toEqual({
+      book: "SIM_COMBINED_RM",
+      isLive: false,
+    });
+    expect(selectGatedBook({ liveSnapshots: 0, rmSnapshots: 0 })).toEqual({
+      book: "SIM_COMBINED",
+      isLive: false,
+    });
   });
 });
