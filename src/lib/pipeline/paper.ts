@@ -1137,6 +1137,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             currentPrice: held?.currentPrice ?? null,
             restingProtectiveType: protective?.type === "trailing_stop" ? "trailing_stop" : protective ? "stop" : null,
             restingTrailPercent: protective?.trailPercent ?? null,
+            restingStopPrice: protective?.stopPrice ?? null,
             price,
             atrPct: rmOpen ? rmOpen.entryAtrPct : atrPctByStock.get(est.stockId) ?? null,
             confidence: confCalibrator.calibrate(est.confidence),

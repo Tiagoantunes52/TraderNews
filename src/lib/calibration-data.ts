@@ -350,7 +350,15 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
   const primaryHorizon = horizons.find((h) => h.horizon === PRIMARY_HORIZON);
   const gate = evaluateGate({
     monthsCoverage,
-    effectiveTrades: closedTrades,
+    // The threshold this feeds is documented as "non-overlapping round-trips", and it
+    // used to receive a raw count() of every closed position in the gated book. Those
+    // are neither non-overlapping nor the sample the rest of the gate is judged on:
+    // `edgeTStat` and `alphaTStat` are computed from `primaryIndep`, the overlap-pruned
+    // observation set, so a gate that counted evidence one way and tested it another
+    // could clear its sample-size bar on trades that contribute no independent evidence.
+    // Count the same sample the statistics come from. `closedTrades` stays in the report
+    // as a descriptive figure — it is just no longer mistaken for independent evidence.
+    effectiveTrades: Math.min(primaryIndep.length, closedTrades),
     hadSpyDrawdown: spyMaxDd != null && spyMaxDd >= 0.05,
     edgeMean: edge.meanNet,
     edgeTStat: edge.tStat,

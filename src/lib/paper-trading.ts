@@ -203,7 +203,30 @@ export function isBrokerStopsEnabled(): boolean {
 // Marketable-limit buffer for broker entries: a limit priced this far through the
 // spread fills like a market order but lets the order be GTC (so the attached stop
 // persists). The cap, not the fill price — you still fill at the market price.
-const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.005);
+//
+// It is also, unavoidably, a filter on overnight gap direction: the order fills when a
+// name gaps DOWN and fails when it gaps UP past the buffer. Gapping up is what winners
+// do, so a tight buffer quietly selects against them — of nine entries that never filled
+// at 0.5%, eight were winners averaging +6.3% in the sim against a book average of
+// −0.35%. Widening trades a worse average entry price for an unbiased trade population,
+// which is the right trade while the whole problem is that performance can't be measured.
+//
+// 2% not 5%: the miss rate falls roughly with the gap distribution (close-to-close, an
+// upper bound since a GTC order rests all day) — 40.6% of stock-days close >0.5% up,
+// 19.6% >2%, 4.4% >5% — but the buffer also inflates realised risk, because the OTO stop
+// is priced off the same reference close and cannot know the fill (see the re-anchor in
+// planBrokerAction). Until that correction has run in production, keep the band narrow
+// enough that a top-of-band fill can't badly overshoot risk-per-trade before the next
+// run fixes it.
+const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.02);
+
+/**
+ * How far a resting fixed stop may sit from where the actual fill price implies before
+ * it is re-placed, as a fraction of entry. Wide enough that ordinary rounding and
+ * sub-cent drift never trigger a cancel/replace; small relative to any real stop
+ * distance (the ATR floor is 6%), so a genuine mis-anchoring is always caught.
+ */
+const STOP_REANCHOR_TOLERANCE_PCT = numEnv("PAPER_STOP_REANCHOR_TOLERANCE_PCT", 0.005);
 
 /**
  * Days an unfilled BUY entry may rest at the broker before it's cancelled.
@@ -570,6 +593,7 @@ export function planBrokerAction(input: {
   currentPrice: number | null;
   restingProtectiveType: "stop" | "trailing_stop" | null; // resting protective order, if any
   restingTrailPercent?: number | null; // trail % of a resting trailing stop (ratchet compare)
+  restingStopPrice?: number | null; // price of a resting FIXED stop (re-anchor compare)
   price: number; // reference price (latest quant close) for sizing + stop/limit
   atrPct: number | null; // entry-day ATR% when held (frozen distances), today's when entering
   confidence: number;
@@ -578,7 +602,7 @@ export function planBrokerAction(input: {
 }): BrokerAction {
   const cfg = input.cfg ?? DEFAULT_RISK_CONFIG;
   const buffer = input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT;
-  const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, restingTrailPercent, price, atrPct, confidence } = input;
+  const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, restingTrailPercent, restingStopPrice, price, atrPct, confidence } = input;
   // Unknown history ⇒ assume the broker already acted, so we never catch-up-buy a name
   // that was actually stopped out. Only an explicit `false` unlocks a catch-up entry.
   const everAttempted = input.everAttempted ?? true;
@@ -619,6 +643,25 @@ export function planBrokerAction(input: {
     if (restingProtectiveType == null) {
       const anchor = avgEntryPrice ?? price;
       return { type: "REPAIR_STOP", stopPrice: cents(anchor * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct))) };
+    }
+    // Re-anchor a fixed stop that was priced off the wrong reference.
+    //
+    // The OTO entry has to name its stop_price at SUBMISSION, before the fill price is
+    // known, so both legs are derived from the same stale reference close: the limit at
+    // `price × (1 + buffer)`, the stop at `price × (1 − stopPct)`. Fill anywhere other
+    // than exactly `price` and the real distance from the fill isn't `stopPct` — fill at
+    // the top of the band and it's `(buffer + stopPct)`, which at a wide buffer is most
+    // of a second stop's worth of risk on a position sized for the first. Sizing assumes
+    // stopPct holds, so the overshoot lands straight on risk-per-trade.
+    //
+    // Once filled we know the real entry, so re-price off it. Only fixed stops: a
+    // trailing stop is a distance from the peak and never had this problem. Tolerance
+    // keeps the daily stage from cancel/replacing over rounding.
+    if (restingProtectiveType === "stop" && restingStopPrice != null && avgEntryPrice != null && avgEntryPrice > 0) {
+      const want = cents(avgEntryPrice * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct)));
+      if (Math.abs(want - restingStopPrice) / avgEntryPrice > STOP_REANCHOR_TOLERANCE_PCT) {
+        return { type: "REPAIR_STOP", stopPrice: want };
+      }
     }
     if (avgEntryPrice != null && currentPrice != null && avgEntryPrice > 0) {
       const gain = (currentPrice - avgEntryPrice) / avgEntryPrice;

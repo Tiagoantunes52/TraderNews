@@ -66,26 +66,34 @@ it cannot establish is *executable* performance — and only the latter is evide
   Its precheck was validated read-only against prod (no duplicate OPEN rows as of
   2026-07-27), but applying it is a deploy decision.
 
+- **Entry buffer widened 0.5% → 2%, with the risk coupling fixed.** The buffer is a
+  filter on gap direction, so tightness is what selects against winners. But widening it
+  alone inflates realised risk: the OTO stop is priced at submission off the same stale
+  close as the limit, so a top-of-band fill sits `buffer + stopPct` above the stop while
+  sizing assumed `stopPct`. At 5% on a 6% ATR-floor stop that is ~1.75x the intended
+  risk-per-trade — which is why 2%, not the 5% originally proposed. `planBrokerAction`
+  now **re-anchors a fixed stop to the actual fill price** once it is known (trailing
+  stops excluded — they trail the peak and never had the problem), with a tolerance so
+  the daily stage never cancel/replaces over rounding. Gap distribution behind the
+  number (close-to-close, an upper bound since a GTC order rests all day): 40.6% of
+  stock-days close >0.5% up, 19.6% >2%, 4.4% >5%.
+- **`effectiveTrades` now counts the sample the statistics come from.** It received a
+  raw `count()` of closed positions while `edgeTStat`/`alphaTStat` were computed from
+  `primaryIndep`, the overlap-pruned set — so the gate could clear its sample-size bar on
+  trades contributing no independent evidence. `closedTrades` stays in the report as a
+  descriptive figure.
+- **`open` added to the daily price contract and persisted.** `DailyPrice.open` across
+  all four adapters (Tiingo stock/crypto, Yahoo, Binance, CoinGecko — adjusted open where
+  the source has one, close as the documented fallback where it doesn't), plus
+  `QuantAnalysis.open` (migration `20260727200000_add_quant_open`, nullable, no
+  backfill). No indicator reads it. It is recorded now because modelling next-open fills
+  needs open-price history and history has lead time.
+
 ---
 
 ## Priority plan
 
-### 1. Widen `ENTRY_LIMIT_BUFFER_PCT` — interim mitigation only
-
-`paper-trading.ts:206`, currently `0.005`. Widening (~0.05) keeps the OTO+GTC
-architecture untouched and collapses most of the selection bias in item 2.
-
-Honest caveat: this is asymptotic, not a fix. It is weakest exactly where it matters,
-since names that gap >5% are the high-volatility momentum names that dominate the
-unfilled-winners set.
-
-**Do not "just swap to a market order."** The buffered limit is load-bearing:
-`submitEntryWithStop` (`alpaca-trading.ts:282`) is `order_class: "oto"` +
-`time_in_force: "gtc"` specifically because a market entry forces `day`, which would
-expire the attached stop and leave positions naked overnight — the review's own
-highest-severity failure mode (`BROKER_STOPS_MISSING`).
-
-### 2. Intraday execution — the structural fix
+### 1. Intraday execution — the structural fix
 
 **Three findings share one root cause: the system decides after the close and executes
 against a market that isn't open.**
@@ -106,22 +114,21 @@ is read back from Alpaca *positions* — names already held, not a quote source 
 to buy. This is a new market-data integration, which reframes it from "expensive
 nice-to-have" to "the change that resolves the majority of critical findings."
 
-### 3. Measurement correctness
+### 2. Measurement correctness
 
 - **Fills become the primary record; sim demoted to diagnostic.** Largely follows from
-  1–2. The right split: signal research evaluated against a point-in-time executable
+  item 1. The right split: signal research evaluated against a point-in-time executable
   price model; strategy performance from actual orders, fills, cancels, and exposure.
-- **`open` missing from the price contract.** `tiingo-prices.ts:3` `DailyPrice` carries
-  `{ date, close, volume, high, low }`. Needed to model next-open fills. Adapters,
-  persistence and tests all need extending — contained, but more than a column.
-- **Gate is not enforced.** `evaluateGate` is imported only by `calibration.ts`,
-  `calibration-data.ts` and its test. Nothing in the order path checks it.
-- **`effectiveTrades` is wrong.** `calibration.ts:439` documents `minTrades: 30` as
-  "non-overlapping round-trips", but `calibration-data.ts:353` passes a raw
-  `count()` of all closed positions. `effectiveSampleSize()` — which computes exactly
-  the right number — sits at `calibration.ts:430`, unused by the gate. Currently masked
-  (`minMonths: 6` fails first at ~1.3 months of data) so it cannot produce a false GO
-  today, but it will once coverage passes.
+- **Gate is not enforced — and enforcing it naively would halt the experiment.**
+  `evaluateGate` is imported only by `calibration.ts`, `calibration-data.ts` and its
+  test; nothing in the order path checks it. But the gate currently reads
+  INSUFFICIENT_DATA (`minMonths: 6` against ~1.3 months), so wiring it into the order
+  path as-is would stop the paper book trading — killing the data collection that is the
+  only route to ever passing it. The gate's real subject is *live* trading, and live is
+  now refused in code by the `baseUrl()` boundary, which is a strictly stronger
+  guarantee than a gate check. **Needs a decision:** either (a) treat the boundary as the
+  enforcement point and demote the gate to reporting, or (b) define an explicit
+  paper-vs-live split so the gate blocks only the latter. Do not simply "wire it in".
 - **Rotation policy.** The cap is *admission control*, not portfolio construction: held
   names keep slots while stronger current candidates are rejected. That may be
   intentional — but then the strategy is "hold until exit", not "own the best current
@@ -178,7 +185,7 @@ listed so they are not silently forgotten.
   test harness at all, which is why the pure helpers were extracted — but the
   integration path remains unverified.
 - **Ranking allocates, it does not rotate.** It decides which *new* candidate wins a
-  free slot. It never evicts a held name for a stronger candidate — see item 3.
+  free slot. It never evicts a held name for a stronger candidate — see item 2.
 - **The live mirror is still updated before the DB write.** `combinedRmOpened` /
   `combinedRmLong` are set before `simPosition.create`, so a write failure can leave
   the broker targeting an intended-but-unpersisted position. Pre-existing behaviour,

@@ -852,3 +852,52 @@ describe("shouldExpireEntryOrder() — stale broker entries", () => {
     expect(shouldExpireEntryOrder({ ...base, ttlDays: Number.NaN, ageDays: 33 })).toBe(false);
   });
 });
+
+describe("planBrokerAction() — stop re-anchoring after the fill", () => {
+  const base = {
+    opened: false,
+    stillLong: true,
+    exitReason: null,
+    held: true,
+    avgEntryPrice: 102,
+    currentPrice: 102,
+    restingProtectiveType: "stop" as const,
+    price: 100,
+    atrPct: null,
+    confidence: 0.5,
+  };
+  // Fixed-stop distance with no ATR = cfg.stopLossPct (8%). Priced off the reference
+  // close (100) the OTO stop rests at 92; off the real 102 fill it should be 93.84.
+
+  it("re-places a stop that was anchored to the reference close, not the fill", () => {
+    const action = planBrokerAction({ ...base, restingStopPrice: 92 });
+    expect(action.type).toBe("REPAIR_STOP");
+    if (action.type === "REPAIR_STOP") expect(action.stopPrice).toBeCloseTo(93.84, 2);
+  });
+
+  it("leaves a correctly anchored stop alone — no daily cancel/replace churn", () => {
+    expect(planBrokerAction({ ...base, restingStopPrice: 93.84 }).type).toBe("NONE");
+  });
+
+  it("tolerates sub-cent drift without churning", () => {
+    expect(planBrokerAction({ ...base, restingStopPrice: 93.9 }).type).toBe("NONE");
+  });
+
+  it("never re-anchors a trailing stop — it trails the peak, not the entry", () => {
+    const action = planBrokerAction({
+      ...base,
+      restingProtectiveType: "trailing_stop",
+      restingStopPrice: 1,
+      currentPrice: 102,
+    });
+    expect(action.type).not.toBe("REPAIR_STOP");
+  });
+
+  it("does nothing without a known fill price", () => {
+    expect(planBrokerAction({ ...base, avgEntryPrice: null, restingStopPrice: 92 }).type).toBe("NONE");
+  });
+
+  it("still repairs a missing protective order (unchanged behaviour)", () => {
+    expect(planBrokerAction({ ...base, restingProtectiveType: null }).type).toBe("REPAIR_STOP");
+  });
+});

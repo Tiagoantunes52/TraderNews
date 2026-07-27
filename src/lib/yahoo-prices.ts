@@ -14,6 +14,7 @@ type YahooChartResponse = {
       indicators?: {
         quote?: Array<{
           close?: (number | null)[];
+          open?: (number | null)[];
           high?: (number | null)[];
           low?: (number | null)[];
           volume?: (number | null)[];
@@ -54,6 +55,7 @@ export async function getYahooDailyPrices(ticker: string, startDate: Date): Prom
   const quote = result.indicators?.quote?.[0] ?? {};
   const adjClose = result.indicators?.adjclose?.[0]?.adjclose;
   const closes = quote.close ?? [];
+  const opens = quote.open ?? [];
   const highs = quote.high ?? [];
   const lows = quote.low ?? [];
   const volumes = quote.volume ?? [];
@@ -71,6 +73,7 @@ export async function getYahooDailyPrices(ticker: string, startDate: Date): Prom
       date: new Date(timestamps[i] * 1000).toISOString().split("T")[0],
       close,
       volume: volumes[i] ?? 0,
+      open: (opens[i] ?? rawClose) / divisor,
       high: (highs[i] ?? rawClose) / divisor,
       low: (lows[i] ?? rawClose) / divisor,
     });

@@ -33,6 +33,7 @@ export async function getBinanceDailyPrices(ticker: string, startDate: Date): Pr
   return data.map((k) => ({
     date: new Date(Number(k[0])).toISOString().split("T")[0],
     close: parseFloat(String(k[4])),
+    open: parseFloat(String(k[1])),
     high: parseFloat(String(k[2])),
     low: parseFloat(String(k[3])),
     volume: parseFloat(String(k[5])),

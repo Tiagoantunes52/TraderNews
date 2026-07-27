@@ -95,6 +95,7 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
         const isCrypto = stock.ticker.endsWith("-USD");
 
         const price = closes[closes.length - 1];
+        const open = prices[prices.length - 1].open;
         const change1d = calcMomentum(closes, 1);
         const change7d = calcMomentum(closes, 7);
         const change30d = calcMomentum(closes, 30);
@@ -133,7 +134,7 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
         const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d, bollingerPctB });
 
         await db.quantAnalysis.create({
-          data: { stockId: stock.id, price, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
+          data: { stockId: stock.id, price, open, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
         });
 
         created++;
