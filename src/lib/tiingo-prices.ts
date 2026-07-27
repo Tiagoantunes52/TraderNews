@@ -6,6 +6,14 @@ export type DailyPrice = {
   volume: number;
   high: number;
   low: number;
+  /**
+   * Session open. Needed to model an executable entry: the paper sim fills at the
+   * reference CLOSE, but a decision made after that close can only be acted on at the
+   * next open, so sim and broker were pricing different events. Sources that don't
+   * publish an open (CoinGecko's daily series) fall back to the close, which is what
+   * high/low already do there.
+   */
+  open: number;
 };
 
 export async function getTiingoDailyPrices(
@@ -42,8 +50,20 @@ async function getStockPrices(
     throw new Error(`Tiingo prices error: ${res.status} — ${body}`);
   }
 
-  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number; adjVolume?: number; volume: number; adjHigh?: number; high?: number; adjLow?: number; low?: number }>;
-  return data.map((d) => ({ date: d.date, close: d.adjClose ?? d.close, volume: d.adjVolume ?? d.volume ?? 0, high: d.adjHigh ?? d.high ?? 0, low: d.adjLow ?? d.low ?? 0 }));
+  const data = (await res.json()) as Array<{ date: string; adjClose?: number; close: number; adjVolume?: number; volume: number; adjHigh?: number; high?: number; adjLow?: number; low?: number; adjOpen?: number; open?: number }>;
+  return data.map((d) => {
+    const close = d.adjClose ?? d.close;
+    return {
+      date: d.date,
+      close,
+      volume: d.adjVolume ?? d.volume ?? 0,
+      high: d.adjHigh ?? d.high ?? 0,
+      low: d.adjLow ?? d.low ?? 0,
+      // Adjusted open where available, so it sits on the same split/dividend basis as
+      // adjClose — mixing raw and adjusted would fabricate gaps across a corporate action.
+      open: d.adjOpen ?? d.open ?? close,
+    };
+  });
 }
 
 async function getCryptoPrices(
@@ -71,7 +91,14 @@ async function getCryptoPrices(
   }
 
   const data = (await res.json()) as Array<{
-    priceData: Array<{ date: string; close: number; volume?: number; high?: number; low?: number }>;
+    priceData: Array<{ date: string; close: number; volume?: number; high?: number; low?: number; open?: number }>;
   }>;
-  return (data[0]?.priceData ?? []).map((d) => ({ date: d.date, close: d.close, volume: d.volume ?? 0, high: d.high ?? d.close, low: d.low ?? d.close }));
+  return (data[0]?.priceData ?? []).map((d) => ({
+    date: d.date,
+    close: d.close,
+    volume: d.volume ?? 0,
+    high: d.high ?? d.close,
+    low: d.low ?? d.close,
+    open: d.open ?? d.close,
+  }));
 }

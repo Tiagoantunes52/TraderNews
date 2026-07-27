@@ -433,6 +433,48 @@ export function effectiveBets(n: number, avgCorr: number): number {
 // Pre-registered, out-of-sample, net-of-cost. Defaults to INSUFFICIENT_DATA until
 // there's enough history to certify anything — which, given how little has
 // accumulated, is the expected (and correct) near-term verdict.
+//
+// WHERE THIS IS ENFORCED, AND WHY NOT IN THE ORDER PATH
+// The gate is deliberately advisory: nothing in the order path consults it. That reads
+// like an oversight and isn't, so before "fixing" it, note what wiring it in would do.
+//
+// This app can only trade paper — `baseUrl()` in lib/alpaca-trading.ts refuses any
+// non-paper Alpaca host outright, with no environment override. The gate's subject is
+// whether the strategy has earned REAL money, and real money is already unreachable by
+// a stronger mechanism than a status check: a code-level boundary rather than a value
+// that has to be computed correctly and then respected.
+//
+// Meanwhile the gate reads INSUFFICIENT_DATA (it needs `minMonths` of track record).
+// Blocking paper orders on it would stop the paper book trading — and the paper book is
+// the only thing generating the history the gate needs. The gate would permanently
+// prevent itself from ever being satisfiable.
+//
+// So: the gate reports, the endpoint boundary enforces. If live trading is ever wanted,
+// the gate becomes its precondition — and that is a deliberate, reviewed change to the
+// boundary, which is exactly the ceremony such a change deserves.
+
+/**
+ * Which book the gate certifies.
+ *
+ * The broker's book whenever one exists, and a sim book only before any broker history
+ * does. This used to always pick a SIM book — one that never paid a spread, never missed
+ * a fill and never had an order rest unfilled for a month. Those are exactly the points
+ * where sim and broker diverge, and the divergence is one-sided: the sim books trades
+ * the broker could not execute, and the ones it could not execute were disproportionately
+ * the winners. Certifying "ready for real money" against the simulation measures the one
+ * thing such a decision must not rely on.
+ *
+ * A SHORT live history deliberately does not fall back to the sim: it is judged as the
+ * short live history it is and fails the gate on coverage, which is the right answer.
+ * Two snapshots is simply the minimum for a return series to exist at all.
+ */
+export function selectGatedBook(input: { liveSnapshots: number; rmSnapshots: number }): {
+  book: string;
+  isLive: boolean;
+} {
+  if (input.liveSnapshots >= 2) return { book: "ALPACA", isLive: true };
+  return { book: input.rmSnapshots > 0 ? "SIM_COMBINED_RM" : "SIM_COMBINED", isLive: false };
+}
 
 export const GATE_THRESHOLDS = {
   minMonths: 6,

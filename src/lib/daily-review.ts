@@ -109,6 +109,10 @@ export type PaperRunLog = {
   version: 1;
   ranAt: string;
   flags: {
+    // Optional: run logs predating live-quote pricing have no such field. True means
+    // this day's decisions were priced off the live tape, not the previous close — the
+    // two are not comparable, so anything trending across days must account for it.
+    liveQuotes?: boolean;
     riskBooks: boolean;
     riskLimits: boolean;
     brokerStops: boolean;

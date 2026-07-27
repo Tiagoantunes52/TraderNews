@@ -20,6 +20,7 @@ import {
   effectiveBets,
   costBpsForStock,
   evaluateGate,
+  selectGatedBook,
   type EstimatePoint,
   type PricePoint,
   type Observation,
@@ -290,9 +291,31 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
       ? (new Date(lastDate).getTime() - new Date(firstDate).getTime()) / (1000 * 60 * 60 * 24 * 30.44)
       : 0;
 
-  // Pre-registered gated book: COMBINED_RM if it has been run, else COMBINED.
-  const rmSnaps = await db.paperEquitySnapshot.count({ where: { book: "SIM_COMBINED_RM" } });
-  const gatedBook = rmSnaps > 0 ? "SIM_COMBINED_RM" : "SIM_COMBINED";
+  // Gated book: the BROKER's book whenever there is one, and only a sim book before
+  // any broker history exists.
+  //
+  // This used to certify SIM_COMBINED_RM — a book that never paid a spread, never
+  // missed a fill, and never had an order rest unfilled for a month. That is precisely
+  // where the sim and the broker diverge, and the divergence is not symmetric: the sim
+  // books trades the broker could not execute, and the ones it could not execute were
+  // disproportionately the winners. Certifying "ready to go live" against the simulation
+  // measures the one thing a go-live decision must not rely on. The live book is the
+  // record of what actually happened, so it is the record the gate judges.
+  //
+  // The sim books stay in the report as diagnostics — they remain a valid measure of the
+  // model's hypothetical close-to-close behaviour, which is a useful thing to know and a
+  // different thing from investable performance.
+  const [liveSnapCount, rmSnaps] = await Promise.all([
+    db.paperEquitySnapshot.count({ where: { book: "ALPACA" } }),
+    db.paperEquitySnapshot.count({ where: { book: "SIM_COMBINED_RM" } }),
+  ]);
+  // 2 = the minimum for any return series at all. A *short* live history should not
+  // silently fall back to the flattering sim book; it should be judged as the short live
+  // history it is and fail the gate on coverage, which is the correct answer.
+  const { book: gatedBook, isLive: gatedIsLive } = selectGatedBook({
+    liveSnapshots: liveSnapCount,
+    rmSnapshots: rmSnaps,
+  });
   const gatedStrategy = rmSnaps > 0 ? "COMBINED_RM" : "COMBINED";
 
   const [snaps, closedTrades] = await Promise.all([
@@ -301,11 +324,28 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
       select: { date: true, equity: true },
       orderBy: { date: "asc" },
     }),
-    db.simPosition.count({ where: { strategy: gatedStrategy, status: "CLOSED" } }),
+    // Completed round-trips in the gated book. For the live book that means SELL orders
+    // that actually FILLED — an exit the broker executed. Counting sim closes here would
+    // credit the live book with round-trips it never made, which is the same error at a
+    // smaller scale.
+    gatedIsLive
+      ? db.paperOrder.count({ where: { side: "SELL", status: "filled" } })
+      : db.simPosition.count({ where: { strategy: gatedStrategy, status: "CLOSED" } }),
   ]);
 
   const bookEquity = snaps.map((s) => s.equity);
   const book = bookEquity.length >= 2 ? portfolioMetrics(bookEquity) : null;
+
+  // Coverage the GATE is judged on: the span of the gated book's own track record, not
+  // of the estimate history. Those are the same today only because the broker book
+  // started with the estimates; a book that begins trading later has a shorter record
+  // than the data behind it, and certifying it on the data's age would credit it with
+  // history it does not have. `monthsCoverage` in the report keeps its own meaning —
+  // how much estimate data exists — because that answers a different question.
+  const gatedCoverageMonths =
+    snaps.length >= 2
+      ? (snaps[snaps.length - 1].date.getTime() - snaps[0].date.getTime()) / (1000 * 60 * 60 * 24 * 30.44)
+      : 0;
 
   // SPY benchmark — best-effort; align daily returns by date for alpha/beta.
   let spy: CalibrationReport["spy"] = { totalReturn: null, maxDrawdown: null, available: false };
@@ -349,8 +389,16 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
 
   const primaryHorizon = horizons.find((h) => h.horizon === PRIMARY_HORIZON);
   const gate = evaluateGate({
-    monthsCoverage,
-    effectiveTrades: closedTrades,
+    monthsCoverage: gatedCoverageMonths,
+    // The threshold this feeds is documented as "non-overlapping round-trips", and it
+    // used to receive a raw count() of every closed position in the gated book. Those
+    // are neither non-overlapping nor the sample the rest of the gate is judged on:
+    // `edgeTStat` and `alphaTStat` are computed from `primaryIndep`, the overlap-pruned
+    // observation set, so a gate that counted evidence one way and tested it another
+    // could clear its sample-size bar on trades that contribute no independent evidence.
+    // Count the same sample the statistics come from. `closedTrades` stays in the report
+    // as a descriptive figure — it is just no longer mistaken for independent evidence.
+    effectiveTrades: Math.min(primaryIndep.length, closedTrades),
     hadSpyDrawdown: spyMaxDd != null && spyMaxDd >= 0.05,
     edgeMean: edge.meanNet,
     edgeTStat: edge.tStat,

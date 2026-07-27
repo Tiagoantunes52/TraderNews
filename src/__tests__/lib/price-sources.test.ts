@@ -6,6 +6,7 @@ function rows(n: number): DailyPrice[] {
   return Array.from({ length: n }, (_, i) => ({
     date: `2026-05-${String(i + 1).padStart(2, "0")}`,
     close: 100 + i,
+    open: 100 + i,
     volume: 1000,
     high: 101 + i,
     low: 99 + i,

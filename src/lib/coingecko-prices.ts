@@ -59,6 +59,8 @@ export async function getCoinGeckoDailyPrices(ticker: string, startDate: Date): 
 
   return prices.map(([t, price]) => {
     const date = new Date(t).toISOString().split("T")[0];
-    return { date, close: price, high: price, low: price, volume: volumeByDay.get(date) ?? 0 };
+    // Daily market_chart gives one point per day — no OHLC, so open/high/low all
+    // collapse to that point (the file header already notes this degrades ATR).
+    return { date, close: price, open: price, high: price, low: price, volume: volumeByDay.get(date) ?? 0 };
   });
 }

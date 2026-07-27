@@ -123,7 +123,13 @@ model QuantAnalysis {
   id                  String    @id @default(cuid())
   stock               Stock     @relation(fields: [stockId], references: [id], onDelete: Cascade)
   stockId             String
-  price               Float?
+  price               Float? // session close — every downstream calculation reads this
+  // Session open, stored alongside the close from the same bar. Not used by any
+  // indicator: it exists so the sim can eventually price an entry at the bar the
+  // decision could actually have been acted on (a signal produced after the close can
+  // only be executed at the next open), instead of at the close it was derived from.
+  // Recording it now because that comparison needs history, and history has lead time.
+  open                Float?
   change1d            Float?
   change7d            Float?
   change30d           Float?
