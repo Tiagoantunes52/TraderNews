@@ -37,6 +37,7 @@ import {
 import {
   isRiskLimitsEnabled,
   evaluateBuy,
+  rankEntryCandidates,
   maxAllowedNotional,
   regimeMultiplier,
   correlationClusters,
@@ -265,6 +266,22 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   const combinedRmLong = new Set<string>(); // stockIds long after this run
   const combinedRmOpened = new Set<string>(); // fresh OPEN this run (drives broker entries + re-entry guard)
   const combinedRmExit = new Map<string, string>(); // stockId → exit reason on close
+
+  // Fresh _RM entries are buffered here instead of acting inline; the ranked pass
+  // below gates and persists them. See the comment on that pass for why.
+  type RmEntryCandidate = {
+    strategy: Strategy;
+    stockId: string;
+    ticker: string;
+    qty: number;
+    price: number;
+    score: number;
+    signal: ReturnType<typeof scoreToSignal>;
+    confidence: number;
+    atrPct: number | null;
+    decision: DecisionRecord; // annotated in place when the gate vetoes the entry
+  };
+  const rmEntries: RmEntryCandidate[] = [];
 
   // Index open positions by (stock, strategy) for O(1) reconciliation.
   const openPositions = await db.simPosition.findMany({
@@ -497,24 +514,24 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       };
       decisions.push(decision);
 
-      // Portfolio-level gate: block a fresh _RM open that would breach a cap or the
-      // drawdown kill-switch. Must run before the COMBINED_RM capture so a blocked
-      // open isn't mirrored to the live Alpaca book either. Pure books are unaffected.
-      if (riskLimitsOn && action.type === "OPEN" && STRATEGY_IS_RM[strategy]) {
-        const br = bookRisk.get(strategy);
-        if (br) {
-          const candidate = { cluster: clusterKeyFor(est.stock.ticker, clusterByTicker), notional: action.qty * action.price };
-          const verdict = evaluateBuy(br, candidate, limits, regimeMult);
-          if (verdict.allowed) {
-            br.positions.push(candidate); // reserve so later opens this run see it
-          } else {
-            action = { type: "NONE" };
-            decision.riskBlocked = true;
-            // Record WHICH rule vetoed it: without the reason a silently-halted book
-            // can only be diagnosed by rebuilding its equity from closed-position P&L.
-            decision.riskBlockReason = verdict.reason;
-          }
-        }
+      // Fresh _RM opens don't act here. The portfolio gate hands out a bounded number
+      // of slots, so the order candidates reach it decides which names the book holds;
+      // buffer them and run the gate in score order once this loop has booked every
+      // close (see the ranked pass below). Pure books are ungated and open inline.
+      if (action.type === "OPEN" && STRATEGY_IS_RM[strategy]) {
+        rmEntries.push({
+          strategy,
+          stockId: est.stockId,
+          ticker: est.stock.ticker,
+          qty: action.qty,
+          price: action.price,
+          score,
+          signal,
+          confidence: decisionConfidence,
+          atrPct,
+          decision,
+        });
+        continue;
       }
 
       // A close frees a slot. `bookRisk` is a snapshot taken at run start, so without
@@ -541,10 +558,11 @@ export async function runPaperStage(): Promise<PaperStageResult> {
         }
       }
 
-      // Capture the COMBINED_RM decision so the Alpaca book can mirror it.
+      // Capture the COMBINED_RM decision so the Alpaca book can mirror it. Fresh opens
+      // never reach here (they're buffered above); the ranked pass captures the ones
+      // that clear the gate, so a blocked entry still isn't mirrored to the live book.
       if (strategy === "COMBINED_RM") {
-        if (action.type === "OPEN") combinedRmOpened.add(est.stockId);
-        if (action.type === "OPEN" || action.type === "MARK") combinedRmLong.add(est.stockId);
+        if (action.type === "MARK") combinedRmLong.add(est.stockId);
         else if (action.type === "CLOSE" && action.reason) combinedRmExit.set(est.stockId, action.reason);
       }
 
@@ -609,6 +627,78 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       } catch (e) {
         errors.push(`Sim ${strategy} failed for ${est.stock.ticker}: ${String(e)}`);
       }
+    }
+  }
+
+  // ── Ranked _RM entry pass ──────────────────────────────────────────────────
+  // The portfolio gate is a scarce-slot allocator (position count, gross exposure,
+  // cluster caps), so whichever candidates reach it first take the slots. Gating
+  // inline meant that order was `estimates` order — `date desc` off the estimate
+  // query, i.e. arbitrary — so a book at its cap filled with whatever names the query
+  // happened to return first rather than the ones it rated highest. Ranking by score
+  // makes the held book the *best* N candidates instead of the first N.
+  //
+  // Deferring past the main loop also lets today's exits pay for today's entries: the
+  // close handler frees a slot in `bookRisk`, but inline that only helped candidates
+  // later in estimate order, so a book that closed and re-filled on the same day
+  // usually blocked every entry and waited for tomorrow's rebuild.
+  //
+  // See rankEntryCandidates for how ties and cross-book comparability are handled.
+  for (const entry of rankEntryCandidates(rmEntries)) {
+    if (riskLimitsOn) {
+      const br = bookRisk.get(entry.strategy);
+      if (br) {
+        const candidate = {
+          cluster: clusterKeyFor(entry.ticker, clusterByTicker),
+          notional: entry.qty * entry.price,
+        };
+        const verdict = evaluateBuy(br, candidate, limits, regimeMult);
+        if (!verdict.allowed) {
+          // The decision was logged with its OPEN action so the replay compares like
+          // with like; these two fields record the override. Without the reason a
+          // silently-halted book can only be diagnosed by rebuilding its equity from
+          // closed-position P&L.
+          entry.decision.riskBlocked = true;
+          entry.decision.riskBlockReason = verdict.reason;
+          continue;
+        }
+        br.positions.push(candidate); // reserve so lower-ranked candidates see it
+      }
+    }
+
+    // Capture before the write, matching the pre-ranking behaviour: a create that
+    // throws still leaves the live book pointed at the name the sim meant to hold.
+    if (entry.strategy === "COMBINED_RM") {
+      combinedRmOpened.add(entry.stockId);
+      combinedRmLong.add(entry.stockId);
+    }
+
+    try {
+      await db.simPosition.create({
+        data: {
+          stockId: entry.stockId,
+          strategy: entry.strategy,
+          status: "OPEN",
+          qty: entry.qty,
+          entryDate: to,
+          entryPrice: entry.price,
+          // Persist the confidence that actually sized the position.
+          confidence: entry.confidence,
+          // The justification for the entry, frozen here: today's estimate row gets
+          // overwritten, so a later join can't recover what we acted on.
+          entrySignal: entry.signal,
+          entryScore: entry.score,
+          lastMarkDate: to,
+          lastMarkPrice: entry.price,
+          peakPrice: entry.price,
+          // Freeze the entry-day ATR so exit distances never widen with a later
+          // volatility spike.
+          entryAtrPct: entry.atrPct,
+        },
+      });
+      simOpened++;
+    } catch (e) {
+      errors.push(`Sim ${entry.strategy} failed for ${entry.ticker}: ${String(e)}`);
     }
   }
 

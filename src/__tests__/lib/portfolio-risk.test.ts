@@ -11,6 +11,7 @@ import {
   currentDrawdown,
   deriskMultiplier,
   evaluateBuy,
+  rankEntryCandidates,
   maxAllowedNotional,
   regimeMultiplier,
   type BookExposure,
@@ -287,5 +288,71 @@ describe("regimeMultiplier() — SPY regime filter (issue #58)", () => {
     const candidate = { cluster: "B", notional: 10_000 };
     expect(evaluateBuy(book, candidate, DEFAULT_RISK_LIMITS, 1).allowed).toBe(true);
     expect(evaluateBuy(book, candidate, DEFAULT_RISK_LIMITS, 0.5)).toEqual({ allowed: false, reason: "GROSS_CAP" });
+  });
+});
+
+describe("rankEntryCandidates() — who gets the scarce slots", () => {
+  const c = (ticker: string, score: number, confidence = 0.5) => ({ ticker, score, confidence });
+
+  it("orders by score, strongest first", () => {
+    const ranked = rankEntryCandidates([c("LOW", 0.21), c("HIGH", 0.88), c("MID", 0.55)]);
+    expect(ranked.map((r) => r.ticker)).toEqual(["HIGH", "MID", "LOW"]);
+  });
+
+  it("breaks score ties on confidence, then ticker", () => {
+    const ranked = rankEntryCandidates([
+      c("ZZZ", 0.5, 0.4),
+      c("BBB", 0.5, 0.9),
+      c("AAA", 0.5, 0.4),
+    ]);
+    expect(ranked.map((r) => r.ticker)).toEqual(["BBB", "AAA", "ZZZ"]);
+  });
+
+  it("is deterministic — same input, same order, whatever the arrival sequence", () => {
+    const rows = [c("A", 0.3, 0.5), c("B", 0.3, 0.5), c("C", 0.9, 0.1), c("D", 0.3, 0.7)];
+    const forward = rankEntryCandidates(rows).map((r) => r.ticker);
+    const reversed = rankEntryCandidates([...rows].reverse()).map((r) => r.ticker);
+    expect(forward).toEqual(["C", "D", "A", "B"]);
+    expect(reversed).toEqual(forward);
+  });
+
+  it("does not mutate the caller's array", () => {
+    const rows = [c("LOW", 0.1), c("HIGH", 0.9)];
+    rankEntryCandidates(rows);
+    expect(rows.map((r) => r.ticker)).toEqual(["LOW", "HIGH"]);
+  });
+
+  it("keeps each book's candidates ordered when several books share a list", () => {
+    // Scores only compare within a book; the gate is per-book, so all that matters is
+    // that a book's own candidates stay in descending order after a single global sort.
+    const mixed = [
+      { ticker: "Q1", score: 0.2, confidence: 0.5, book: "QUANT_RM" },
+      { ticker: "S1", score: 0.9, confidence: 0.5, book: "SENTIMENT_RM" },
+      { ticker: "Q2", score: 0.7, confidence: 0.5, book: "QUANT_RM" },
+      { ticker: "S2", score: 0.4, confidence: 0.5, book: "SENTIMENT_RM" },
+    ];
+    const ranked = rankEntryCandidates(mixed);
+    const perBook = (b: string) => ranked.filter((r) => r.book === b).map((r) => r.ticker);
+    expect(perBook("QUANT_RM")).toEqual(["Q2", "Q1"]);
+    expect(perBook("SENTIMENT_RM")).toEqual(["S1", "S2"]);
+  });
+
+  it("hands the last slot to the best candidate, not the first to arrive", () => {
+    // One slot left (11 of 12 taken). Arrival order would have given it to WEAK.
+    const book: BookExposure = {
+      equity: 100_000,
+      peakEquity: 100_000,
+      positions: Array.from({ length: 11 }, (_, i) => ({ cluster: `C${i}`, notional: 1_000 })),
+    };
+    const candidates = [c("WEAK", 0.12), c("STRONG", 0.91)];
+    const admitted: string[] = [];
+    for (const cand of rankEntryCandidates(candidates)) {
+      const entry = { cluster: cand.ticker, notional: 1_000 };
+      if (evaluateBuy(book, entry, DEFAULT_RISK_LIMITS).allowed) {
+        book.positions.push(entry);
+        admitted.push(cand.ticker);
+      }
+    }
+    expect(admitted).toEqual(["STRONG"]);
   });
 });
