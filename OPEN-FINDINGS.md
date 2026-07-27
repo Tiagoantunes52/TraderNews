@@ -89,35 +89,34 @@ it cannot establish is *executable* performance — and only the latter is evide
   backfill). No indicator reads it. It is recorded now because modelling next-open fills
   needs open-price history and history has lead time.
 
+- **Live intraday pricing** — `lib/alpaca-quotes.ts`, ship-dark behind
+  `PAPER_LIVE_QUOTES=1`. Overlays `priceByStock` (the single map every decision, fill,
+  limit reference and mark reads) with the last traded price, so all of them refer to the
+  same moment instead of booking a simulated fill at a close the broker can only fill
+  after. Last *trade*, not mid or ask — the only one of the three something actually
+  transacted at. Uses the MARKET DATA keys (`ALPACA_API_KEY_ID`/`_SECRET`, as the News
+  API does), not the paper trading keys. Guards: only while the session is open (outside
+  it the "latest trade" is an extended-hours print — neither the official close the rest
+  of the app uses nor the price the next order gets); per-stock fallback to the stored
+  close so a partial feed response degrades name-by-name rather than splitting a run
+  across two pricing regimes; never throws, because a quote feed must not be able to stop
+  the stage managing open positions. `flags.liveQuotes` in the run log marks which regime
+  produced a given day — days on either side are not comparable.
+
+  **Still open after this:** signal staleness. `sentiment.ts` / `quant.ts` compute once
+  per UTC day, so an in-hours run prices against the live tape but still acts on scores
+  built from this morning's data. Re-running sentiment near the close means LLM calls
+  over the whole universe inside a 300s budget, which is a separate piece of work.
+
 ---
 
 ## Priority plan
 
-### 1. Intraday execution — the structural fix
+### 1. Measurement correctness
 
-**Three findings share one root cause: the system decides after the close and executes
-against a market that isn't open.**
-
-- Near-close runs use stale signals. `pipeline/sentiment.ts:33` and `pipeline/quant.ts:78`
-  both filter `{ none: { date: { gte: todayUTC } } }`, so a stock that already has
-  today's row is skipped — a second run never recomputes.
-- Fills are *conditional*, producing the winner-selection bias (evidence below).
-- Entry orders rest indefinitely (fixed — see Shipped).
-
-You cannot be both unbiased and protected while deciding after the close — every
-alternative trades measurement bias against a protection gap. Intraday execution
-(live quote → marketable limit, GTC + OTO, in-hours) resolves all three at once.
-
-Blocker: **the app has no intraday price capability at all.** `price-sources.ts`
-exports exactly one function, `getDailyPrices`. The only `currentPrice` in the codebase
-is read back from Alpaca *positions* — names already held, not a quote source for names
-to buy. This is a new market-data integration, which reframes it from "expensive
-nice-to-have" to "the change that resolves the majority of critical findings."
-
-### 2. Measurement correctness
-
-- **Fills become the primary record; sim demoted to diagnostic.** Largely follows from
-  item 1. The right split: signal research evaluated against a point-in-time executable
+- **Fills become the primary record; sim demoted to diagnostic.** Now unblocked: with
+  live-quote pricing on, the sim and the broker finally price the same event. The right
+  split: signal research evaluated against a point-in-time executable
   price model; strategy performance from actual orders, fills, cancels, and exposure.
 - **Gate is not enforced — and enforcing it naively would halt the experiment.**
   `evaluateGate` is imported only by `calibration.ts`, `calibration-data.ts` and its
@@ -185,7 +184,7 @@ listed so they are not silently forgotten.
   test harness at all, which is why the pure helpers were extracted — but the
   integration path remains unverified.
 - **Ranking allocates, it does not rotate.** It decides which *new* candidate wins a
-  free slot. It never evicts a held name for a stronger candidate — see item 2.
+  free slot. It never evicts a held name for a stronger candidate — see item 1.
 - **The live mirror is still updated before the DB write.** `combinedRmOpened` /
   `combinedRmLong` are set before `simPosition.create`, so a write failure can leave
   the broker targeting an intended-but-unpersisted position. Pre-existing behaviour,

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { db } from "@/lib/db";
+import { getLatestTrades, isLiveQuotesEnabled, isMarketDataConfigured } from "@/lib/alpaca-quotes";
 import { acquireLease, releaseLease } from "@/lib/pipeline-lease";
 import { scoreToSignal } from "@/lib/indicators";
 import {
@@ -292,6 +293,43 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         })
       : [];
   const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
+
+  // Price an in-hours run against the live tape (PAPER_LIVE_QUOTES=1, ship-dark).
+  //
+  // Everything below — entry and exit decisions, simulated fills, the marketable-limit
+  // reference, the daily mark — reads this one map, so overlaying it here is the whole
+  // change. The point is that all of them then refer to the SAME moment: booking a
+  // simulated fill at a close the broker's order can only be filled after is what makes
+  // sim P&L unusable as evidence, and no amount of extra history fixes it.
+  //
+  // Only while the market is actually open. Outside the session the "latest trade" can
+  // be an extended-hours print, which is neither the official close every other part of
+  // the app uses nor a price the next order will get — worse than the close on both
+  // counts. Per-stock fallback: a name the feed didn't return keeps its stored close, so
+  // a partial response degrades name-by-name instead of splitting the run between two
+  // pricing regimes.
+  let livePricedCount = 0;
+  if (isLiveQuotesEnabled() && isMarketDataConfigured() && estimates.length > 0) {
+    try {
+      const open = isPaperTradingConfigured() ? (await getClock()).isOpen : false;
+      if (open) {
+        const tickerByStockId = new Map(estimates.map((e) => [e.stockId, e.stock.ticker]));
+        const { prices: live, errors: quoteErrors } = await getLatestTrades([...tickerByStockId.values()]);
+        errors.push(...quoteErrors);
+        for (const [stockId, ticker] of tickerByStockId) {
+          const p = live.get(ticker);
+          if (p != null && priceByStock.has(stockId)) {
+            priceByStock.set(stockId, p);
+            livePricedCount++;
+          }
+        }
+      }
+    } catch (e) {
+      // Degrade to closes rather than skipping the run: a quote feed must never be able
+      // to stop the stage from managing open positions.
+      errors.push(`Live quote overlay failed (priced from closes): ${String(e)}`);
+    }
+  }
   // ATR% (volatility) per stock — lets the _RM books scale stops to each name's
   // regime. Absent for new/illiquid names; the overlay falls back to fixed pcts.
   const atrPctByStock = new Map(quantRows.map((q) => [q.stockId, q.atrPct]));
