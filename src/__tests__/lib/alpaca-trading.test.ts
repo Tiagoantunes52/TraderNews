@@ -42,6 +42,45 @@ describe("alpaca-trading client", () => {
     });
   });
 
+  describe("live-endpoint safety boundary", () => {
+    // ALPACA_PAPER_BASE_URL was the only thing between this app and real money:
+    // nothing validated the endpoint, and isPaperTradingConfigured() only checks that
+    // the vars exist, not that they belong to a paper account.
+    it("refuses the live Alpaca trading host", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://api.alpaca.markets";
+      await expect(getAccount()).rejects.toThrow(/Refusing to trade against a live Alpaca host/);
+      expect(mockFetch).not.toHaveBeenCalled(); // refused before any request left the process
+    });
+
+    it("refuses any non-paper alpaca.markets host, including on writes", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({}));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://broker-api.alpaca.markets";
+      await expect(submitMarketOrder({ symbol: "AAPL", side: "buy", notional: 100 })).rejects.toThrow(
+        /Refusing to trade against a live Alpaca host/
+      );
+      await expect(cancelOrder("abc")).rejects.toThrow(/Refusing to trade against a live Alpaca host/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("allows the paper host and non-Alpaca stub hosts (tests need the latter)", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ equity: "1", cash: "1" }));
+      vi.stubGlobal("fetch", mockFetch);
+      process.env.ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
+      await expect(getAccount()).resolves.toBeTruthy();
+      process.env.ALPACA_PAPER_BASE_URL = "http://localhost:9999";
+      await expect(getAccount()).resolves.toBeTruthy();
+    });
+
+    it("rejects a malformed override rather than silently falling back", async () => {
+      vi.stubGlobal("fetch", vi.fn());
+      process.env.ALPACA_PAPER_BASE_URL = "not-a-url";
+      await expect(getAccount()).rejects.toThrow(/not a valid URL/);
+    });
+  });
+
   it("hits the paper base URL with both auth headers", async () => {
     const mockFetch = vi.fn().mockResolvedValue(jsonResponse({ equity: "100000", cash: "50000" }));
     vi.stubGlobal("fetch", mockFetch);

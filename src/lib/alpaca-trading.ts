@@ -10,8 +10,45 @@ import { fetchWithRetry } from "@/lib/http";
 // Docs: https://docs.alpaca.markets/reference/getaccount-1
 // Resolved per-call (not captured at import) so an override is honoured and tests
 // can point it at a stub host.
+
+/**
+ * Refuse to talk to a LIVE Alpaca trading host.
+ *
+ * `ALPACA_PAPER_BASE_URL` exists so tests can point the client at a stub, but it was
+ * also the only thing standing between this app and real money: nothing else here
+ * validates the endpoint, and `isPaperTradingConfigured()` checks that the
+ * `ALPACA_PAPER_*` variables are *present*, not that they belong to a paper account.
+ * A single mistyped or copy-pasted env value would have routed every order — entries,
+ * stops, sells — at the live book with no other signal that anything had changed.
+ *
+ * So the boundary is enforced in code: any `*.alpaca.markets` host that isn't the
+ * paper API is rejected. Non-Alpaca hosts (localhost, stub servers) pass through
+ * untouched, which is what the tests need. There is deliberately NO env escape hatch —
+ * an override would restore exactly the foot-gun this closes. Trading live must be a
+ * reviewed code change, not a deploy-time variable.
+ */
+const PAPER_HOST = "paper-api.alpaca.markets";
+
+function assertNotLiveHost(url: string): void {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    throw new Error(`ALPACA_PAPER_BASE_URL is not a valid URL: ${url}`);
+  }
+  if (host === PAPER_HOST) return;
+  if (host === "alpaca.markets" || host.endsWith(".alpaca.markets")) {
+    throw new Error(
+      `Refusing to trade against a live Alpaca host (${host}). This app is paper-only; ` +
+        `ALPACA_PAPER_BASE_URL must be ${PAPER_HOST} (or unset).`
+    );
+  }
+}
+
 function baseUrl(): string {
-  return process.env.ALPACA_PAPER_BASE_URL || "https://paper-api.alpaca.markets";
+  const url = process.env.ALPACA_PAPER_BASE_URL || `https://${PAPER_HOST}`;
+  assertNotLiveHost(url);
+  return url;
 }
 
 /** True when both paper-trading credentials are present. */

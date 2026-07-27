@@ -30,6 +30,7 @@ import {
   realizedFromFills,
   isPaperTradeEligible,
   isEntrySignal,
+  shouldExpireEntryOrder,
   SIM_STARTING_EQUITY,
   type Strategy,
   type PositionAction,
@@ -73,6 +74,7 @@ export type PaperStageResult = {
   ordersSubmitted: number; // real Alpaca paper orders placed this run
   simOpened: number; // internal sim positions opened
   simClosed: number; // internal sim positions closed
+  entryOrdersExpired: number; // stale unfilled BUY entries cancelled at the broker
   done: true;
   errors: string[];
 };
@@ -147,6 +149,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
   let ordersSubmitted = 0;
   let simOpened = 0;
   let simClosed = 0;
+  let entryOrdersExpired = 0;
   // Account / trading-health alerts (issue #56) accumulated across the run, then
   // persisted + emailed to admins once at the end (the daily guard fires them once).
   const accountAlerts: AlertDraft[] = [];
@@ -165,13 +168,13 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     select: { id: true },
   });
   if (alreadyRan) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
   }
 
   // Near-close gate: when enabled, out-of-window runs no-op WITHOUT writing the
   // idempotency snapshot, so the day's first in-window run does all the work.
   if (isTradeNearCloseEnabled() && !(await inCloseWindow())) {
-    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, done: true, errors };
+    return { stage: "paper", rebalanced: false, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
   }
 
   // Dead-man's check: any trading day between the previous snapshot and today with
@@ -844,11 +847,28 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       const pending = await db.paperOrder.findMany({
         where: { alpacaOrderId: { not: null }, status: { notIn: [...TERMINAL_ORDER_STATUS] } },
         orderBy: { submittedAt: "desc" },
-        select: { id: true, alpacaOrderId: true, status: true },
+        select: { id: true, alpacaOrderId: true, status: true, side: true, submittedAt: true },
       });
       for (const o of pending) {
         try {
-          const remote = await getOrder(o.alpacaOrderId!);
+          let remote = await getOrder(o.alpacaOrderId!);
+          // Expire a stale entry. Entries rest `gtc` so the attached stop survives the
+          // close, but nothing ever cancelled them — an unfilled BUY kept working
+          // indefinitely and could fill weeks later on a signal the book had already
+          // replaced. Sells are exempt: an unfilled exit still WANTS to happen, and
+          // cancelling one would strand a position the strategy has decided to leave.
+          const staleEntry = shouldExpireEntryOrder({
+            side: o.side,
+            terminal: TERMINAL_ORDER_STATUS.has(remote.status),
+            ageDays: utcDaysBetween(o.submittedAt, todayUTC),
+          });
+          if (staleEntry) {
+            await cancelOrder(o.alpacaOrderId!);
+            // Re-read rather than assuming "canceled": the order may have filled
+            // between the fetch above and the cancel, and cancelOrder tolerates that.
+            remote = await getOrder(o.alpacaOrderId!);
+            entryOrdersExpired++;
+          }
           await db.paperOrder.update({
             where: { id: o.id },
             data: {
@@ -1335,7 +1355,7 @@ export async function runPaperStage(): Promise<PaperStageResult> {
       cfg,
       decisions,
       errors,
-      counts: { simOpened, simClosed, ordersSubmitted },
+      counts: { simOpened, simClosed, ordersSubmitted, entryOrdersExpired },
     };
     await db.dailyReview.upsert({
       where: { date: todayUTC },
@@ -1357,5 +1377,5 @@ export async function runPaperStage(): Promise<PaperStageResult> {
     }
   }
 
-  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, done: true, errors };
+  return { stage: "paper", rebalanced: true, ordersSubmitted, simOpened, simClosed, entryOrdersExpired, done: true, errors };
 }

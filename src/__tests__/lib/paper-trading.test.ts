@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  shouldExpireEntryOrder,
   isEntrySignal,
   isExitSignal,
   isBearishSignal,
@@ -821,5 +822,33 @@ describe("realizedFromFills()", () => {
   it("handles fractional quantities", () => {
     const { totalRealized } = realizedFromFills([buy("F", 1.5, 10, "t1"), sell("F", 1.5, 12, "t2")]);
     expect(totalRealized).toBeCloseTo(3);
+  });
+});
+
+describe("shouldExpireEntryOrder() — stale broker entries", () => {
+  const base = { side: "BUY", terminal: false, ageDays: 5, ttlDays: 1 };
+
+  it("expires an unfilled BUY once it has had its session", () => {
+    expect(shouldExpireEntryOrder({ ...base, ageDays: 1 })).toBe(true);
+    expect(shouldExpireEntryOrder({ ...base, ageDays: 33 })).toBe(true);
+  });
+
+  it("leaves a BUY submitted this run alone — it has not had a session yet", () => {
+    expect(shouldExpireEntryOrder({ ...base, ageDays: 0 })).toBe(false);
+  });
+
+  it("never expires a SELL — an unfilled exit still wants to happen", () => {
+    // Cancelling one would strand a position the strategy already decided to leave.
+    expect(shouldExpireEntryOrder({ ...base, side: "SELL", ageDays: 33 })).toBe(false);
+  });
+
+  it("does nothing when the broker already considers the order done", () => {
+    expect(shouldExpireEntryOrder({ ...base, terminal: true, ageDays: 33 })).toBe(false);
+  });
+
+  it("is disabled by a zero or nonsensical TTL rather than cancelling everything", () => {
+    expect(shouldExpireEntryOrder({ ...base, ttlDays: 0, ageDays: 33 })).toBe(false);
+    expect(shouldExpireEntryOrder({ ...base, ttlDays: -1, ageDays: 33 })).toBe(false);
+    expect(shouldExpireEntryOrder({ ...base, ttlDays: Number.NaN, ageDays: 33 })).toBe(false);
   });
 });

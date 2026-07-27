@@ -314,8 +314,25 @@ export type RankableEntry = { score: number; confidence: number; ticker: string 
  */
 export function rankEntryCandidates<T extends RankableEntry>(candidates: readonly T[]): T[] {
   return [...candidates].sort(
-    (a, b) => b.score - a.score || b.confidence - a.confidence || a.ticker.localeCompare(b.ticker)
+    (a, b) => descFinite(a.score, b.score) || descFinite(a.confidence, b.confidence) || a.ticker.localeCompare(b.ticker)
   );
+}
+
+/**
+ * Descending compare that stays a total order when a value isn't finite. A plain
+ * `b - a` returns NaN against NaN/±Infinity, and a comparator that returns NaN makes
+ * the sort order implementation-defined — which would silently break the determinism
+ * the run-log replay depends on. Non-finite values sort last (and tie with each
+ * other): a corrupt score is data to investigate, not a candidate that should win a
+ * scarce slot.
+ */
+function descFinite(a: number, b: number): number {
+  const aOk = Number.isFinite(a);
+  const bOk = Number.isFinite(b);
+  if (aOk && bOk) return b - a;
+  if (aOk) return -1;
+  if (bOk) return 1;
+  return 0;
 }
 
 /**

@@ -316,6 +316,21 @@ describe("rankEntryCandidates() — who gets the scarce slots", () => {
     expect(reversed).toEqual(forward);
   });
 
+  it("stays a total order when a score isn't finite", () => {
+    // A NaN score makes `b - a` return NaN; a NaN comparator result makes the sort
+    // order implementation-defined, which would break run-log replay determinism.
+    const rows = [
+      { ticker: "NAN", score: Number.NaN, confidence: 0.9 },
+      { ticker: "GOOD", score: 0.4, confidence: 0.5 },
+      { ticker: "INF", score: Number.POSITIVE_INFINITY, confidence: 0.5 },
+      { ticker: "BEST", score: 0.8, confidence: 0.5 },
+    ];
+    const ranked = rankEntryCandidates(rows).map((r) => r.ticker);
+    expect(ranked.slice(0, 2)).toEqual(["BEST", "GOOD"]); // finite scores rank first, in order
+    expect(ranked.slice(2).sort()).toEqual(["INF", "NAN"]); // non-finite sink, never win a slot
+    expect(rankEntryCandidates([...rows].reverse()).map((r) => r.ticker).slice(0, 2)).toEqual(["BEST", "GOOD"]);
+  });
+
   it("does not mutate the caller's array", () => {
     const rows = [c("LOW", 0.1), c("HIGH", 0.9)];
     rankEntryCandidates(rows);
