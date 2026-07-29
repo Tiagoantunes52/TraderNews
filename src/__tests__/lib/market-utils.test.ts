@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { marketNamesForTicker } from "@/lib/market-utils";
+import { marketNamesForTicker, toAlpacaSymbol, fromAlpacaSymbol } from "@/lib/market-utils";
 
 describe("marketNamesForTicker()", () => {
   it("maps Euronext Lisbon suffix", () => {
@@ -47,5 +47,35 @@ describe("marketNamesForTicker()", () => {
   it("does not match .L suffix for longer suffixes", () => {
     // EGL.LS should NOT match LSE (.L)
     expect(marketNamesForTicker("EGL.LS")).not.toEqual(["LSE"]);
+  });
+});
+
+describe("Alpaca symbol form", () => {
+  it("converts a US class share to the dot form Alpaca requires", () => {
+    expect(toAlpacaSymbol("BRK-B")).toBe("BRK.B");
+    expect(toAlpacaSymbol("BF-B")).toBe("BF.B");
+  });
+
+  it("converts an Alpaca class-share symbol back to the stored dash form", () => {
+    expect(fromAlpacaSymbol("BRK.B")).toBe("BRK-B");
+  });
+
+  it("leaves ordinary US tickers untouched in both directions", () => {
+    expect(toAlpacaSymbol("AAPL")).toBe("AAPL");
+    expect(fromAlpacaSymbol("AAPL")).toBe("AAPL");
+  });
+
+  // Neither is an Alpaca equity symbol, and rewriting them would invent ticker forms
+  // the rest of the app has never stored.
+  it("leaves crypto and foreign listings alone", () => {
+    expect(toAlpacaSymbol("BTC-USD")).toBe("BTC-USD");
+    expect(fromAlpacaSymbol("MC.PA")).toBe("MC.PA");
+    expect(fromAlpacaSymbol("EGL.LS")).toBe("EGL.LS");
+  });
+
+  it("round-trips", () => {
+    for (const t of ["BRK-B", "AAPL", "BTC-USD", "MC.PA"]) {
+      expect(fromAlpacaSymbol(toAlpacaSymbol(t))).toBe(t);
+    }
   });
 });

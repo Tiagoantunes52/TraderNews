@@ -785,6 +785,117 @@ export function reconcileBroker(args: {
 
 // ── 4. Pipeline & data health ────────────────────────────────────────────────
 
+/**
+ * What kind of problem a paper-stage error string describes.
+ *
+ * Every stage error used to land as one undifferentiated `STAGE_ERROR` per message,
+ * which made the whole bucket unactionable: a transient 502 from Alpaca and a request
+ * the broker will reject on every future run read identically, so the bucket had to be
+ * treated as operational and excluded from the improvement agent (see
+ * NON_CODE_CODES in lib/pick-finding). That hid a real bug for as long as it existed —
+ * eight positions a day whose stop re-anchor was rejected 403 because it was submitted
+ * on top of the still-resting stop. Splitting the bucket is what lets a deterministic
+ * failure be routed to a code fix while the transient ones stay operational.
+ *
+ *  - BROKER_ORDER_REJECTED — the broker refused the ORDER (4xx, not rate-limiting).
+ *    Our request was invalid for the account's state; retrying it unchanged fails
+ *    identically tomorrow, so this is a code bug.
+ *  - QUOTE_SYMBOL_INVALID — we asked a market-data endpoint for a symbol it doesn't
+ *    know. A ticker-form bug in the request; also a code bug.
+ *  - BROKER_API_ERROR — the API call itself failed (5xx, 429, transport). Usually
+ *    transient and owned by the operator, not the code.
+ *  - STAGE_ERROR — anything unrecognized. Keeps the old catch-all behaviour so a new
+ *    failure mode still surfaces (just never auto-routed to a code fix).
+ */
+export type StageErrorClass = "BROKER_ORDER_REJECTED" | "QUOTE_SYMBOL_INVALID" | "BROKER_API_ERROR" | "STAGE_ERROR";
+
+/** Classify one paper-stage error message. Pure, and the order of tests matters. */
+export function classifyStageError(message: string): StageErrorClass {
+  // Checked first: an invalid symbol arrives as an HTTP 400 whose body names it, so a
+  // status-code test alone would file it as a generic API error.
+  if (/invalid symbol/i.test(message)) return "QUOTE_SYMBOL_INVALID";
+  // 429 is rate-limiting — a 4xx that says "later", not "never", so it is NOT a
+  // rejection of the order's contents.
+  if (/order error: 4(?!29)\d\d/.test(message)) return "BROKER_ORDER_REJECTED";
+  if (/error: (?:429|5\d\d)/.test(message) || /(?:failed|unreachable|ECONN|ETIMEDOUT|fetch failed)/i.test(message)) {
+    return "BROKER_API_ERROR";
+  }
+  return "STAGE_ERROR";
+}
+
+/** The ticker an error is about, when the message names one. */
+function stageErrorTicker(message: string): string | null {
+  return (
+    message.match(/(?:failed|rejected) for ([A-Z][A-Z0-9.-]*)/)?.[1] ??
+    message.match(/invalid symbol: ([A-Z][A-Z0-9.-]*)/i)?.[1] ??
+    null
+  );
+}
+
+const STAGE_ERROR_CLASSES: Record<
+  StageErrorClass,
+  { severity: Severity; title: (n: number) => string; detail: string }
+> = {
+  BROKER_ORDER_REJECTED: {
+    severity: "fail",
+    title: (n) => `${n} order(s) the broker rejected outright`,
+    detail:
+      "Alpaca refused these orders with a 4xx — the request was invalid for the account's state (already-held shares, bad qty, unknown symbol), so it will fail identically on every future run until the code changes. Whatever each order was for (an exit, a stop, a repair) did NOT happen.",
+  },
+  QUOTE_SYMBOL_INVALID: {
+    severity: "warn",
+    title: (n) => `${n} symbol(s) the market-data feed doesn't recognize`,
+    detail:
+      "The app asked for a ticker form Alpaca doesn't use (typically a dash-form class share like BRK-B, which Alpaca names BRK.B). The latest-trades endpoint fails the WHOLE request on one bad symbol, so up to 100 other names silently fell back to stored closes for that run.",
+  },
+  BROKER_API_ERROR: {
+    severity: "warn",
+    title: (n) => `${n} broker/API call(s) failed`,
+    detail:
+      "The call itself failed (5xx, rate limit, or transport). Usually transient — worth watching for a pattern, but there is nothing to fix in code unless it repeats daily.",
+  },
+  STAGE_ERROR: {
+    severity: "warn",
+    title: (n) => `${n} unclassified paper-stage error(s)`,
+    detail: "The stage reported an error that matches no known class. Read the messages below.",
+  },
+};
+
+/**
+ * Paper-stage errors, one finding per CLASS rather than per message.
+ *
+ * Per-message findings buried the report: a single root cause hitting eight tickers
+ * read as eight separate problems, exactly the failure mode that took an early report
+ * to 198 findings. Group by class, carry every affected ticker (or the raw messages
+ * when none is named) in the detail.
+ */
+export function auditStageErrors(errors: string[]): Finding[] {
+  const byClass = new Map<StageErrorClass, string[]>();
+  for (const err of errors) {
+    const cls = classifyStageError(err);
+    const existing = byClass.get(cls) ?? [];
+    existing.push(err);
+    byClass.set(cls, existing);
+  }
+
+  const out: Finding[] = [];
+  for (const [cls, messages] of byClass) {
+    const spec = STAGE_ERROR_CLASSES[cls];
+    const tickers = [...new Set(messages.map(stageErrorTicker).filter((t): t is string => t != null))];
+    // The messages are the evidence a fix gets written from, so they travel with the
+    // finding — capped, because a stage that fails on every name would otherwise ship
+    // its whole log into the report.
+    const evidence = messages.slice(0, 8).join(" | ") + (messages.length > 8 ? ` | +${messages.length - 8} more` : "");
+    out.push(
+      finding(spec.severity, cls, spec.title(messages.length), `${spec.detail}\n\n${evidence}`, {
+        count: messages.length,
+        ...(tickers.length > 0 ? { tickers: tickers.join(",") } : {}),
+      })
+    );
+  }
+  return out;
+}
+
 export type HealthInput = {
   universeSize: number;
   estimatesToday: number;
@@ -872,9 +983,7 @@ export function auditHealth(h: HealthInput): Finding[] {
     }
   }
 
-  for (const err of h.paperErrors) {
-    out.push(finding("warn", "STAGE_ERROR", "Paper stage reported an error", err));
-  }
+  out.push(...auditStageErrors(h.paperErrors));
 
   if (h.missedTradingDays.length > 0) {
     out.push(

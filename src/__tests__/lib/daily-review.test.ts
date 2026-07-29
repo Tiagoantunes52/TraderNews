@@ -9,6 +9,8 @@ import {
   auditTrackingError,
   reconcileBroker,
   auditHealth,
+  auditStageErrors,
+  classifyStageError,
   summarizeStrategies,
   tuningSignals,
   overallStatus,
@@ -653,9 +655,58 @@ describe("auditHealth", () => {
     expect(found[0].title).toContain("Drawdown 12%");
   });
 
-  it("reports every stage error", () => {
+  it("reports stage errors, carrying the raw message as evidence", () => {
     const found = auditHealth({ ...healthy, paperErrors: ["Alpaca order failed for AAPL"] });
-    expect(found.find((f) => f.code === "STAGE_ERROR")?.detail).toBe("Alpaca order failed for AAPL");
+    expect(found.find((f) => f.code === "BROKER_API_ERROR")?.detail).toContain("Alpaca order failed for AAPL");
+  });
+});
+
+describe("classifyStageError / auditStageErrors", () => {
+  // The exact 403 body Alpaca returns when a sell is submitted while a resting stop
+  // still holds the shares — the failure that ran unfixed for weeks because the whole
+  // stage-error bucket was excluded from the improvement agent.
+  const rejected = (t: string) =>
+    `Alpaca broker action failed for ${t}: Error: Alpaca order error: 403 — {"available":"0","code":40310000,"existing_qty":"5"}`;
+
+  it("classifies a 4xx order rejection as a code bug, not an API blip", () => {
+    expect(classifyStageError(rejected("PM"))).toBe("BROKER_ORDER_REJECTED");
+  });
+
+  it("classifies an unknown symbol from the quote feed", () => {
+    expect(classifyStageError('Alpaca latest-trades error: 400 — {"message":"invalid symbol: BRK-B"}')).toBe(
+      "QUOTE_SYMBOL_INVALID"
+    );
+  });
+
+  it("treats a rate-limited order as transient, not a rejection of its contents", () => {
+    expect(classifyStageError("Alpaca order error: 429 — slow down")).toBe("BROKER_API_ERROR");
+  });
+
+  it("classifies 5xx and transport failures as API errors", () => {
+    expect(classifyStageError("Alpaca trading error: 502 — bad gateway")).toBe("BROKER_API_ERROR");
+    expect(classifyStageError("Alpaca open-orders fetch failed: ECONNRESET")).toBe("BROKER_API_ERROR");
+  });
+
+  it("falls back to the catch-all for anything unrecognized", () => {
+    expect(classifyStageError("Orphan-exit sold XYZ but found no Stock row to record it")).toBe("STAGE_ERROR");
+  });
+
+  it("emits ONE finding per class, listing every affected ticker", () => {
+    const found = auditStageErrors([rejected("PM"), rejected("RTX"), rejected("VZ"), "Alpaca trading error: 502 — x"]);
+    expect(found).toHaveLength(2);
+    const rej = found.find((f) => f.code === "BROKER_ORDER_REJECTED")!;
+    expect(rej.severity).toBe("fail");
+    expect(rej.refs).toMatchObject({ count: 3, tickers: "PM,RTX,VZ" });
+  });
+
+  it("caps the evidence so a stage failing on every name can't flood the report", () => {
+    const found = auditStageErrors(Array.from({ length: 20 }, (_, i) => rejected(`T${i}`)));
+    expect(found).toHaveLength(1);
+    expect(found[0].detail).toContain("+12 more");
+  });
+
+  it("emits nothing when the stage reported no errors", () => {
+    expect(auditStageErrors([])).toEqual([]);
   });
 });
 

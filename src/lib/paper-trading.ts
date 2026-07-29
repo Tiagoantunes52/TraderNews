@@ -215,9 +215,10 @@ export function isBrokerStopsEnabled(): boolean {
 // upper bound since a GTC order rests all day) — 40.6% of stock-days close >0.5% up,
 // 19.6% >2%, 4.4% >5% — but the buffer also inflates realised risk, because the OTO stop
 // is priced off the same reference close and cannot know the fill (see the re-anchor in
-// planBrokerAction). Until that correction has run in production, keep the band narrow
-// enough that a top-of-band fill can't badly overshoot risk-per-trade before the next
-// run fixes it.
+// planBrokerAction). That correction shipped rejected — every re-place was submitted on
+// top of the still-resting stop and 403'd on held shares, so no stop was ever re-anchored
+// until the cancel-first fix (2026-07-29). Keep the band narrow enough that a top-of-band
+// fill can't badly overshoot risk-per-trade before the next run fixes it.
 const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.02);
 
 /**
@@ -562,7 +563,18 @@ export type BrokerAction =
   | { type: "ENTER"; qty: number; limitPrice: number; stopPrice: number }
   | { type: "EXIT"; reason: string } // signal/time exit: cancel the resting stop + market-sell
   | { type: "ARM_TRAILING"; trailPercent: number } // replace the fixed stop with a trailing stop
-  | { type: "REPAIR_STOP"; stopPrice: number } // held but no protective order: re-place a GTC stop
+  /**
+   * Place a GTC stop — either because nothing is protecting the position, or because
+   * the resting stop is anchored to the wrong price and must be re-placed.
+   *
+   * `replacesResting` distinguishes the two, and the caller MUST cancel the resting
+   * order first when it is set. Alpaca holds the position's shares against a resting
+   * sell order, so submitting the replacement while the old stop is still working is
+   * rejected (403, `available: "0"`) — the repair silently never happens and the stop
+   * stays mis-anchored. The flag lives here, rather than being re-derived at the call
+   * site, because this function is the only thing that knows which case it chose.
+   */
+  | { type: "REPAIR_STOP"; stopPrice: number; replacesResting: boolean }
   | { type: "NONE" };
 
 /**
@@ -642,7 +654,11 @@ export function planBrokerAction(input: {
   if (stillLong) {
     if (restingProtectiveType == null) {
       const anchor = avgEntryPrice ?? price;
-      return { type: "REPAIR_STOP", stopPrice: cents(anchor * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct))) };
+      return {
+        type: "REPAIR_STOP",
+        stopPrice: cents(anchor * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct))),
+        replacesResting: false,
+      };
     }
     // Re-anchor a fixed stop that was priced off the wrong reference.
     //
@@ -660,7 +676,7 @@ export function planBrokerAction(input: {
     if (restingProtectiveType === "stop" && restingStopPrice != null && avgEntryPrice != null && avgEntryPrice > 0) {
       const want = cents(avgEntryPrice * (1 - riskDistancePct(cfg, atrPct, cfg.stopLossPct)));
       if (Math.abs(want - restingStopPrice) / avgEntryPrice > STOP_REANCHOR_TOLERANCE_PCT) {
-        return { type: "REPAIR_STOP", stopPrice: want };
+        return { type: "REPAIR_STOP", stopPrice: want, replacesResting: true };
       }
     }
     if (avgEntryPrice != null && currentPrice != null && avgEntryPrice > 0) {

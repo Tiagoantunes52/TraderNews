@@ -1239,6 +1239,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             } else if (action.type === "REPAIR_STOP" && held) {
               const qty = Math.floor(Math.abs(held.qty));
               if (qty >= 1) {
+                // A re-anchor REPLACES a working stop, so cancel it first — Alpaca holds
+                // the shares against the resting sell order and rejects the replacement
+                // (403 `available: "0"`) while it's still live. Without this the repair
+                // never lands and the stop keeps its wrong anchor, run after run.
+                if (action.replacesResting && protective) await cancelOrder(protective.id);
                 await submitTracked({ stockId: est.stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
                   submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice, clientOrderId })
                 );

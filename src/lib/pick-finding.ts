@@ -24,7 +24,8 @@ import { type Finding, type Severity } from "@/lib/daily-review";
  * account, not editing code), or an `info` strategy-tuning signal (owned by the
  * backtest-gated tuning track, never an LLM code edit). Any code NOT listed here —
  * the REPLAY_*, EXIT_*, ENTRY_*, REALIZED_PNL_MISMATCH, MISSED_EXIT correctness
- * findings — is a genuine code bug and is eligible.
+ * findings, plus BROKER_ORDER_REJECTED and QUOTE_SYMBOL_INVALID — is a genuine code
+ * bug and is eligible.
  */
 export const NON_CODE_CODES: ReadonlySet<string> = new Set([
   // Pipeline / data health (auditHealth)
@@ -36,7 +37,14 @@ export const NON_CODE_CODES: ReadonlySet<string> = new Set([
   "PAPER_DID_NOT_RUN",
   "PAPER_RAN_AFTER_CLOSE",
   "PAPER_RAN_EARLY",
+  // Unclassified stage errors, and API calls that failed transiently (5xx, 429,
+  // transport). Their deterministic siblings — BROKER_ORDER_REJECTED and
+  // QUOTE_SYMBOL_INVALID — are deliberately ABSENT from this list: an order the broker
+  // refuses on its contents, or a symbol form the feed doesn't accept, fails the same
+  // way on every future run and is fixed in code, not by operating the account. See
+  // classifyStageError in lib/daily-review.
   "STAGE_ERROR",
+  "BROKER_API_ERROR",
   "MISSED_TRADING_DAYS",
   "DATA_WARNING",
   "ACCOUNT_ALERT",

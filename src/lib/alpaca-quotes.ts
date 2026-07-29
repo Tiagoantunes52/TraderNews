@@ -24,6 +24,7 @@
 // Docs: https://docs.alpaca.markets/reference/stocklatesttrades
 
 import { fetchWithRetry } from "@/lib/http";
+import { fromAlpacaSymbol, toAlpacaSymbol } from "@/lib/market-utils";
 
 const BASE_URL = "https://data.alpaca.markets/v2/stocks";
 
@@ -67,7 +68,7 @@ export type LatestTrades = {
 };
 
 /**
- * Last traded price per symbol.
+ * Last traded price per symbol, keyed by the caller's (stored) ticker form.
  *
  * The last TRADE, not the mid or the ask: it is the only one of the three that is a
  * price something actually transacted at, which is what both the simulated fill and the
@@ -83,7 +84,9 @@ export async function getLatestTrades(symbols: string[]): Promise<LatestTrades> 
   const errors: string[] = [];
   if (symbols.length === 0) return { prices, errors };
 
-  for (const group of chunk(symbols, SYMBOLS_PER_REQUEST)) {
+  // Ask in Alpaca's symbol form; a single unrecognised symbol 400s the whole request,
+  // taking every other name in the chunk down with it.
+  for (const group of chunk(symbols.map(toAlpacaSymbol), SYMBOLS_PER_REQUEST)) {
     try {
       const url = `${BASE_URL}/trades/latest?symbols=${encodeURIComponent(group.join(","))}`;
       const res = await fetchWithRetry(url, {
@@ -100,7 +103,8 @@ export async function getLatestTrades(symbols: string[]): Promise<LatestTrades> 
         const p = trade?.p;
         // A non-positive or missing price is not a price; leaving it out means the
         // caller falls back to the close rather than marking a book at zero.
-        if (typeof p === "number" && Number.isFinite(p) && p > 0) prices.set(symbol, p);
+        // Back to the stored form so callers can look prices up by their own ticker.
+        if (typeof p === "number" && Number.isFinite(p) && p > 0) prices.set(fromAlpacaSymbol(symbol), p);
       }
     } catch (e) {
       errors.push(`Alpaca latest-trades failed: ${String(e)}`);
