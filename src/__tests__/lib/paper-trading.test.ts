@@ -753,6 +753,7 @@ describe("planBrokerAction()", () => {
       expect(plan({ held: true, restingProtectiveType: null, avgEntryPrice: 100 })).toEqual({
         type: "REPAIR_STOP",
         stopPrice: 92,
+        replacesResting: false,
       });
     });
 
@@ -760,6 +761,7 @@ describe("planBrokerAction()", () => {
       expect(plan({ held: true, restingProtectiveType: null, avgEntryPrice: null, price: 50 })).toEqual({
         type: "REPAIR_STOP",
         stopPrice: 46,
+        replacesResting: false,
       });
     });
   });
@@ -899,5 +901,19 @@ describe("planBrokerAction() — stop re-anchoring after the fill", () => {
 
   it("still repairs a missing protective order (unchanged behaviour)", () => {
     expect(planBrokerAction({ ...base, restingProtectiveType: null }).type).toBe("REPAIR_STOP");
+  });
+
+  // The stage cancels the resting order iff `replacesResting` is set. Getting this
+  // wrong is silent: Alpaca holds the shares against the working stop and rejects the
+  // replacement (403, `available: "0"`), so the stop keeps its wrong anchor — which is
+  // exactly what production did until 2026-07-29, on every held name, every run.
+  it("flags a re-anchor as replacing the resting stop, so the caller cancels first", () => {
+    const action = planBrokerAction({ ...base, restingStopPrice: 92 });
+    expect(action).toMatchObject({ type: "REPAIR_STOP", replacesResting: true });
+  });
+
+  it("does not flag a repair with nothing resting — there is no order to cancel", () => {
+    const action = planBrokerAction({ ...base, restingProtectiveType: null });
+    expect(action).toMatchObject({ type: "REPAIR_STOP", replacesResting: false });
   });
 });

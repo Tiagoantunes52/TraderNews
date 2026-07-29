@@ -36,3 +36,29 @@ export function isSupportedTicker(ticker: string): boolean {
   if (!ticker.includes(".")) return true; // US equity (no exchange suffix)
   return SUPPORTED_EXCHANGE_SUFFIXES.some((s) => ticker.endsWith(s));
 }
+
+// ── Alpaca symbol form ───────────────────────────────────────────────────────
+// The app stores US class shares in DASH form (`BRK-B`, `BF-B`); every Alpaca API —
+// market data and trading alike — names them with a DOT (`BRK.B`) and rejects the
+// dash form outright. Sending one through cost more than that single name: the
+// latest-trades endpoint fails the WHOLE request on one bad symbol
+// (`400 invalid symbol: BRK-B`), so a chunk of up to 100 names silently fell back to
+// stored closes — re-introducing the very close-vs-fill bias live quotes exist to
+// remove. Convert at the Alpaca boundary and nowhere else: everything inside the app
+// keeps speaking the stored dash form.
+//
+// Only a single-letter share class is converted (`^TICK-A$`). Crypto (`BTC-USD`) and
+// foreign listings (`MC.PA`) are left alone — neither is an Alpaca equity symbol, and
+// mangling them would create ticker forms the rest of the app has never seen.
+const US_CLASS_SHARE_DASH = /^([A-Z]{1,4})-([A-Z])$/;
+const US_CLASS_SHARE_DOT = /^([A-Z]{1,4})\.([A-Z])$/;
+
+/** Stored ticker → Alpaca symbol (`BRK-B` → `BRK.B`). Everything else unchanged. */
+export function toAlpacaSymbol(ticker: string): string {
+  return ticker.replace(US_CLASS_SHARE_DASH, "$1.$2");
+}
+
+/** Alpaca symbol → stored ticker (`BRK.B` → `BRK-B`). Everything else unchanged. */
+export function fromAlpacaSymbol(symbol: string): string {
+  return symbol.replace(US_CLASS_SHARE_DOT, "$1-$2");
+}

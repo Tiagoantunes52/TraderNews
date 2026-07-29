@@ -1,4 +1,5 @@
 import { fetchWithRetry } from "@/lib/http";
+import { fromAlpacaSymbol, toAlpacaSymbol } from "@/lib/market-utils";
 
 // Alpaca paper Trading API client (issue #14). Places the REAL (simulated) orders
 // for the combined-signal book on a paper account and reads back fills + equity.
@@ -64,6 +65,11 @@ function authHeaders(): Record<string, string> {
   }
   return { "APCA-API-KEY-ID": keyId, "APCA-API-SECRET-KEY": secretKey };
 }
+
+// Symbols cross this boundary in Alpaca's form (`BRK.B`) and the app's (`BRK-B`);
+// `toAlpacaSymbol`/`fromAlpacaSymbol` translate, so every symbol this module RETURNS is
+// a stored ticker and every symbol it SENDS is an Alpaca one. Callers match broker
+// positions against their own tickers, so a leaked dot form reads as a different name.
 
 // Alpaca returns all numerics as strings; coerce defensively (null/"" → null).
 function num(v: unknown): number | null {
@@ -154,7 +160,7 @@ export async function getPortfolioPositions(): Promise<AlpacaPortfolioPosition[]
     }>
   >("/v2/positions");
   return raw.map((p) => ({
-    symbol: p.symbol,
+    symbol: fromAlpacaSymbol(p.symbol),
     qty: num(p.qty) ?? 0,
     avgEntryPrice: num(p.avg_entry_price),
     currentPrice: num(p.current_price),
@@ -206,7 +212,7 @@ export async function getPositions(): Promise<AlpacaPosition[]> {
     Array<{ symbol: string; qty?: string; unrealized_pl?: string; avg_entry_price?: string; current_price?: string }>
   >("/v2/positions");
   return raw.map((p) => ({
-    symbol: p.symbol,
+    symbol: fromAlpacaSymbol(p.symbol),
     qty: num(p.qty) ?? 0,
     unrealizedPl: num(p.unrealized_pl),
     avgEntryPrice: num(p.avg_entry_price),
@@ -263,7 +269,7 @@ export async function submitMarketOrder(input: MarketOrderInput): Promise<Alpaca
     throw new Error("submitMarketOrder requires exactly one of notional or qty");
   }
   const body: Record<string, string> = {
-    symbol,
+    symbol: toAlpacaSymbol(symbol),
     side,
     type: "market",
     time_in_force: "day",
@@ -320,7 +326,7 @@ async function postOrder(body: Record<string, unknown>): Promise<RawOrder> {
   const res = await fetchWithRetry(`${baseUrl()}/v2/orders`, {
     method: "POST",
     headers: { ...authHeaders(), "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, symbol: toAlpacaSymbol(String(body.symbol)) }),
     cache: "no-store",
   });
   if (!res.ok) {
@@ -427,13 +433,13 @@ export type AlpacaOpenOrder = {
 
 /** Open (resting) orders — broker-truth for finding/cancelling the protective leg. */
 export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]> {
-  const q = symbol ? `?status=open&symbols=${encodeURIComponent(symbol)}` : "?status=open";
+  const q = symbol ? `?status=open&symbols=${encodeURIComponent(toAlpacaSymbol(symbol))}` : "?status=open";
   const raw = await apiGet<
     Array<{ id: string; symbol: string; type: string; side: string; qty?: string; stop_price?: string | null; trail_percent?: string | null }>
   >(`/v2/orders${q}`);
   return raw.map((o) => ({
     id: o.id,
-    symbol: o.symbol,
+    symbol: fromAlpacaSymbol(o.symbol),
     type: o.type,
     side: o.side,
     qty: num(o.qty),
@@ -499,7 +505,7 @@ export async function getAccountActivities(pageSize = 100, maxPages = 50): Promi
     const raw = await apiGet<RawActivity[]>(`/v2/account/activities/FILL?${qs}`);
     for (const a of raw) {
       fills.push({
-        symbol: a.symbol,
+        symbol: fromAlpacaSymbol(a.symbol),
         side: a.side === "sell" ? "sell" : "buy",
         qty: num(a.qty) ?? 0,
         price: num(a.price) ?? 0,

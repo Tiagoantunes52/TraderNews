@@ -77,6 +77,15 @@ it cannot establish is *executable* performance — and only the latter is evide
   the daily stage never cancel/replaces over rounding. Gap distribution behind the
   number (close-to-close, an upper bound since a GTC order rests all day): 40.6% of
   stock-days close >0.5% up, 19.6% >2%, 4.4% >5%.
+  **Correction (2026-07-29): the re-anchor shipped inert and never once executed.** The
+  stage submitted the replacement stop without cancelling the one it replaces, and
+  Alpaca holds the position's shares against a resting sell order — so every re-place
+  was rejected `403 insufficient qty available` (the body's `related_orders` names the
+  very stop being replaced) and every mis-anchored stop stayed exactly where it was.
+  It failed on 8 of 11 positions on 2026-07-28 alone. `planBrokerAction` now marks the
+  re-anchor case `replacesResting`, and the stage cancels first. The realised-risk
+  overshoot the 2% cap was sized to tolerate was therefore live and uncorrected for the
+  whole period between the two dates.
 - **`effectiveTrades` now counts the sample the statistics come from.** It received a
   raw `count()` of closed positions while `edgeTStat`/`alphaTStat` were computed from
   `primaryIndep`, the overlap-pruned set — so the gate could clear its sample-size bar on

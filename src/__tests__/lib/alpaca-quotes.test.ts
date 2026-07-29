@@ -83,6 +83,25 @@ describe("alpaca-quotes", () => {
       expect(prices.size).toBe(0);
     });
 
+    // A dash-form class share (`BRK-B`) is not an Alpaca symbol: the endpoint 400s the
+    // WHOLE request on it ("invalid symbol"), so one bad name silently dropped up to 100
+    // others back to stored closes.
+    it("asks for class shares in Alpaca's dot form", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(ok({ trades: {} }));
+      vi.stubGlobal("fetch", mockFetch);
+      await getLatestTrades(["AAPL", "BRK-B"]);
+      const url = String(mockFetch.mock.calls[0][0]);
+      expect(decodeURIComponent(url)).toContain("BRK.B");
+      expect(decodeURIComponent(url)).not.toContain("BRK-B");
+    });
+
+    it("keys the reply back to the caller's stored ticker form", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok({ trades: { "BRK.B": { p: 415.2 } } })));
+      const { prices } = await getLatestTrades(["BRK-B"]);
+      expect(prices.get("BRK-B")).toBe(415.2);
+      expect(prices.has("BRK.B")).toBe(false);
+    });
+
     it("does not pin a feed — an explicit one would 403 an unentitled account", async () => {
       const mockFetch = vi.fn().mockResolvedValue(ok({ trades: {} }));
       vi.stubGlobal("fetch", mockFetch);

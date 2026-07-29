@@ -52,6 +52,16 @@ describe("pickFinding", () => {
     expect(reversed?.code).toBe("EXIT_TRAIL_NOT_ARMED");
   });
 
+  // The stage-error bucket used to be excluded wholesale, which hid a deterministic
+  // broker rejection (a stop repair submitted on top of the resting stop it replaces)
+  // for as long as it existed. Only the transient half stays excluded.
+  it("routes a deterministic stage error to the agent, but not a transient one", () => {
+    expect(pickFinding([f("fail", "BROKER_ORDER_REJECTED")], [])?.code).toBe("BROKER_ORDER_REJECTED");
+    expect(pickFinding([f("warn", "QUOTE_SYMBOL_INVALID")], [])?.code).toBe("QUOTE_SYMBOL_INVALID");
+    expect(pickFinding([f("warn", "BROKER_API_ERROR")], [])).toBeNull();
+    expect(pickFinding([f("warn", "STAGE_ERROR")], [])).toBeNull();
+  });
+
   it("does not mutate the input array", () => {
     const findings = [f("warn", "B_WARN"), f("fail", "A_FAIL")];
     const before = findings.map((x) => x.code);
