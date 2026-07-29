@@ -32,6 +32,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...except the annotated template, which is placeholders only and is what
+# "cp .env.example .env" in the README depends on.
+!.env.example
 
 # vercel
 .vercel
