@@ -21,6 +21,7 @@ import {
   reconcileRiskManaged,
   reconcileEventPosition,
   planBrokerAction,
+  entryAttemptHistory,
   isRiskBooksEnabled,
   isInsiderBookEnabled,
   isBrokerStopsEnabled,
@@ -34,6 +35,9 @@ import {
   isPaperTradeEligible,
   isEntrySignal,
   shouldExpireEntryOrder,
+  PENDING_SUBMIT_STATUS,
+  ABANDONED_STATUS,
+  TERMINAL_ORDER_STATUS,
   SIM_STARTING_EQUITY,
   type Strategy,
   type PositionAction,
@@ -84,26 +88,10 @@ export type PaperStageResult = {
   errors: string[];
 };
 
-// A recorded intent that has NOT yet been confirmed at the broker. Written before the
-// submission so a crash in between leaves something to recover from, and cleared to the
-// real Alpaca status the moment the broker responds.
-const PENDING_SUBMIT_STATUS = "PENDING_SUBMIT";
-// An intent the broker never received (looked up by client_order_id on a later run and
-// not found). Terminal: there is nothing at the broker, so nothing to reconcile.
-const ABANDONED_STATUS = "ABANDONED";
-
-// Terminal Alpaca order states — once an order reaches one, there's nothing left
-// to reconcile, so it drops out of the pending-fill recheck.
-const TERMINAL_ORDER_STATUS = new Set([
-  "filled",
-  "canceled",
-  "cancelled",
-  "expired",
-  "rejected",
-  "done_for_day",
-  "replaced",
-  ABANDONED_STATUS,
-]);
+/** Earliest of a non-empty date list — the lower bound for an attempt-history scan. */
+function minDate(dates: Date[]): Date {
+  return dates.reduce((a, b) => (b < a ? b : a));
+}
 
 // ── Near-close trade window (PAPER_TRADE_NEAR_CLOSE) ──────────────────────────
 // Act only in the final minutes before the US close: deepest liquidity of the day
@@ -1129,10 +1117,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         const managedSymbols = new Set<string>();
 
         // Has the broker already placed an entry for each COMBINED_RM episode? A BUY
-        // order dated at/after the sim's entry means yes — so if the broker is now flat
-        // in it, it was exited/stopped out and the re-entry guard must leave it alone.
-        // No such order means the entry never took hold (risk-gated, or a sub-share
-        // that has since grown), which planBrokerAction may then *catch up*.
+        // order dated at/after the sim's entry that filled — or is still working —
+        // means yes, so if the broker is now flat in it, it was exited/stopped out and
+        // the re-entry guard must leave it alone. No such order means the entry never
+        // took hold (risk-gated, rejected, or a sub-share that has since grown), which
+        // planBrokerAction may then *catch up*. See entryAttemptHistory.
         const rmOpens = openPositions.filter((p) => p.strategy === "COMBINED_RM");
         const everAttemptedByStock = new Map<string, boolean>();
         // How long ago that attempt was, so the re-entry guard can expire rather than
@@ -1141,17 +1130,26 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         if (rmOpens.length > 0) {
           const rmEntryByStock = new Map(rmOpens.map((p) => [p.stockId, p.entryDate]));
           const buys = await db.paperOrder.findMany({
-            where: { side: "BUY", stockId: { in: rmOpens.map((p) => p.stockId) } },
-            select: { stockId: true, submittedAt: true },
-            orderBy: { submittedAt: "desc" },
+            // Only the CURRENT episode can matter: entryAttemptHistory discards any
+            // attempt older than the stock's own entryDate, so bound the scan at the
+            // earliest of them rather than dragging in every BUY the name ever had.
+            where: {
+              side: "BUY",
+              stockId: { in: rmOpens.map((p) => p.stockId) },
+              submittedAt: { gte: minDate(rmOpens.map((p) => p.entryDate)) },
+            },
+            select: { stockId: true, submittedAt: true, filledQty: true, status: true },
           });
-          const lastBuyByStock = new Map<string, Date>();
-          for (const b of buys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+          const buysByStock = new Map<string, { submittedAt: Date; filledQty: number | null; status: string }[]>();
+          for (const b of buys) {
+            const list = buysByStock.get(b.stockId);
+            if (list) list.push(b);
+            else buysByStock.set(b.stockId, [b]);
+          }
           for (const [stockId, entryDate] of rmEntryByStock) {
-            const last = lastBuyByStock.get(stockId);
-            const attempted = last != null && last >= entryDate;
-            everAttemptedByStock.set(stockId, attempted);
-            if (attempted) runsSinceAttemptByStock.set(stockId, utcDaysBetween(last!, todayUTC));
+            const { everAttempted, runsSinceAttempt } = entryAttemptHistory(buysByStock.get(stockId) ?? [], entryDate, todayUTC);
+            everAttemptedByStock.set(stockId, everAttempted);
+            if (runsSinceAttempt != null) runsSinceAttemptByStock.set(stockId, runsSinceAttempt);
           }
         }
 
@@ -1380,26 +1378,32 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             // an estimate today, so reusing them would leave the guard permanently
             // unexpired for every name this sweep exists to reach.
             const sweepBuys = await db.paperOrder.findMany({
-              where: { side: "BUY", stockId: { in: missing.map((p) => p.stockId) } },
-              select: { stockId: true, submittedAt: true },
-              orderBy: { submittedAt: "desc" },
+              where: {
+                side: "BUY",
+                stockId: { in: missing.map((p) => p.stockId) },
+                submittedAt: { gte: minDate(missing.map((p) => p.entryDate)) },
+              },
+              select: { stockId: true, submittedAt: true, filledQty: true, status: true },
             });
-            const lastBuyByStock = new Map<string, Date>();
-            for (const b of sweepBuys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+            const sweepBuysByStock = new Map<string, { submittedAt: Date; filledQty: number | null; status: string }[]>();
+            for (const b of sweepBuys) {
+              const list = sweepBuysByStock.get(b.stockId);
+              if (list) list.push(b);
+              else sweepBuysByStock.set(b.stockId, [b]);
+            }
 
             for (const { stockId, stock, entryDate, entryAtrPct, confidence } of missing) {
               const ticker = stock.ticker;
               const quant = quantByStock.get(stockId);
               if (!quant || quant.price <= 0) continue;
-              const lastBuy = lastBuyByStock.get(stockId);
-              const attempted = lastBuy != null && lastBuy >= entryDate;
+              const { everAttempted, runsSinceAttempt } = entryAttemptHistory(sweepBuysByStock.get(stockId) ?? [], entryDate, todayUTC);
               const action = planBrokerAction({
                 opened: false,
                 stillLong: true,
                 exitReason: null,
                 held: false,
-                everAttempted: attempted,
-                runsSinceAttempt: attempted ? utcDaysBetween(lastBuy!, todayUTC) : null,
+                everAttempted,
+                runsSinceAttempt,
                 avgEntryPrice: null,
                 currentPrice: quant.price,
                 restingProtectiveType: null,

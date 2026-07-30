@@ -229,6 +229,28 @@ const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.02);
  */
 const STOP_REANCHOR_TOLERANCE_PCT = numEnv("PAPER_STOP_REANCHOR_TOLERANCE_PCT", 0.005);
 
+// A recorded intent that has NOT yet been confirmed at the broker. Written before the
+// submission so a crash in between leaves something to recover from, and cleared to the
+// real Alpaca status the moment the broker responds.
+export const PENDING_SUBMIT_STATUS = "PENDING_SUBMIT";
+// An intent the broker never received (looked up by client_order_id on a later run and
+// not found). Terminal: there is nothing at the broker, so nothing to reconcile.
+export const ABANDONED_STATUS = "ABANDONED";
+
+// Terminal Alpaca order states — once an order reaches one, there's nothing left
+// to reconcile, so it drops out of the pending-fill recheck. Anything NOT in here is
+// still working at the broker, which `entryAttemptHistory` also depends on.
+export const TERMINAL_ORDER_STATUS = new Set([
+  "filled",
+  "canceled",
+  "cancelled",
+  "expired",
+  "rejected",
+  "done_for_day",
+  "replaced",
+  ABANDONED_STATUS,
+]);
+
 /**
  * Days an unfilled BUY entry may rest at the broker before it's cancelled.
  *
@@ -576,6 +598,44 @@ export type BrokerAction =
    */
   | { type: "REPAIR_STOP"; stopPrice: number; replacesResting: boolean }
   | { type: "NONE" };
+
+/**
+ * Reduce a stock's raw BUY order history to what the re-entry guard needs: has the
+ * broker got an entry on this name for the CURRENT COMBINED_RM episode, and how long
+ * ago it went in.
+ *
+ * An order counts as an attempt when EITHER of two things is true, and the distinction
+ * matters in opposite directions:
+ *
+ *  • It filled (`filledQty > 0`) — shares were acquired, so a flat broker means the
+ *    position was exited or stopped out, which is exactly what the guard exists for.
+ *
+ *  • It is not terminal yet (PENDING_SUBMIT, new, accepted, partially_filled…) — the
+ *    order is still WORKING at the broker. `filledQty` is null here simply because it
+ *    is backfilled by the reconcile sweep on a later run, not because nothing happened.
+ *    Treating that as "never attempted" would let the stage submit a SECOND entry (and
+ *    a second attached stop) over a live one it can't see in `getPositions()`, since
+ *    nothing else de-duplicates resting buys — up to 2x the sized risk on one name.
+ *
+ * Only a BUY that reached a terminal state with NO fill — rejected, cancelled,
+ * expired, abandoned — is discounted. That order never held a position, so there is
+ * nothing to have been stopped out of; counting it stranded the name flat for the full
+ * `brokerReentryRuns` cooldown instead of retrying the entry on the next run.
+ */
+export function entryAttemptHistory(
+  buys: { submittedAt: Date; filledQty: number | null; status: string }[],
+  entryDate: Date,
+  today: Date
+): { everAttempted: boolean; runsSinceAttempt: number | null } {
+  let lastAttempt: Date | null = null;
+  for (const b of buys) {
+    const acquired = (b.filledQty ?? 0) > 0;
+    if (!acquired && TERMINAL_ORDER_STATUS.has(b.status)) continue;
+    if (lastAttempt == null || b.submittedAt > lastAttempt) lastAttempt = b.submittedAt;
+  }
+  const everAttempted = lastAttempt != null && lastAttempt >= entryDate;
+  return { everAttempted, runsSinceAttempt: everAttempted ? utcDaysBetween(lastAttempt!, today) : null };
+}
 
 /**
  * Decide the live broker book's action for one stock from the COMBINED_RM sim

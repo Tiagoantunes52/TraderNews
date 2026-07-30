@@ -13,6 +13,7 @@ import {
   reconcilePosition,
   reconcileRiskManaged,
   planBrokerAction,
+  entryAttemptHistory,
   isBrokerStopsEnabled,
   realizedFromFills,
   utcDaysBetween,
@@ -777,6 +778,97 @@ describe("planBrokerAction()", () => {
       if (prev === undefined) delete process.env.PAPER_BROKER_STOPS;
       else process.env.PAPER_BROKER_STOPS = prev;
     }
+  });
+});
+
+describe("entryAttemptHistory()", () => {
+  const entryDate = new Date("2026-07-01T00:00:00Z");
+  const today = new Date("2026-07-05T00:00:00Z");
+  const buy = (submittedAt: string, filledQty: number | null, status: string) => ({
+    submittedAt: new Date(submittedAt),
+    filledQty,
+    status,
+  });
+
+  it("is unattempted with no buy history at all", () => {
+    expect(entryAttemptHistory([], entryDate, today)).toEqual({ everAttempted: false, runsSinceAttempt: null });
+  });
+
+  it("counts a filled buy at/after the entry as an attempt", () => {
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", 6, "filled")], entryDate, today)).toEqual({
+      everAttempted: true,
+      runsSinceAttempt: 3,
+    });
+  });
+
+  it("ignores a rejected order — it never held a position, so it must not trip the guard", () => {
+    // Only order on file for this episode is a reject (filledQty null); the broker
+    // never actually acquired shares, so this must catch up like a fresh entry, not
+    // be mistaken for a stop-out.
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", null, "rejected")], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
+  });
+
+  it("ignores a cancelled/abandoned order (filledQty 0) the same way", () => {
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", 0, "canceled")], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
+  });
+
+  it("counts an unfilled order that is STILL WORKING at the broker as an attempt", () => {
+    // `accepted` with no fill yet: filledQty is null only because the reconcile sweep
+    // backfills it on a later run. The order is live and holds buying power, so a
+    // catch-up entry here would stack a second position on the same name.
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", null, "accepted")], entryDate, today)).toEqual({
+      everAttempted: true,
+      runsSinceAttempt: 3,
+    });
+  });
+
+  it("counts an unconfirmed PENDING_SUBMIT intent as an attempt", () => {
+    // The intent row is written BEFORE submission, and recovery deliberately leaves it
+    // PENDING_SUBMIT on a transport error rather than guessing ABANDONED — the order
+    // may well be live at the broker, so the guard must stay on.
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", null, "PENDING_SUBMIT")], entryDate, today)).toEqual({
+      everAttempted: true,
+      runsSinceAttempt: 3,
+    });
+  });
+
+  it("falls back to an earlier filled buy when the latest order rejected", () => {
+    // A genuine fill on day 2, then an unrelated reject on day 4 (e.g. a same-day
+    // repair attempt) — the reject must not erase the real attempt or its age.
+    expect(
+      entryAttemptHistory(
+        [buy("2026-07-04T00:00:00Z", null, "rejected"), buy("2026-07-02T00:00:00Z", 6, "filled")],
+        entryDate,
+        today
+      )
+    ).toEqual({ everAttempted: true, runsSinceAttempt: 3 });
+  });
+
+  it("counts a partial fill as an attempt", () => {
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", 2, "partially_filled")], entryDate, today)).toEqual({
+      everAttempted: true,
+      runsSinceAttempt: 3,
+    });
+  });
+
+  it("does not count a fill from a prior episode, before the current entry date", () => {
+    expect(entryAttemptHistory([buy("2026-06-20T00:00:00Z", 6, "filled")], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
+  });
+
+  it("does not count a still-working order from a prior episode either", () => {
+    expect(entryAttemptHistory([buy("2026-06-20T00:00:00Z", null, "accepted")], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
   });
 });
 
