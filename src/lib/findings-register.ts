@@ -38,6 +38,11 @@ export type RegisterFacts = {
   entryWindowDays: number;
   /** Today's paper-stage errors naming the `insufficient qty available` rejection. */
   insufficientQtyErrors: number;
+  /**
+   * QUANT entry-bucket excess over the universe, in bps, from `signal-health.ts`.
+   * Null when there is not yet enough history to score it.
+   */
+  quantEntryExcessBps: number | null;
 };
 
 export type RegisterAssertion = {
@@ -109,6 +114,24 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
         f.staleMarkedPositions > 0
           ? `${f.staleMarkedPositions} open position(s) have not been marked in ${f.staleMarkDays}+ days. The deferred defect is ACTIVE, not latent — the reason it lost prioritisation no longer applies.`
           : "no position is going unmarked.",
+    }),
+  },
+  {
+    // The register's claim is that the QUANT entry signal is currently anti-predictive.
+    // If live data stops agreeing, the bullet is describing a world that has moved on —
+    // and since the recommendation attached to it is "do not reweight off one period",
+    // a second period disagreeing is exactly the evidence that should reopen it.
+    id: "quant-signal-inverted",
+    section: "Confirmed 2026-07-30",
+    claim: "calcQuantScore's entry signal is anti-predictive: BUY names trail the universe.",
+    check: (f) => ({
+      holds: f.quantEntryExcessBps == null || f.quantEntryExcessBps < 0,
+      detail:
+        f.quantEntryExcessBps != null && f.quantEntryExcessBps >= 0
+          ? `QUANT entries are now beating the universe by ${f.quantEntryExcessBps.toFixed(1)} bps on the live window. The inversion has not persisted — re-read the bullet before acting on it, and note that a sign flipping twice is itself the argument against fitting to any single period.`
+          : f.quantEntryExcessBps == null
+            ? "not enough live history to score yet."
+            : `${f.quantEntryExcessBps.toFixed(1)} bps — still negative.`,
     }),
   },
   {

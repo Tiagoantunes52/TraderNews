@@ -21,6 +21,7 @@ import {
   type PaperRunLog,
 } from "@/lib/daily-review";
 import { auditFindingsRegister, type RegisterFacts } from "@/lib/findings-register";
+import { buildObservations, signalHealth, auditSignalHealth, DEFAULT_HORIZON, MIN_ENTRY_OBSERVATIONS, MIN_SESSIONS } from "@/lib/signal-health";
 import { ALL_STRATEGIES, RM_STRATEGIES, STRATEGY_BOOK, utcDaysBetween, type Strategy } from "@/lib/paper-trading";
 import { loadTradingConfig } from "@/lib/trading-config";
 import { minutesSinceClose, lastClosedSession, withinStaticAfterCloseWindow, type TradingSession } from "@/lib/market-hours";
@@ -67,6 +68,10 @@ const REGISTER_STALE_MARK_DAYS = 4;
 // Trailing window for "did the _RM entry freeze drain?". 30 days is long enough that a
 // quiet fortnight doesn't re-assert a freeze that has ended.
 const REGISTER_ENTRY_WINDOW_DAYS = 30;
+// Trailing window for the entry-signal health check. 90 days is the shortest span that
+// accumulates enough scored entries to t-test while staying recent enough that a regime
+// change shows up rather than being averaged away by three good years.
+const SIGNAL_HEALTH_WINDOW_DAYS = 90;
 
 /**
  * True when we're in the post-close window. Prefers the broker calendar, which
@@ -402,7 +407,66 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     errors.push(`Strategy rollup failed: ${String(e)}`);
   }
 
-  // ── 6. The findings register re-checks itself ──────────────────────────────
+  // Shared with the register check below, which asserts the sign of this number.
+  let quantEntryExcessBps: number | null = null;
+
+  // ── 6. Is the signal still pointing the right way? ─────────────────────────
+  //
+  // Every other check here asks whether the rules were followed. This one asks whether
+  // following them still pays — the question that went unasked while calcQuantScore's
+  // entry signal inverted (see OPEN-FINDINGS.md, "the quant entry signal inverted").
+  try {
+    const since = new Date(todayUTC.getTime() - SIGNAL_HEALTH_WINDOW_DAYS * 86_400_000);
+    // Estimates joined to the SESSION their scores describe. That mapping now exists —
+    // QuantAnalysis.sessionDate — and must be read, not re-derived: `date` is the run
+    // day, which is one to four days after the session it prices.
+    const [estimates, quantRows] = await Promise.all([
+      db.stockEstimate.findMany({
+        where: { date: { gte: since } },
+        select: { stockId: true, date: true, sentimentScore: true, quantScore: true, combinedScore: true },
+      }),
+      db.quantAnalysis.findMany({
+        where: { date: { gte: since }, sessionDate: { not: null } },
+        select: { stockId: true, date: true, sessionDate: true },
+      }),
+    ]);
+
+    const sessionFor = new Map<string, string>();
+    for (const q of quantRows) {
+      sessionFor.set(`${q.stockId}|${dateStr(q.date)}`, dateStr(q.sessionDate!));
+    }
+    const rows = estimates
+      .map((e) => {
+        const session = sessionFor.get(`${e.stockId}|${dateStr(e.date)}`);
+        return session ? { stockId: e.stockId, session, sentimentScore: e.sentimentScore, quantScore: e.quantScore, combinedScore: e.combinedScore } : null;
+      })
+      .filter((r): r is NonNullable<typeof r> => r != null);
+
+    if (rows.length > 0) {
+      const stockIds = [...new Set(rows.map((r) => r.stockId))];
+      const bars = await db.priceBar.findMany({
+        where: { stockId: { in: stockIds }, date: { gte: since } },
+        select: { stockId: true, date: true, close: true },
+      });
+      const obs = buildObservations(
+        rows,
+        bars.map((b) => ({ stockId: b.stockId, session: dateStr(b.date), close: b.close })),
+        DEFAULT_HORIZON
+      );
+      const health = signalHealth(obs);
+      findings.push(...auditSignalHealth(health));
+      const q = health.find((h) => h.source === "QUANT");
+      // Only meaningful once the sample clears the same bars auditSignalHealth uses;
+      // below that, null means "unknown" and the register assertion abstains.
+      if (q && q.entry.n >= MIN_ENTRY_OBSERVATIONS && q.sessions >= MIN_SESSIONS) {
+        quantEntryExcessBps = q.entry.meanExcess * 10_000;
+      }
+    }
+  } catch (e) {
+    errors.push(`Signal health check failed: ${String(e)}`);
+  }
+
+  // ── 7. The findings register re-checks itself ──────────────────────────────
   //
   // OPEN-FINDINGS.md asserts empirical facts in prose, and prose cannot notice when it
   // stops being true. Re-deriving the facts here means a claim that expired — usually
@@ -436,13 +500,14 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       rmEntriesInWindow: rmEntries,
       entryWindowDays: REGISTER_ENTRY_WINDOW_DAYS,
       insufficientQtyErrors: (runLog?.errors ?? []).filter((e) => /insufficient qty/i.test(e)).length,
+      quantEntryExcessBps,
     };
     findings.push(...auditFindingsRegister(facts));
   } catch (e) {
     errors.push(`Findings register check failed: ${String(e)}`);
   }
 
-  // ── 7. Book equity, today vs yesterday ─────────────────────────────────────
+  // ── 8. Book equity, today vs yesterday ─────────────────────────────────────
   let books: DailyReviewReport["books"] = [];
   try {
     const wanted = ["ALPACA", ...ALL_STRATEGIES.map((s) => STRATEGY_BOOK[s])];
