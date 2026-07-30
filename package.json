@@ -12,7 +12,8 @@
     "test:e2e:ui": "playwright test --ui",
     "lint": "eslint",
     "db:seed": "tsx prisma/seed.ts",
-    "promote-admin": "tsx scripts/promote-admin.ts"
+    "promote-admin": "tsx scripts/promote-admin.ts",
+    "backfill-price-bars": "tsx scripts/backfill-price-bars.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.6.2",
