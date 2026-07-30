@@ -55,3 +55,6 @@ AGENTS.md
 
 # Claude Code local state (agent worktrees, session settings)
 .claude/
+
+# Signal-research feature cache (rebuildable from PriceBar)
+.cache/

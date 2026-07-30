@@ -166,6 +166,83 @@ it cannot establish is *executable* performance — and only the latter is evide
 
 ---
 
+## Confirmed 2026-07-30: the quant entry signal inverted
+
+<!-- check: quant-signal-inverted -->
+**`calcQuantScore` is anti-predictive out of sample.** Established over the whole
+`PriceBar` corpus — **119,428 stock-days, 104 names, 2021-10-25 → 2026-07-22** — as daily
+cross-sectional IC against 5-day forward returns, t-stat taken across days (pooling would
+inflate N ~100x, since names move together). The measurement was validated before being
+trusted: a plumbing control returns IC exactly 1.0000, and 30-day momentum returns
+IC 0.0216 at t = 3.10.
+
+Split TRAIN 2021-10 → 2025-01 (801 sessions) vs HOLDOUT 2025-01 → 2026-07 (383):
+
+| | cross-sectional | time-series |
+|---|---|---|
+| TRAIN | +0.0109 (1.55) | +0.0142 (2.29) |
+| HOLDOUT | **-0.0238 (-2.32)** | **-0.0366 (-4.73)** |
+
+Mean 5-day forward return by `scoreToSignal` bucket, against the universe that session:
+
+| bucket | TRAIN n | TRAIN | HOLDOUT n | HOLDOUT |
+|---|---|---|---|---|
+| STRONG_BUY | 118 | 1.21% | 32 | -0.21% |
+| **BUY** | 7,443 | **0.94% (t=6.54)** | 4,231 | **0.21% (t=-3.42)** |
+| NEUTRAL | 64,618 | 0.37% | 31,652 | **0.66%** |
+| SELL | 7,256 | 0.52% | 4,029 | 0.48% |
+
+Train reads correctly (1.21 → 0.94 → 0.37); holdout reads backwards (-0.21 → 0.21 →
+0.66), with NEUTRAL the best bucket. **The BUY signal went from +0.50pp excess to
+-0.38pp.** Consistent with the live `QUANT` book's 29.6% hit rate over 81 closes.
+
+**Three structural causes, none of them a single bad term.** Leave-one-out leaves IC
+between -0.021 and -0.026 whichever term is removed — every one is dragging.
+
+1. **Nominal weights are fiction.** The terms have wildly different spreads, so the
+   designed 30/30/10/10/20 behaves like macd 33.1% / momentum 25.8% / rsi 19.8% /
+   bollinger 16.4% / **volume 5.0%**. MACD dominates on the third-largest weight;
+   the volume term is inert for ranking purposes.
+2. **It leans on the fragile momentum horizon.** `change7d` +0.0116 train,
+   **-0.0136 holdout**; `change30d` +0.0227 (t=2.63) train, **+0.0194 (t=1.63) holdout**.
+   Momentum did not stop working — the 7-day lookback the score uses is the one that
+   broke. This is the only component finding that replicates across both periods.
+3. **Nothing was ever fitted.** The weights, the ±20% momentum normaliser, the 0.6/0.2
+   `scoreToSignal` cuts are all hardcoded constants validated against nothing. `p99` of
+   the score is 0.48, so STRONG_BUY (>0.6) fires 0.08% of the time and NEUTRAL holds 79%
+   of the mass: the five-level scale is really three.
+
+**What was tried and rejected.** `calcQuantScore`'s internal RSI regime flip
+(`indicators.ts:237-240`, mean-reversion when `|momNorm| < TREND_REGIME_MIN`) looked like
+a one-line fix: reading RSI as pure momentum scored t = +2.58 in sample against t = -1.14
+for the shipped version. **It did not replicate — t = 2.90 train, 0.35 holdout.** Recorded
+because the next reader will have the same idea.
+
+**Do NOT invert or reweight the signal off this.** One holdout period. The finding is
+"the score was never fitted and its effective weights do not match its designed weights",
+which argues for refitting under train/test discipline — not for flipping a sign, which
+has already been tried here and failed. No capital is exposed (`baseUrl()` refuses any
+non-`paper-api` host), so the cost is measurement time, not money.
+
+**Now monitored.** `src/lib/signal-health.ts` runs in the daily review and reports each
+source's entry-bucket excess over the universe, emitting `SIGNAL_INVERTED` when it turns
+significantly negative. That is a prompt to investigate, not a trigger to act.
+
+**Next step: a signal research harness, not the portfolio backtest.** The study above ran
+in throwaway scripts in ~20 minutes; promoting it (IC both ways, bucket monotonicity,
+train/test split, regime conditioning, pre-registered hypotheses) is roughly a tenth of
+the Phase-2 portfolio backtest and shares its metrics layer. `quantScore`'s defect is a
+signal defect — fill modelling is not needed to fix it. Hypothesis #1 is the 7-day vs
+30-day momentum horizon, the one result with prior evidence on both sides of the split.
+
+**Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
+expected by chance — the out-of-sample split is what separates signal from that, and it
+is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's
+watchlist tested back to 2021, which inflates momentum-family results specifically.
+Close-to-close IC with no fills and no costs; costs make this worse, not better.
+
+---
+
 ## Priority plan
 
 ### 1. Rotation policy — the last open item, and deliberately still open

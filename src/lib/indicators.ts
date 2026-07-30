@@ -139,6 +139,85 @@ export function calcATR(highs: number[], lows: number[], closes: number[], perio
   return atr;
 }
 
+/**
+ * Wilder's Average Directional Index — trend STRENGTH, with no direction.
+ *
+ * ADX is the standard way to ask "is this market trending or chopping?", which is the
+ * question every regime classifier starts from. It says nothing about which way: a
+ * violent decline and a steady rally both read high. Convention is ADX > 25 = trending,
+ * < 20 = range-bound, with 20-25 deliberately unclassified rather than forced.
+ *
+ * Three smoothed series, all Wilder (not simple, not exponential — the `(prev*(n-1) +
+ * new)/n` recursion, same as `calcATR` above):
+ *   TR   — true range
+ *   +DM  — up-move, when today's high exceeds yesterday's by more than the low fell
+ *   -DM  — down-move, the mirror
+ * then DI± = 100 × smoothed(±DM)/smoothed(TR), DX = 100 × |DI+ − DI−|/(DI+ + DI−), and
+ * ADX = Wilder-smoothed DX.
+ *
+ * Warm-up is `2 × period`, not `period`: DX cannot start until the DI pair exists, and
+ * ADX is an average OF DX. Returning null through that window rather than a partially
+ * warmed value matters here — a research harness reading an under-smoothed ADX would
+ * classify the first weeks of every series into the wrong regime.
+ */
+export function calcADX(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period = 14
+): number | null {
+  const n = Math.min(highs.length, lows.length, closes.length);
+  if (n < period * 2 + 1) return null;
+
+  const tr: number[] = [];
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+  for (let i = 1; i < n; i++) {
+    tr.push(
+      Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]))
+    );
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    // Only the LARGER of the two counts, and only if positive — an inside day where
+    // both shrink contributes no directional movement at all.
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+  }
+
+  // Seed each smoothed series with the simple sum of its first `period` values.
+  let atr = 0;
+  let plus = 0;
+  let minus = 0;
+  for (let i = 0; i < period; i++) {
+    atr += tr[i];
+    plus += plusDM[i];
+    minus += minusDM[i];
+  }
+
+  const dxs: number[] = [];
+  for (let i = period; i < tr.length; i++) {
+    atr = atr - atr / period + tr[i];
+    plus = plus - plus / period + plusDM[i];
+    minus = minus - minus / period + minusDM[i];
+    if (atr <= 0) {
+      // A dead-flat window: no range, so no directional information either.
+      dxs.push(0);
+      continue;
+    }
+    const plusDI = (plus / atr) * 100;
+    const minusDI = (minus / atr) * 100;
+    const sum = plusDI + minusDI;
+    dxs.push(sum > 0 ? (Math.abs(plusDI - minusDI) / sum) * 100 : 0);
+  }
+
+  if (dxs.length < period) return null;
+  let adx = dxs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxs.length; i++) {
+    adx = (adx * (period - 1) + dxs[i]) / period;
+  }
+  return adx;
+}
+
 export type MACDResult = { macd: number; signal: number; histogram: number };
 
 // MACD calculation.

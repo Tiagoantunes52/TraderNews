@@ -19,6 +19,7 @@ const asWritten: RegisterFacts = {
   rmEntriesInWindow: 34,
   entryWindowDays: 30,
   insufficientQtyErrors: 0,
+  quantEntryExcessBps: -38.0, // measured negative — see the 2026-07-30 finding
 };
 
 const staleIds = (f: Partial<RegisterFacts>) =>
@@ -63,6 +64,16 @@ describe("auditFindingsRegister()", () => {
     const [f] = auditFindingsRegister({ ...asWritten, rmEntriesInWindow: 0 });
     expect(f.refs?.id).toBe("entry-freeze-drained");
     expect(f.detail).toContain("looks healthy from every other angle");
+  });
+
+  it("notices the quant entry signal ceasing to be inverted", () => {
+    const [f] = auditFindingsRegister({ ...asWritten, quantEntryExcessBps: 12.5 });
+    expect(f.refs?.id).toBe("quant-signal-inverted");
+    expect(f.detail).toContain("has not persisted");
+  });
+
+  it("abstains on the inversion claim when there is no live sample yet", () => {
+    expect(staleIds({ quantEntryExcessBps: null })).toEqual([]);
   });
 
   it("notices the cancel-first stop fix regressing", () => {
