@@ -13,6 +13,7 @@ import {
   reconcilePosition,
   reconcileRiskManaged,
   planBrokerAction,
+  entryAttemptHistory,
   isBrokerStopsEnabled,
   realizedFromFills,
   utcDaysBetween,
@@ -777,6 +778,55 @@ describe("planBrokerAction()", () => {
       if (prev === undefined) delete process.env.PAPER_BROKER_STOPS;
       else process.env.PAPER_BROKER_STOPS = prev;
     }
+  });
+});
+
+describe("entryAttemptHistory()", () => {
+  const entryDate = new Date("2026-07-01T00:00:00Z");
+  const today = new Date("2026-07-05T00:00:00Z");
+  const buy = (submittedAt: string, filledQty: number | null) => ({ submittedAt: new Date(submittedAt), filledQty });
+
+  it("is unattempted with no buy history at all", () => {
+    expect(entryAttemptHistory([], entryDate, today)).toEqual({ everAttempted: false, runsSinceAttempt: null });
+  });
+
+  it("counts a filled buy at/after the entry as an attempt", () => {
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", 6)], entryDate, today)).toEqual({
+      everAttempted: true,
+      runsSinceAttempt: 3,
+    });
+  });
+
+  it("ignores a rejected order — it never held a position, so it must not trip the guard", () => {
+    // Only order on file for this episode is a reject (filledQty null); the broker
+    // never actually acquired shares, so this must catch up like a fresh entry, not
+    // be mistaken for a stop-out.
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", null)], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
+  });
+
+  it("ignores a cancelled/abandoned order (filledQty 0) the same way", () => {
+    expect(entryAttemptHistory([buy("2026-07-02T00:00:00Z", 0)], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
+  });
+
+  it("falls back to an earlier filled buy when the latest order rejected", () => {
+    // A genuine fill on day 2, then an unrelated reject on day 4 (e.g. a same-day
+    // repair attempt) — the reject must not erase the real attempt or its age.
+    expect(
+      entryAttemptHistory([buy("2026-07-04T00:00:00Z", null), buy("2026-07-02T00:00:00Z", 6)], entryDate, today)
+    ).toEqual({ everAttempted: true, runsSinceAttempt: 3 });
+  });
+
+  it("does not count a fill from a prior episode, before the current entry date", () => {
+    expect(entryAttemptHistory([buy("2026-06-20T00:00:00Z", 6)], entryDate, today)).toEqual({
+      everAttempted: false,
+      runsSinceAttempt: null,
+    });
   });
 });
 

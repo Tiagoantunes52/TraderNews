@@ -21,6 +21,7 @@ import {
   reconcileRiskManaged,
   reconcileEventPosition,
   planBrokerAction,
+  entryAttemptHistory,
   isRiskBooksEnabled,
   isInsiderBookEnabled,
   isBrokerStopsEnabled,
@@ -1142,16 +1143,19 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           const rmEntryByStock = new Map(rmOpens.map((p) => [p.stockId, p.entryDate]));
           const buys = await db.paperOrder.findMany({
             where: { side: "BUY", stockId: { in: rmOpens.map((p) => p.stockId) } },
-            select: { stockId: true, submittedAt: true },
+            select: { stockId: true, submittedAt: true, filledQty: true },
             orderBy: { submittedAt: "desc" },
           });
-          const lastBuyByStock = new Map<string, Date>();
-          for (const b of buys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+          const buysByStock = new Map<string, { submittedAt: Date; filledQty: number | null }[]>();
+          for (const b of buys) {
+            const list = buysByStock.get(b.stockId);
+            if (list) list.push(b);
+            else buysByStock.set(b.stockId, [b]);
+          }
           for (const [stockId, entryDate] of rmEntryByStock) {
-            const last = lastBuyByStock.get(stockId);
-            const attempted = last != null && last >= entryDate;
-            everAttemptedByStock.set(stockId, attempted);
-            if (attempted) runsSinceAttemptByStock.set(stockId, utcDaysBetween(last!, todayUTC));
+            const { everAttempted, runsSinceAttempt } = entryAttemptHistory(buysByStock.get(stockId) ?? [], entryDate, todayUTC);
+            everAttemptedByStock.set(stockId, everAttempted);
+            if (runsSinceAttempt != null) runsSinceAttemptByStock.set(stockId, runsSinceAttempt);
           }
         }
 
@@ -1381,25 +1385,28 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             // unexpired for every name this sweep exists to reach.
             const sweepBuys = await db.paperOrder.findMany({
               where: { side: "BUY", stockId: { in: missing.map((p) => p.stockId) } },
-              select: { stockId: true, submittedAt: true },
+              select: { stockId: true, submittedAt: true, filledQty: true },
               orderBy: { submittedAt: "desc" },
             });
-            const lastBuyByStock = new Map<string, Date>();
-            for (const b of sweepBuys) if (!lastBuyByStock.has(b.stockId)) lastBuyByStock.set(b.stockId, b.submittedAt);
+            const sweepBuysByStock = new Map<string, { submittedAt: Date; filledQty: number | null }[]>();
+            for (const b of sweepBuys) {
+              const list = sweepBuysByStock.get(b.stockId);
+              if (list) list.push(b);
+              else sweepBuysByStock.set(b.stockId, [b]);
+            }
 
             for (const { stockId, stock, entryDate, entryAtrPct, confidence } of missing) {
               const ticker = stock.ticker;
               const quant = quantByStock.get(stockId);
               if (!quant || quant.price <= 0) continue;
-              const lastBuy = lastBuyByStock.get(stockId);
-              const attempted = lastBuy != null && lastBuy >= entryDate;
+              const { everAttempted, runsSinceAttempt } = entryAttemptHistory(sweepBuysByStock.get(stockId) ?? [], entryDate, todayUTC);
               const action = planBrokerAction({
                 opened: false,
                 stillLong: true,
                 exitReason: null,
                 held: false,
-                everAttempted: attempted,
-                runsSinceAttempt: attempted ? utcDaysBetween(lastBuy!, todayUTC) : null,
+                everAttempted,
+                runsSinceAttempt,
                 avgEntryPrice: null,
                 currentPrice: quant.price,
                 restingProtectiveType: null,

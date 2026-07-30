@@ -578,6 +578,30 @@ export type BrokerAction =
   | { type: "NONE" };
 
 /**
+ * Reduce a stock's raw BUY order history to what the re-entry guard needs: did the
+ * broker ever actually acquire shares for the CURRENT COMBINED_RM episode, and how
+ * long ago. Only a BUY that filled counts — a rejected, cancelled, expired, or
+ * abandoned order never held a position, so it must not trip the guard. Counting it
+ * would leave a name that merely failed to submit (a transient reject, a crash before
+ * the broker confirmed) stranded flat for `brokerReentryRuns` runs as if it had been
+ * entered and stopped out, instead of retried on the next run like any other
+ * never-attempted entry.
+ */
+export function entryAttemptHistory(
+  buys: { submittedAt: Date; filledQty: number | null }[],
+  entryDate: Date,
+  today: Date
+): { everAttempted: boolean; runsSinceAttempt: number | null } {
+  let lastFilled: Date | null = null;
+  for (const b of buys) {
+    if (!b.filledQty || b.filledQty <= 0) continue;
+    if (lastFilled == null || b.submittedAt > lastFilled) lastFilled = b.submittedAt;
+  }
+  const everAttempted = lastFilled != null && lastFilled >= entryDate;
+  return { everAttempted, runsSinceAttempt: everAttempted ? utcDaysBetween(lastFilled!, today) : null };
+}
+
+/**
  * Decide the live broker book's action for one stock from the COMBINED_RM sim
  * transitions + the live broker state. Pure (no network/DB) so it's unit-testable.
  *
