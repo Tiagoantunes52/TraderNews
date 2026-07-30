@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, scoreToSignal } from "@/lib/indicators";
+import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcEMA, calcMACD, calcBollingerBands, calcATR, calcADX, scoreToSignal } from "@/lib/indicators";
 
 // ── calcSMA ──────────────────────────────────────────────────────────────────
 
@@ -362,6 +362,63 @@ describe("calcATR()", () => {
     const lows = closes.map((c) => c - 1);
     const result = calcATR(highs, lows, closes, 14);
     expect(result!).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ── calcADX ───────────────────────────────────────────────────────────────────
+
+describe("calcADX()", () => {
+  /** Bars of constant range around a given close path. */
+  const series = (closes: number[], range = 2) => ({
+    highs: closes.map((c) => c + range),
+    lows: closes.map((c) => c - range),
+    closes,
+  });
+
+  it("returns null through the warm-up — ADX needs 2x period, not period", () => {
+    // period+1 bars is enough for ATR but NOT for ADX: DX cannot start until the DI
+    // pair exists, and ADX averages DX. A partially-warmed value would misclassify
+    // the opening weeks of every series.
+    const { highs, lows, closes } = series(Array.from({ length: 20 }, (_, i) => 100 + i));
+    expect(calcADX(highs, lows, closes, 14)).toBeNull();
+    const long = series(Array.from({ length: 40 }, (_, i) => 100 + i));
+    expect(calcADX(long.highs, long.lows, long.closes, 14)).not.toBeNull();
+  });
+
+  it("reads high on a clean one-way trend", () => {
+    const { highs, lows, closes } = series(Array.from({ length: 60 }, (_, i) => 100 + i * 2));
+    const adx = calcADX(highs, lows, closes, 14)!;
+    expect(adx).toBeGreaterThan(25); // the conventional "trending" cut
+    expect(adx).toBeLessThanOrEqual(100);
+  });
+
+  it("is direction-blind — a decline of the same shape reads the same", () => {
+    const up = series(Array.from({ length: 60 }, (_, i) => 100 + i * 2));
+    const down = series(Array.from({ length: 60 }, (_, i) => 220 - i * 2));
+    expect(calcADX(up.highs, up.lows, up.closes, 14)!).toBeCloseTo(
+      calcADX(down.highs, down.lows, down.closes, 14)!,
+      6
+    );
+  });
+
+  it("reads ~0 on a dead-flat series — no range means no directional information", () => {
+    const flat = series(Array(60).fill(100), 0);
+    expect(calcADX(flat.highs, flat.lows, flat.closes, 14)!).toBeCloseTo(0, 10);
+  });
+
+  it("reads low on chop and high on trend, over the same number of bars", () => {
+    const chop = series(Array.from({ length: 60 }, (_, i) => 100 + (i % 2 === 0 ? 1 : -1)));
+    const trend = series(Array.from({ length: 60 }, (_, i) => 100 + i * 2));
+    expect(calcADX(chop.highs, chop.lows, chop.closes, 14)!).toBeLessThan(
+      calcADX(trend.highs, trend.lows, trend.closes, 14)!
+    );
+  });
+
+  it("stays within [0, 100]", () => {
+    const s = series(Array.from({ length: 80 }, (_, i) => 100 + Math.sin(i / 3) * 10 + i * 0.4));
+    const adx = calcADX(s.highs, s.lows, s.closes, 14)!;
+    expect(adx).toBeGreaterThanOrEqual(0);
+    expect(adx).toBeLessThanOrEqual(100);
   });
 });
 
