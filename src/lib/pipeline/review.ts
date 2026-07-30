@@ -20,7 +20,8 @@ import {
   type Finding,
   type PaperRunLog,
 } from "@/lib/daily-review";
-import { ALL_STRATEGIES, STRATEGY_BOOK, utcDaysBetween, type Strategy } from "@/lib/paper-trading";
+import { auditFindingsRegister, type RegisterFacts } from "@/lib/findings-register";
+import { ALL_STRATEGIES, RM_STRATEGIES, STRATEGY_BOOK, utcDaysBetween, type Strategy } from "@/lib/paper-trading";
 import { loadTradingConfig } from "@/lib/trading-config";
 import { minutesSinceClose, lastClosedSession, withinStaticAfterCloseWindow, type TradingSession } from "@/lib/market-hours";
 import {
@@ -58,6 +59,14 @@ const TUNING_LOOKBACK_DAYS = Number(process.env.REVIEW_TUNING_LOOKBACK_DAYS) || 
 // two-name lag from a pending fill while still failing the state that went unnoticed
 // for 17 trading days (3 of 8 names = 0.38).
 const LIVE_TRACKING_MIN_COVERAGE = Number(process.env.REVIEW_TRACKING_MIN_COVERAGE) || 0.7;
+
+// Days without a mark before an open position counts as unmanaged, for the register's
+// "verified zero occurrences" claim. 4 clears a long weekend, so only a position the
+// stage is genuinely not reaching trips it.
+const REGISTER_STALE_MARK_DAYS = 4;
+// Trailing window for "did the _RM entry freeze drain?". 30 days is long enough that a
+// quiet fortnight doesn't re-assert a freeze that has ended.
+const REGISTER_ENTRY_WINDOW_DAYS = 30;
 
 /**
  * True when we're in the post-close window. Prefers the broker calendar, which
@@ -393,7 +402,47 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     errors.push(`Strategy rollup failed: ${String(e)}`);
   }
 
-  // ── 6. Book equity, today vs yesterday ─────────────────────────────────────
+  // ── 6. The findings register re-checks itself ──────────────────────────────
+  //
+  // OPEN-FINDINGS.md asserts empirical facts in prose, and prose cannot notice when it
+  // stops being true. Re-deriving the facts here means a claim that expired — usually
+  // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
+  // there being trusted.
+  try {
+    const [labelledRmExits, closesWithEntryScore, cfgRow, staleMarked, rmEntries] = await Promise.all([
+      db.simPosition.count({
+        where: { strategy: { in: RM_STRATEGIES }, status: "CLOSED", exitReason: { not: null } },
+      }),
+      // Not `_RM`-scoped: the register's entryScore claim counts closes across all books.
+      db.simPosition.count({ where: { status: "CLOSED", entryScore: { not: null } } }),
+      db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { key: true } }),
+      db.simPosition.count({
+        where: { status: "OPEN", lastMarkDate: { lt: new Date(todayUTC.getTime() - REGISTER_STALE_MARK_DAYS * 86_400_000) } },
+      }),
+      db.simPosition.count({
+        where: {
+          strategy: { in: RM_STRATEGIES },
+          entryDate: { gte: new Date(todayUTC.getTime() - REGISTER_ENTRY_WINDOW_DAYS * 86_400_000) },
+        },
+      }),
+    ]);
+
+    const facts: RegisterFacts = {
+      labelledRmExits,
+      closesWithEntryScore,
+      tradingConfigRowExists: cfgRow != null,
+      staleMarkedPositions: staleMarked,
+      staleMarkDays: REGISTER_STALE_MARK_DAYS,
+      rmEntriesInWindow: rmEntries,
+      entryWindowDays: REGISTER_ENTRY_WINDOW_DAYS,
+      insufficientQtyErrors: (runLog?.errors ?? []).filter((e) => /insufficient qty/i.test(e)).length,
+    };
+    findings.push(...auditFindingsRegister(facts));
+  } catch (e) {
+    errors.push(`Findings register check failed: ${String(e)}`);
+  }
+
+  // ── 7. Book equity, today vs yesterday ─────────────────────────────────────
   let books: DailyReviewReport["books"] = [];
   try {
     const wanted = ["ALPACA", ...ALL_STRATEGIES.map((s) => STRATEGY_BOOK[s])];
