@@ -65,6 +65,7 @@ model Stock {
   congressTrades      CongressTrade[]
   paperOrders         PaperOrder[]
   simPositions        SimPosition[]
+  priceBars           PriceBar[]
   userStocks          UserStock[]
 
   @@index([marketId])
@@ -154,6 +155,46 @@ model QuantAnalysis {
   createdAt           DateTime  @default(now())
 
   @@index([stockId, date])
+}
+
+// Daily OHLCV bars — the raw price record everything else is derived from.
+//
+// The quant stage has always fetched a 60-day window and discarded it after computing
+// indicators, so the only price history the app owned was QuantAnalysis.price: one
+// close per stock per day, starting the day the app first ran. That is enough to
+// compute an indicator and nothing else. It cannot answer "would this order have
+// filled?" — a limit order's fate is decided by the next bar's open and low, neither
+// of which was kept — and it cannot support anything needing history that predates the
+// app itself (a 200-day regime MA, a gap distribution with real sample size).
+//
+// Written forward by the quant stage from the window it already fetches, and backwards
+// by scripts/backfill-price-bars.ts.
+//
+// Prices are SPLIT/DIVIDEND ADJUSTED, and all four of O/H/L/C must sit on the SAME
+// adjustment basis. Mixing an adjusted close with a raw low fabricates a gap across
+// every corporate action, which a fill model reads as a stop-out on every affected bar
+// (that was a live defect in the Yahoo adapter). `source` records which adapter served
+// the bar so a series written on a mixed basis can be found and rewritten later.
+model PriceBar {
+  stock   Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
+  date    DateTime // UTC midnight of the session date
+
+  open   Float
+  high   Float
+  low    Float
+  close  Float
+  volume Float // Float, not Int: index and crypto volumes exceed 2^31
+
+  source    String // "Tiingo" | "Yahoo" | "Binance" | "CoinGecko"
+  createdAt DateTime @default(now())
+
+  // (stockId, date) IS the identity, so it's the primary key — deliberately no surrogate
+  // cuid `id`, unlike every other model here. This is the largest table in the schema
+  // and a surrogate key would add a column plus a second unique index serving no query
+  // the app makes. It also makes backfill re-runs idempotent via skipDuplicates.
+  @@id([stockId, date])
+  @@index([date]) // cross-sectional reads: "every bar on day D"
 }
 
 model StockEstimate {
