@@ -5,6 +5,7 @@ import { isEtf } from "@/lib/etf";
 import { getDailyPrices } from "@/lib/price-sources";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcMACD, calcBollingerBands, calcATR } from "@/lib/indicators";
 import { SECTOR_ETF } from "@/lib/sectors";
+import { toPriceBarRows, describeRejections } from "@/lib/price-bars";
 import { processWithBudget } from "@/lib/concurrency";
 import { STAGE_BUDGET_MS, dateStr, startOfUtcDay, universeWhere, type BatchStageResult, type StageOptions } from "./shared";
 
@@ -84,8 +85,27 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
     worklist,
     async (stock) => {
       try {
-        const { prices, errors: priceErrors } = await getDailyPrices(stock.ticker, from60);
+        const { prices, provider, errors: priceErrors } = await getDailyPrices(stock.ticker, from60);
         errors.push(...priceErrors);
+
+        // Persist the raw window before deriving anything from it. This is the same
+        // 60 days the indicators below consume and the stage has always thrown away;
+        // keeping it is what lets a fill model ask whether an order would have filled.
+        // Append-only (skipDuplicates on the composite PK), so re-runs are free and an
+        // already-stored bar is never rewritten — correcting one is the backfill
+        // script's job, since it needs to know which `source` wrote it.
+        if (prices.length > 0 && provider) {
+          const { rows, rejected } = toPriceBarRows(stock.id, prices, provider, todayUTC);
+          const dropped = describeRejections(rejected);
+          // A bar failing validation means the provider handed back something
+          // self-contradictory (mixed adjustment bases produce exactly this). Record
+          // it — it's a data-quality regression, not a per-ticker hiccup.
+          if (dropped) errors.push(`Price bars rejected for ${stock.ticker} (${provider}): ${dropped}`);
+          if (rows.length > 0) {
+            await db.priceBar.createMany({ data: rows, skipDuplicates: true });
+          }
+        }
+
         if (prices.length < 2) return; // insufficient data — attempted, skip gracefully
 
         const closes = prices.map((p) => p.close);

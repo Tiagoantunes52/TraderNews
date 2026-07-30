@@ -74,4 +74,104 @@ describe("getYahooDailyPrices", () => {
     mockFetch({}, 404);
     expect(await getYahooDailyPrices("NOPE", new Date())).toEqual([]);
   });
+
+  // Yahoo serves `adjclose` separately from the RAW `quote` open/high/low. Mixing the
+  // two bases is invisible over a 60-day indicator window but corrupts every bar
+  // before a corporate action, which is exactly the history a fill model reads.
+  describe("split/dividend adjustment", () => {
+    // Bar as Yahoo actually returns it: raw O/H/L/C plus a separately adjusted close.
+    function splitResponse(
+      raw: { open: number; high: number; low: number; close: number; volume: number },
+      adjClose: number,
+      currency = "USD"
+    ) {
+      return {
+        chart: {
+          result: [
+            {
+              timestamp: [1_717_200_000],
+              meta: { currency },
+              indicators: {
+                quote: [{ close: [raw.close], open: [raw.open], high: [raw.high], low: [raw.low], volume: [raw.volume] }],
+                adjclose: [{ adjclose: [adjClose] }],
+              },
+            },
+          ],
+        },
+      };
+    }
+
+    it("puts open/high/low on the adjusted close's basis across a 2:1 split", async () => {
+      // Raw session: 102 / 104 / 98 / 100. Post-split the close adjusts to 50, so
+      // every other leg must halve too.
+      mockFetch(splitResponse({ open: 102, high: 104, low: 98, close: 100, volume: 1000 }, 50));
+      const [bar] = await getYahooDailyPrices("AAPL", new Date());
+      expect(bar.close).toBeCloseTo(50, 5);
+      expect(bar.open).toBeCloseTo(51, 5);
+      expect(bar.high).toBeCloseTo(52, 5);
+      expect(bar.low).toBeCloseTo(49, 5);
+      // Price halves, share count doubles — Tiingo's adjVolume convention.
+      expect(bar.volume).toBeCloseTo(2000, 5);
+    });
+
+    it("keeps the bar internally consistent — low <= close <= high", async () => {
+      // The regression that matters. Unadjusted, this bar reports low 98 against a
+      // close of 50: a fabricated 96% gap that a stop model reads as a stop-out on
+      // every pre-split bar.
+      mockFetch(splitResponse({ open: 102, high: 104, low: 98, close: 100, volume: 1000 }, 50));
+      const [bar] = await getYahooDailyPrices("AAPL", new Date());
+      expect(bar.low).toBeLessThanOrEqual(bar.close);
+      expect(bar.high).toBeGreaterThanOrEqual(bar.close);
+    });
+
+    it("leaves an unadjusted bar untouched (ratio 1, no over-correction)", async () => {
+      mockFetch(splitResponse({ open: 102, high: 104, low: 98, close: 100, volume: 1000 }, 100));
+      const [bar] = await getYahooDailyPrices("AAPL", new Date());
+      expect(bar.open).toBeCloseTo(102, 5);
+      expect(bar.high).toBeCloseTo(104, 5);
+      expect(bar.low).toBeCloseTo(98, 5);
+      expect(bar.volume).toBeCloseTo(1000, 5);
+    });
+
+    it("applies a fractional dividend adjustment to every leg", async () => {
+      // adjClose 99 vs raw 100 → ratio 0.99.
+      mockFetch(splitResponse({ open: 102, high: 104, low: 98, close: 100, volume: 1000 }, 99));
+      const [bar] = await getYahooDailyPrices("AAPL", new Date());
+      expect(bar.open).toBeCloseTo(100.98, 5);
+      expect(bar.high).toBeCloseTo(102.96, 5);
+      expect(bar.low).toBeCloseTo(97.02, 5);
+    });
+
+    it("adjusts and converts pence together, in that order", async () => {
+      // GBp listing across a 2:1 split: ratio 0.5 then /100.
+      mockFetch(splitResponse({ open: 13300, high: 13400, low: 13100, close: 13200, volume: 500 }, 6600, "GBp"));
+      const [bar] = await getYahooDailyPrices("AZN.L", new Date());
+      expect(bar.close).toBeCloseTo(66, 5);
+      expect(bar.open).toBeCloseTo(66.5, 5);
+      expect(bar.high).toBeCloseTo(67, 5);
+      expect(bar.low).toBeCloseTo(65.5, 5);
+    });
+
+    it("falls back to the adjusted close when a leg is missing, without scaling it twice", async () => {
+      const body = {
+        chart: {
+          result: [
+            {
+              timestamp: [1_717_200_000],
+              meta: { currency: "USD" },
+              indicators: {
+                quote: [{ close: [100], open: [null], high: [null], low: [null], volume: [1000] }],
+                adjclose: [{ adjclose: [50] }],
+              },
+            },
+          ],
+        },
+      };
+      mockFetch(body);
+      const [bar] = await getYahooDailyPrices("AAPL", new Date());
+      expect(bar.open).toBeCloseTo(50, 5);
+      expect(bar.high).toBeCloseTo(50, 5);
+      expect(bar.low).toBeCloseTo(50, 5);
+    });
+  });
 });

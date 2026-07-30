@@ -423,21 +423,28 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
   // cap is scaled by regimeRiskOffGrossFrac — long-only books make most of their
   // drawdown in bear markets. Neutral (1) until enough SPY history exists for the
   // MA, and on any error: the filter only ever tightens on an OBSERVED downtrend.
+  //
+  // Reads PriceBar, not QuantAnalysis. QuantAnalysis only holds closes from the day the
+  // app first ran, so the `closes.length >= regimeMaWindow` guard below was never once
+  // satisfied in production: 200 required against ~52 available, meaning regimeMult has
+  // been pinned at 1 and this filter has never fired since it shipped. PriceBar carries
+  // backfilled history that predates the app, so the guard starts being a real test of
+  // the regime rather than a test of how long the app has been running.
   let regimeMult = 1;
   if (riskLimitsOn && limits.regimeMaWindow > 0) {
     try {
       const spy = await db.stock.findUnique({ where: { ticker: "SPY" }, select: { id: true } });
       const closes = spy
-        ? await db.quantAnalysis.findMany({
-            where: { stockId: spy.id, price: { not: null } },
+        ? await db.priceBar.findMany({
+            where: { stockId: spy.id },
             orderBy: { date: "desc" },
             take: limits.regimeMaWindow,
-            select: { price: true },
+            select: { close: true },
           })
         : [];
       if (closes.length >= limits.regimeMaWindow) {
-        const ma = closes.reduce((s, r) => s + r.price!, 0) / closes.length;
-        regimeMult = regimeMultiplier(closes[0].price, ma, limits.regimeRiskOffGrossFrac);
+        const ma = closes.reduce((s, r) => s + r.close, 0) / closes.length;
+        regimeMult = regimeMultiplier(closes[0].close, ma, limits.regimeRiskOffGrossFrac);
       }
     } catch (e) {
       errors.push(`Regime filter failed (treated as risk-on): ${String(e)}`);
@@ -446,6 +453,14 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
 
   // Correlation clusters across the watchlist (crypto = one bucket) so the cluster
   // cap limits *correlated* exposure, not just per-ticker. Built from recent closes.
+  //
+  // Still reads QuantAnalysis, deliberately. Unlike the regime MA above, this works
+  // today — 45 days is inside what the app has recorded — so pointing it at PriceBar
+  // before the backfill has run would break a functioning risk control against an
+  // empty table. Moving it is also not a like-for-like swap: PriceBar's depth invites
+  // a longer lookback than 45 days, which changes which names cluster together and so
+  // changes the caps themselves. That belongs in its own change, measured, once bars
+  // are in place.
   let clusterByTicker = new Map<string, string>();
   if (riskLimitsOn && stockIds.length > 0) {
     try {
