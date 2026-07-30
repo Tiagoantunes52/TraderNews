@@ -70,8 +70,10 @@ export type DayInput = {
 };
 
 export type DisagreementKind =
-  /** No run log at all — the paper stage did not complete on this day. */
+  /** No run log on a day that WAS a trading session — the paper stage did not complete. */
   | "NO_RUN_LOG"
+  /** No bar is dated this day, so no paper run was expected. Not a fault. */
+  | "NOT_A_SESSION"
   /** The run log predates pricing provenance, so how it was priced is unknowable. */
   | "PRICING_UNDECLARED"
   /** Quant rows on this day with no `sessionDate` — which session they describe is unknown. */
@@ -157,6 +159,17 @@ export function explainDay(input: DayInput): DayExplanation {
   const d: Disagreement[] = [];
   const { day, run, quant, bars, opened, closed, orders } = input;
 
+  const barsByStock = new Map<string, BarRow[]>();
+  for (const b of bars) {
+    const list = barsByStock.get(b.stockId);
+    if (list) list.push(b);
+    else barsByStock.set(b.stockId, [b]);
+  }
+  // A bar dated `day` is the evidence that `day` was a trading session. It is absent for
+  // weekends and holidays, and also for the session in progress — bars are written a day
+  // in arrears by design (see PriceBar's IN_PROGRESS rule).
+  const dayIsSession = bars.some((b) => b.date === day);
+
   // ── Session alignment ──────────────────────────────────────────────────────
   const declaredCounts = new Map<string, number>();
   let undeclared = 0;
@@ -167,15 +180,24 @@ export function explainDay(input: DayInput): DayExplanation {
   const declared = [...declaredCounts.entries()]
     .map(([date, rows]) => ({ date, rows }))
     .sort((a, b) => b.rows - a.rows || a.date.localeCompare(b.date));
+  /** The session the run as a whole read — ~100 names agreeing, so far stronger than any row. */
+  const consensusSession: string | null = declared[0]?.date ?? null;
 
-  if (undeclared > 0) {
+  // Only rows that COULD have declared a session are worth a finding. Crypto and
+  // European listings have no bars to resolve against, so their nulls are permanent and
+  // expected — reporting them would put a warning on every single day forever, and an
+  // alarm that always fires is one nobody reads.
+  const coveredUndeclared = quant.filter(
+    (q) => !q.sessionDate && barsByStock.has(q.stockId)
+  ).length;
+  if (coveredUndeclared > 0) {
     d.push({
       kind: "SESSION_UNDECLARED",
-      // Warn, not fail: crypto and European listings have no bars to resolve against, so
-      // some nulls are permanent and expected. A jump in the count is the signal.
       severity: "warn",
       subject: day,
-      detail: `${undeclared} of ${quant.length} quant rows do not declare a session. Their price cannot be aligned to a bar; treat them as unknown, not as same-day.`,
+      detail: `${coveredUndeclared} quant row(s) have bar coverage but declare no session, so their price cannot be aligned. Treat as unknown, never as same-day. (${
+        undeclared - coveredUndeclared
+      } further row(s) have no bars at all — crypto and non-US listings, permanently unresolvable and not counted here.)`,
     });
   }
   if (declared.length > 1) {
@@ -190,13 +212,6 @@ export function explainDay(input: DayInput): DayExplanation {
   }
 
   // ── Link 1: quant row vs the bar it claims ─────────────────────────────────
-  const barsByStock = new Map<string, BarRow[]>();
-  for (const b of bars) {
-    const list = barsByStock.get(b.stockId);
-    if (list) list.push(b);
-    else barsByStock.set(b.stockId, [b]);
-  }
-
   const quantByStock = new Map<string, QuantRow>();
   for (const q of quant) {
     quantByStock.set(q.stockId, q);
@@ -210,7 +225,18 @@ export function explainDay(input: DayInput): DayExplanation {
     // Does some OTHER session in the window explain the price? That is the specific
     // failure this whole exercise exists to catch, so name it rather than reporting a
     // generic mismatch the reader then has to diagnose.
-    const elsewhere = stockBars.find((b) => b.date !== q.sessionDate && near(q.price!, b.close));
+    //
+    // But only for a row that dissents from the run's consensus. A row carrying the
+    // consensus session got that label from the RUN, not from its own price, so "some
+    // other day's bar matches better" cannot mean the label is wrong. It happens
+    // constantly on dividend payers: a ~1% adjustment-basis offset on a name that moves
+    // ~1% a day lands on a neighbouring session's close by coincidence, and PFE and PG
+    // were reported as wrong-session on four separate days before this rule existed.
+    // Their real story is the basis, which is what QUANT_OFF_BAR below says.
+    const dissents = consensusSession != null && q.sessionDate !== consensusSession;
+    const elsewhere = dissents
+      ? stockBars.find((b) => b.date !== q.sessionDate && near(q.price!, b.close))
+      : undefined;
     if (elsewhere) {
       d.push({
         kind: "QUANT_WRONG_SESSION",
@@ -236,12 +262,19 @@ export function explainDay(input: DayInput): DayExplanation {
   const priced = { live: 0, close: 0, unknown: 0 };
   const decisions: DecisionRecord[] = run?.decisions ?? [];
 
-  if (!run) {
+  if (!run && !dayIsSession) {
+    d.push({
+      kind: "NOT_A_SESSION",
+      severity: "info",
+      subject: day,
+      detail: `no bar is dated ${day}, so it was a weekend or holiday and no paper run was due. (Also reported for the session in progress — its bar is not written until the next run.)`,
+    });
+  } else if (!run) {
     d.push({
       kind: "NO_RUN_LOG",
       severity: "fail",
       subject: day,
-      detail: `no paperRun recorded for ${day}. Either the paper stage never completed or the day was not a trading day.`,
+      detail: `${day} was a trading session — a bar is stored for it — and no paperRun was recorded. The paper stage did not complete.`,
     });
   } else if (!run.pricing) {
     d.push({
@@ -406,7 +439,9 @@ export function formatDayExplanation(x: DayExplanation): string {
   L.push(
     x.pricing
       ? `pricing    liveQuotes=${x.pricing.enabled} marketOpen=${x.pricing.marketOpen} → ${x.pricing.livePriced}/${x.pricing.totalPriced} names on the live tape`
-      : `pricing    UNDECLARED — this run predates pricing provenance`
+      : x.ranAt
+        ? `pricing    UNDECLARED — this run predates pricing provenance`
+        : `pricing    — no run to price —`
   );
 
   L.push(

@@ -47,7 +47,11 @@ function input(over: Partial<DayInput> = {}): DayInput {
     run: runLog(),
     reviewStatus: "OK",
     quant: [{ stockId: "s1", ticker: "AAPL", price: 200, sessionDate: SESSION }],
-    bars: [{ stockId: "s1", date: SESSION, close: 200 }],
+    // A bar dated DAY is what marks DAY as a trading session.
+    bars: [
+      { stockId: "s1", date: SESSION, close: 200 },
+      { stockId: "s1", date: DAY, close: 201 },
+    ],
     opened: [],
     closed: [],
     orders: [],
@@ -65,14 +69,21 @@ describe("explainDay() — session alignment", () => {
     expect(x.disagreements).toEqual([]);
   });
 
-  it("flags rows that declare no session instead of assuming the run day", () => {
-    const x = explainDay(
-      input({ quant: [{ stockId: "s1", ticker: "BTC-USD", price: 200, sessionDate: null }] })
-    );
-    expect(x.session.undeclared).toBe(1);
-    expect(kinds(input({ quant: [{ stockId: "s1", ticker: "BTC-USD", price: 200, sessionDate: null }] }))).toContain(
-      "SESSION_UNDECLARED"
-    );
+  it("flags a row that has bars but declares no session", () => {
+    const i = input({ quant: [{ stockId: "s1", ticker: "AAPL", price: 200, sessionDate: null }] });
+    expect(explainDay(i).session.undeclared).toBe(1);
+    expect(kinds(i)).toContain("SESSION_UNDECLARED");
+  });
+
+  it("stays quiet about names that CANNOT declare a session — otherwise it warns forever", () => {
+    const i = input({
+      quant: [
+        { stockId: "s1", ticker: "AAPL", price: 200, sessionDate: SESSION },
+        { stockId: "s9", ticker: "BTC-USD", price: 60000, sessionDate: null },
+      ],
+    });
+    expect(explainDay(i).session.undeclared).toBe(1);
+    expect(kinds(i)).not.toContain("SESSION_UNDECLARED");
   });
 
   it("flags a run whose rows disagree about which session they read", () => {
@@ -94,21 +105,46 @@ describe("explainDay() — session alignment", () => {
 });
 
 describe("explainDay() — bar vs stored close", () => {
-  it("names the session a price actually belongs to when the label is wrong", () => {
+  it("names the session a price belongs to when a row dissents from the run's consensus", () => {
     const x = explainDay(
       input({
-        quant: [{ stockId: "s1", ticker: "AAPL", price: 195, sessionDate: SESSION }],
-        bars: [
-          { stockId: "s1", date: "2026-07-27", close: 195 },
-          { stockId: "s1", date: SESSION, close: 200 },
+        quant: [
+          // The consensus: two names agree the run read SESSION.
+          { stockId: "s1", ticker: "AAPL", price: 200, sessionDate: SESSION },
+          { stockId: "s2", ticker: "MSFT", price: 300, sessionDate: SESSION },
+          // The dissenter, and its price backs the dissent up.
+          { stockId: "s3", ticker: "NVDA", price: 195, sessionDate: "2026-07-27" },
         ],
-        // The decision followed the (wrong-session) stored close, so only the label is at fault.
-        run: runLog({ decisions: [decision({ inputs: { ...decision().inputs, price: 195 } })] }),
+        bars: [
+          { stockId: "s1", date: SESSION, close: 200 },
+          { stockId: "s1", date: DAY, close: 201 },
+          { stockId: "s2", date: SESSION, close: 300 },
+          { stockId: "s3", date: "2026-07-24", close: 195 },
+          { stockId: "s3", date: "2026-07-27", close: 210 },
+        ],
       })
     );
     const g = x.disagreements.find((d) => d.kind === "QUANT_WRONG_SESSION");
     expect(g?.severity).toBe("fail");
-    expect(g?.detail).toContain("2026-07-27");
+    expect(g?.subject).toBe("NVDA");
+    expect(g?.detail).toContain("2026-07-24");
+  });
+
+  it("does not call a consensus row wrong-session — a dividend basis is not a bad label", () => {
+    // PFE's stored close sits ~1.7% off the adjusted bar and lands on a neighbouring
+    // session's close by coincidence. The label came from the run, so it is not at fault.
+    const x = explainDay(
+      input({
+        quant: [{ stockId: "s1", ticker: "PFE", price: 24.75, sessionDate: SESSION }],
+        bars: [
+          { stockId: "s1", date: "2026-07-24", close: 24.7477 },
+          { stockId: "s1", date: SESSION, close: 24.33 },
+          { stockId: "s1", date: DAY, close: 24.4 },
+        ],
+      })
+    );
+    expect(x.disagreements.map((g) => g.kind)).not.toContain("QUANT_WRONG_SESSION");
+    expect(x.disagreements.find((g) => g.kind === "QUANT_OFF_BAR")?.detail).toContain("1.017");
   });
 
   it("reports an unexplained ratio rather than silently accepting it", () => {
@@ -235,8 +271,15 @@ describe("explainDay() — provenance and orders", () => {
     expect(x.disagreements.find((d) => d.kind === "PRICING_UNDECLARED")?.detail).toContain("Absent does NOT mean");
   });
 
-  it("fails when there is no run log at all", () => {
+  it("fails when a trading session produced no run log", () => {
     expect(kinds(input({ run: null }))).toContain("NO_RUN_LOG");
+  });
+
+  it("does not fail a weekend — no bar for the day means no run was due", () => {
+    const weekend = input({ run: null, bars: [{ stockId: "s1", date: SESSION, close: 200 }] });
+    expect(kinds(weekend)).toContain("NOT_A_SESSION");
+    expect(kinds(weekend)).not.toContain("NO_RUN_LOG");
+    expect(explainDay(weekend).disagreements.every((g) => g.severity === "info")).toBe(true);
   });
 
   it("surfaces an order still working with no fill, but not a terminal one", () => {
