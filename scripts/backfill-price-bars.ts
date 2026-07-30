@@ -196,56 +196,126 @@ async function backfill(args: Args) {
 /**
  * Cross-check backfilled bars against the closes the app recorded live.
  *
- * PriceBar and QuantAnalysis.price come from the same adapters, so on any overlapping
- * day they should agree to within floating-point noise. They legitimately diverge when
- * a corporate action landed AFTER the QuantAnalysis row was written: the stored close
- * is unadjusted-as-of-then, the backfilled bar is adjusted-as-of-now. So a handful of
- * mismatches concentrated on split names is expected and fine.
+ * PriceBar and QuantAnalysis.price come from the same adapters, so where they describe
+ * the same session they should agree to floating-point noise. The check is which
+ * SESSION a QuantAnalysis row describes, and the answer is not the one its own date
+ * suggests.
  *
- * What is NOT fine is broad disagreement across names with no corporate action — that
- * means the backfill pulled a different series than the app has been trading against,
- * and every conclusion drawn from these bars would be about the wrong asset. This is
- * the only end-to-end validation available, and it is cheap.
+ * The quant stage stamps `date` with now() and stores the last close in the window it
+ * fetched. It runs off the 3-hourly pipeline cron, and the per-day dedup means the
+ * first invocation after UTC midnight does the work — observed at ~02:15-02:50 UTC.
+ * At that hour the most recent completed session is the PREVIOUS day's. So a
+ * QuantAnalysis row dated D almost always carries the close of session D-1, and a
+ * naive same-day comparison is misaligned by one session by construction (it reported
+ * 82% disagreement on a corpus that turned out to match to the cent).
+ *
+ * Rather than hard-code the offset, score each row against both the same-day bar and
+ * the previous session's and report which matched. That keeps working if the schedule
+ * moves — and the offset distribution is itself worth seeing, because everything
+ * downstream that treats QuantAnalysis.date as the observation date inherits it.
+ *
+ * Rows matching NEITHER are the real signal. A few are expected where a corporate
+ * action landed after the QuantAnalysis row was written: the stored close is
+ * unadjusted-as-of-then, the backfilled bar is adjusted-as-of-now. Broad disagreement
+ * would mean the backfill pulled a different series than the app has been trading
+ * against, and every conclusion drawn from these bars would be about the wrong asset.
  */
 async function verify(args: Args) {
   const stocks = await loadStocks(args);
-  const byId = new Map(stocks.map((s) => [s.id, s.ticker]));
   const TOLERANCE = 0.005; // 0.5% — absorbs rounding, catches a wrong series
 
   let compared = 0;
-  let mismatched = 0;
-  const worst: { ticker: string; date: string; bar: number; quant: number; diff: number }[] = [];
+  let sameDay = 0;
+  let prevSession = 0;
+  const unexplained: { ticker: string; date: string; bar: number | null; prev: number | null; quant: number; diff: number }[] = [];
 
   for (const stock of stocks) {
     const [bars, quants] = await Promise.all([
-      prisma.priceBar.findMany({ where: { stockId: stock.id }, select: { date: true, close: true } }),
+      prisma.priceBar.findMany({ where: { stockId: stock.id }, orderBy: { date: "asc" }, select: { date: true, close: true } }),
       prisma.quantAnalysis.findMany({
         where: { stockId: stock.id, price: { not: null } },
         select: { date: true, price: true },
       }),
     ]);
-    const barByDay = new Map(bars.map((b) => [b.date.toISOString().slice(0, 10), b.close]));
+    if (bars.length === 0) continue;
+    const days = bars.map((b) => b.date.toISOString().slice(0, 10));
+    const indexByDay = new Map(days.map((d, i) => [d, i]));
 
     for (const q of quants) {
+      if (q.price == null || q.price <= 0) continue;
       const day = q.date.toISOString().slice(0, 10);
-      const barClose = barByDay.get(day);
-      if (barClose == null || q.price == null || q.price <= 0) continue;
+
+      // Same-day bar if the session exists, plus whatever session preceded that day.
+      const sameIdx = indexByDay.get(day);
+      let prevIdx: number | null = null;
+      if (sameIdx != null) prevIdx = sameIdx > 0 ? sameIdx - 1 : null;
+      else {
+        // No bar on that calendar day (weekend/holiday stamp): walk back to the last
+        // session strictly before it.
+        let lo = 0;
+        let hi = days.length - 1;
+        let found = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (days[mid] < day) {
+            found = mid;
+            lo = mid + 1;
+          } else hi = mid - 1;
+        }
+        prevIdx = found >= 0 ? found : null;
+      }
+      const sameClose = sameIdx != null ? bars[sameIdx].close : null;
+      const prevClose = prevIdx != null ? bars[prevIdx].close : null;
+      if (sameClose == null && prevClose == null) continue;
+
       compared++;
-      const diff = Math.abs(barClose - q.price) / q.price;
-      if (diff > TOLERANCE) {
-        mismatched++;
-        worst.push({ ticker: stock.ticker, date: day, bar: barClose, quant: q.price, diff });
+      const dSame = sameClose != null ? Math.abs(sameClose - q.price) / q.price : Infinity;
+      const dPrev = prevClose != null ? Math.abs(prevClose - q.price) / q.price : Infinity;
+
+      if (dPrev <= TOLERANCE) prevSession++;
+      else if (dSame <= TOLERANCE) sameDay++;
+      else {
+        unexplained.push({
+          ticker: stock.ticker,
+          date: day,
+          bar: sameClose,
+          prev: prevClose,
+          quant: q.price,
+          diff: Math.min(dSame, dPrev),
+        });
       }
     }
   }
 
-  const pct = compared > 0 ? (mismatched / compared) * 100 : 0;
-  console.log(`Compared ${compared} overlapping days across ${byId.size} tickers.`);
-  console.log(`${mismatched} mismatched beyond ${(TOLERANCE * 100).toFixed(1)}% (${pct.toFixed(2)}%).`);
+  const bad = unexplained.length;
+  const pct = compared > 0 ? (bad / compared) * 100 : 0;
+  console.log(`Compared ${compared} QuantAnalysis rows against bars across ${stocks.length} tickers.`);
+  console.log(`  matched the PREVIOUS session's close: ${prevSession} (${((prevSession / Math.max(compared, 1)) * 100).toFixed(1)}%)`);
+  console.log(`  matched the SAME day's close:         ${sameDay} (${((sameDay / Math.max(compared, 1)) * 100).toFixed(1)}%)`);
+  console.log(`  matched neither beyond ${(TOLERANCE * 100).toFixed(1)}%:        ${bad} (${pct.toFixed(2)}%)`);
 
-  worst.sort((a, b) => b.diff - a.diff);
-  for (const w of worst.slice(0, 20)) {
-    console.log(`  ${w.ticker.padEnd(6)} ${w.date}  bar=${w.bar.toFixed(2)}  quant=${w.quant.toFixed(2)}  ${(w.diff * 100).toFixed(1)}%`);
+  // Rolled up per ticker, because concentration is the whole diagnosis: a corporate
+  // action hits one name on every day of its history (and at a near-constant ratio),
+  // while a genuinely wrong series is spread thin across many names.
+  if (unexplained.length > 0) {
+    const byTicker = new Map<string, { n: number; ratios: number[] }>();
+    for (const u of unexplained) {
+      const entry = byTicker.get(u.ticker) ?? { n: 0, ratios: [] };
+      entry.n++;
+      const ref = u.prev ?? u.bar;
+      if (ref != null && ref > 0) entry.ratios.push(u.quant / ref);
+      byTicker.set(u.ticker, entry);
+    }
+    console.log(`\nUnexplained rows by ticker (${byTicker.size} name(s)):`);
+    for (const [ticker, e] of [...byTicker].sort((a, b) => b[1].n - a[1].n)) {
+      const sorted = [...e.ratios].sort((a, b) => a - b);
+      const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : NaN;
+      // A tight ratio across many days is a corporate action; a scattered one is not.
+      const spread = sorted.length > 1 ? sorted[sorted.length - 1] - sorted[0] : 0;
+      console.log(
+        `  ${ticker.padEnd(6)} ${String(e.n).padStart(4)} rows  quant/bar median ${median.toFixed(3)}  spread ${spread.toFixed(3)}`
+      );
+    }
   }
 
   if (compared === 0) {

@@ -6,6 +6,7 @@ import {
   auditOpenPositions,
   auditEntries,
   auditRiskBlocks,
+  auditRunProvenance,
   auditTrackingError,
   reconcileBroker,
   auditHealth,
@@ -372,6 +373,47 @@ describe("auditEntries", () => {
 
   it("accepts a well-formed entry", () => {
     expect(auditEntries([position({ status: "OPEN" })], cfg)).toEqual([]);
+  });
+});
+
+describe("auditRunProvenance", () => {
+  const withPricing = (pricing: PaperRunLog["pricing"]): PaperRunLog => ({ ...runLog([]), pricing });
+
+  // The regression this whole audit exists for: `flags.liveQuotes` was declared,
+  // documented and consumed but never written, and being optional its absence read as
+  // "off" rather than "unknown". A run that can't say how it was priced must say so.
+  it("warns when the run recorded no pricing provenance at all", () => {
+    const f = auditRunProvenance(runLog([]));
+    expect(f).toHaveLength(1);
+    expect(f[0].code).toBe("RUN_PROVENANCE_MISSING");
+    expect(f[0].severity).toBe("warn");
+  });
+
+  it("reports a fully live-priced run as info", () => {
+    const f = auditRunProvenance(withPricing({ enabled: true, marketOpen: true, livePriced: 12, totalPriced: 12 }));
+    expect(f[0].code).toBe("RUN_PRICING");
+    expect(f[0].severity).toBe("info");
+    expect(f[0].title).toContain("12/12");
+    expect(f[0].detail).toContain("live tape");
+  });
+
+  // The case that actually bites: a partial overlay silently mixes two SESSIONS,
+  // because a stored close is the previous session's.
+  it("calls out a mixed run and points at the per-decision field", () => {
+    const f = auditRunProvenance(withPricing({ enabled: true, marketOpen: true, livePriced: 9, totalPriced: 12 }));
+    expect(f[0].detail).toContain("3 name(s) fell back");
+    expect(f[0].detail).toContain("priceSource");
+  });
+
+  it("reports an all-close run without implying it was live", () => {
+    const f = auditRunProvenance(withPricing({ enabled: true, marketOpen: false, livePriced: 0, totalPriced: 12 }));
+    expect(f[0].detail).toContain("market closed");
+    expect(f[0].detail).toContain("stored close");
+  });
+
+  it("distinguishes disabled from enabled-but-closed", () => {
+    const f = auditRunProvenance(withPricing({ enabled: false, marketOpen: false, livePriced: 0, totalPriced: 12 }));
+    expect(f[0].detail).toContain("Live quotes disabled");
   });
 });
 

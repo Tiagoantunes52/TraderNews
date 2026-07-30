@@ -10,6 +10,30 @@ at `~/projects/TraderNews-Vault`). Delete the whole file when it's empty.
 
 Line numbers are hints — trust the symbol names, they rot slower.
 
+## This file checks itself
+
+Several claims below are empirical — "there is no `tradingConfig` row", "verified zero
+occurrences in prod", "13 labelled exits". Each is really a query someone ran once, and
+prose cannot notice when it stops being true. So they are also written as assertions in
+`src/lib/findings-register.ts`, re-run by the daily review, and a broken one becomes a
+**`REGISTER_STALE`** finding naming the bullet to edit.
+
+Claims that are checked carry an `<!-- check: <id> -->` marker naming their assertion.
+**Staleness is not failure** — most of these expire by being *fixed*, and the finding is
+the prompt to delete the bullet. If you edit a marked claim, edit its assertion in the
+same commit; if you delete the bullet, delete the assertion. An assertion with no bullet
+is worse than neither, because it reports on a document that no longer says it.
+
+Claims about *code* rather than data are deliberately not encoded — "exits fire on
+NEUTRAL" would be a second, worse copy of `paper-trading.ts`.
+
+Counts quoted in the bullets are **as of the review date in the header** and are not
+maintained. The live numbers ride on the daily review's `REGISTER_CHECKED` finding; a
+bullet's number is there to show what the judgement was made on, not what is true today.
+
+*First run, 2026-07-30: two claims had already expired* — the pipeline-lease migration
+was applied, and the `_RM` entry freeze had drained. Both are corrected below.
+
 ---
 
 ## The one-sentence verdict
@@ -62,9 +86,10 @@ it cannot establish is *executable* performance — and only the latter is evide
   that fails loudly and names the offending rows rather than letting `CREATE INDEX`
   raise something opaque.
 
-  **The migration is written but NOT applied** — `20260727190000_add_pipeline_lease`.
-  Its precheck was validated read-only against prod (no duplicate OPEN rows as of
-  2026-07-27), but applying it is a deploy decision.
+  **Applied 2026-07-30.** `20260727190000_add_pipeline_lease` is recorded finished in
+  prod; its precheck (no duplicate OPEN rows) passed on the real data. The register said
+  "written but NOT applied" for three days after it stopped being true — which is the
+  reason the self-check below exists.
 
 - **Entry buffer widened 0.5% → 2%, with the risk coupling fixed.** The buffer is a
   filter on gap direction, so tightness is what selects against winners. But widening it
@@ -77,6 +102,7 @@ it cannot establish is *executable* performance — and only the latter is evide
   the daily stage never cancel/replaces over rounding. Gap distribution behind the
   number (close-to-close, an upper bound since a GTC order rests all day): 40.6% of
   stock-days close >0.5% up, 19.6% >2%, 4.4% >5%.
+  <!-- check: reanchor-cancels-first -->
   **Correction (2026-07-29): the re-anchor shipped inert and never once executed.** The
   stage submitted the replacement stop without cancelling the one it replaces, and
   Alpaca holds the position's shares against a resting sell order — so every re-place
@@ -173,6 +199,7 @@ listed so they are not silently forgotten.
   (`trading-config.ts:127`) accepts any finite number, while DB-sourced overrides get
   range-checked and dropped on violation. A typo in an env var silently installs a
   nonsensical risk parameter.
+<!-- check: unmanaged-positions-latent -->
 - **Missing-fresh-estimate positions go unmanaged.** The paper stage loads only
   estimates dated today and only open positions for those stock ids, so a name without
   a fresh estimate is neither marked nor exited. Verified **zero occurrences in prod**
@@ -183,6 +210,7 @@ listed so they are not silently forgotten.
 
 ## Strategy thread (predates the execution review)
 
+<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few --> <!-- check: entry-score-too-few -->
 - **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
   are at code defaults, and that is currently correct. `exitReason` only began
   persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
@@ -193,11 +221,14 @@ listed so they are not silently forgotten.
   55–62% (good), payoff 0.54–0.66, losses ~1.6× winners. Classic cut-winners-short
   signature, consistent across three independent books. Cannot be attributed to a
   specific exit rung until `exitReason` accumulates.
-- **The 15-session entry freeze.** `SENTIMENT_RM` and `COMBINED_RM` took zero entries
-  2026-07-01 → 07-24; 100% of intended entries vetoed. Cause: `maxPositions: 12`
-  evaluated against the *run-start* position count, with books seeded at 83/94 names
-  before the limits were switched on. Self-resolving as they drain, and the ranking
-  change lets same-day exits free slots for same-day entries.
+<!-- check: entry-freeze-drained -->
+- **The 15-session entry freeze — drained, now watched.** `SENTIMENT_RM` and
+  `COMBINED_RM` took zero entries 2026-07-01 → 07-24; 100% of intended entries vetoed.
+  Cause: `maxPositions: 12` evaluated against the *run-start* position count, with books
+  seeded at 83/94 names before the limits were switched on. It resolved as predicted —
+  34 `_RM` entries in the 30 days to 2026-07-30. The assertion is kept but **inverted**:
+  it now fires if the books stop taking entries again, because a book that only ever
+  shrinks looks healthy from every other angle.
 
 ---
 

@@ -152,6 +152,16 @@ model QuantAnalysis {
   relativeStrSector7d Float?
   score               Float
   date                DateTime  @default(now())
+  // The trading session these numbers actually describe, as opposed to `date`, which is
+  // the wall clock when the row was written. The two are routinely a day apart: the
+  // stage runs ~02:15-02:50 UTC, so the last completed bar it can fetch belongs to the
+  // previous session. Every "the price doesn't match" round-trip so far has been this
+  // offset being re-derived from scratch and re-derived wrong. Nullable because rows
+  // predating this column are backfilled from evidence — matching the stored close
+  // against PriceBar, then promoting per-run agreement across ~100 names — which cannot
+  // resolve a name with no bars (crypto, European listings, whose calendars differ
+  // anyway). A null means "unknown", never "same as date"; consumers must treat it so.
+  sessionDate         DateTime?
   createdAt           DateTime  @default(now())
 
   @@index([stockId, date])

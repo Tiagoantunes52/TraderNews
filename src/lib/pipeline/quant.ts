@@ -5,7 +5,7 @@ import { isEtf } from "@/lib/etf";
 import { getDailyPrices } from "@/lib/price-sources";
 import { calcSMA, calcRSI, calcVolatility, calcMomentum, calcVolumeRatio, calcQuantScore, calcMACD, calcBollingerBands, calcATR } from "@/lib/indicators";
 import { SECTOR_ETF } from "@/lib/sectors";
-import { toPriceBarRows, describeRejections } from "@/lib/price-bars";
+import { toPriceBarRows, describeRejections, barDate } from "@/lib/price-bars";
 import { processWithBudget } from "@/lib/concurrency";
 import { STAGE_BUDGET_MS, dateStr, startOfUtcDay, universeWhere, type BatchStageResult, type StageOptions } from "./shared";
 
@@ -116,6 +116,14 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
 
         const price = closes[closes.length - 1];
         const open = prices[prices.length - 1].open;
+        // Which session these numbers describe. `date` below defaults to now(), and this
+        // stage runs ~02:20 UTC, so the newest completed bar is almost always yesterday's
+        // — recording it here means nothing downstream ever has to infer the offset.
+        // Deliberately the bar `price` came from, even on the rare off-schedule run where
+        // that bar is today's still-open session: the PriceBar write above skips such a
+        // bar, so sessionDate pointing at a session with no stored bar is the truth
+        // ("this row is priced off an unfinished session"), not a mismatch to paper over.
+        const sessionDate = barDate(prices[prices.length - 1].date);
         const change1d = calcMomentum(closes, 1);
         const change7d = calcMomentum(closes, 7);
         const change30d = calcMomentum(closes, 30);
@@ -154,7 +162,7 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
         const score = calcQuantScore({ rsi14, change7d, sma20, price, volatility30d, volumeRatio10d, isCrypto, macdHistogram, relativeStr7d, bollingerPctB });
 
         await db.quantAnalysis.create({
-          data: { stockId: stock.id, price, open, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
+          data: { stockId: stock.id, price, open, sessionDate, change1d, change7d, change30d, rsi14, sma20, sma50, volatility30d, volumeRatio10d, macdHistogram, priceVs60dHigh, priceVs60dLow, relativeStr7d, bollingerWidth, bollingerPctB, atr14, atrPct, nextEarningsDate, daysToEarnings, relativeStrSector7d, score },
         });
 
         created++;

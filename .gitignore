@@ -52,3 +52,6 @@ AGENTS.md
 # Playwright test artifacts
 /playwright-report
 /test-results
+
+# Claude Code local state (agent worktrees, session settings)
+.claude/

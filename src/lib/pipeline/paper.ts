@@ -296,10 +296,16 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
   // counts. Per-stock fallback: a name the feed didn't return keeps its stored close, so
   // a partial response degrades name-by-name instead of splitting the run between two
   // pricing regimes.
-  let livePricedCount = 0;
-  if (isLiveQuotesEnabled() && isMarketDataConfigured() && estimates.length > 0) {
+  // WHICH stocks, not how many: the overlay is per-stock and partial, so a count alone
+  // can't tell a later reader which side of the mix any single decision sat on. Each
+  // DecisionRecord carries its own `priceSource` derived from this set.
+  const livePricedStockIds = new Set<string>();
+  const liveQuotesEnabled = isLiveQuotesEnabled() && isMarketDataConfigured();
+  let marketOpenAtRun = false;
+  if (liveQuotesEnabled && estimates.length > 0) {
     try {
       const open = isPaperTradingConfigured() ? (await getClock()).isOpen : false;
+      marketOpenAtRun = open;
       if (open) {
         const tickerByStockId = new Map(estimates.map((e) => [e.stockId, e.stock.ticker]));
         const { prices: live, errors: quoteErrors } = await getLatestTrades([...tickerByStockId.values()]);
@@ -308,7 +314,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           const p = live.get(ticker);
           if (p != null && priceByStock.has(stockId)) {
             priceByStock.set(stockId, p);
-            livePricedCount++;
+            livePricedStockIds.add(stockId);
           }
         }
       }
@@ -608,6 +614,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           runsSinceEntry,
           isNewRun,
           open: openState,
+          priceSource: livePricedStockIds.has(est.stockId) ? "LIVE_TRADE" : "CLOSE",
         },
         action:
           action.type === "OPEN"
@@ -1546,11 +1553,21 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
       version: 1,
       ranAt: to.toISOString(),
       flags: {
+        liveQuotes: livePricedStockIds.size > 0,
         riskBooks: riskEnabled,
         riskLimits: riskLimitsOn,
         brokerStops: isBrokerStopsEnabled() && riskEnabled,
         insiderBook: isInsiderBookEnabled(),
         nearClose: isTradeNearCloseEnabled(),
+      },
+      // How this run was priced. The boolean above only says "at least one name"; these
+      // are the numbers that make two days comparable, and their absence is itself a
+      // review finding (see auditRunProvenance).
+      pricing: {
+        enabled: liveQuotesEnabled,
+        marketOpen: marketOpenAtRun,
+        livePriced: livePricedStockIds.size,
+        totalPriced: priceByStock.size,
       },
       cfg,
       decisions,
