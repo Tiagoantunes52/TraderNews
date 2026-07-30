@@ -6,6 +6,7 @@ import {
   auditOpenPositions,
   auditEntries,
   auditRiskBlocks,
+  auditRunProvenance,
   auditTrackingError,
   reconcileBroker,
   auditHealth,
@@ -171,6 +172,9 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       // Separate from the replay: the replay asks "did the rules produce the right
       // decision?", this asks "was the decision allowed to happen at all?".
       findings.push(...auditRiskBlocks(runLog.decisions, limits));
+      // What the run says about itself. Separate again: the two above ask whether the
+      // decisions were right, this asks whether they are even comparable to yesterday's.
+      findings.push(...auditRunProvenance(runLog));
       replayed = runLog.decisions.length;
       for (const err of runLog.errors ?? []) notes.push(`paper: ${err}`);
     } catch (e) {

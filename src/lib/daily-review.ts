@@ -79,7 +79,24 @@ export type DecisionInputs = {
   runsSinceEntry: number;
   isNewRun: boolean;
   open: OpenState | null;
+  /**
+   * WHERE `price` came from. The live-quote overlay is per-stock and partial — a name
+   * the feed skipped keeps its stored close — so a run is routinely a mix of both, and
+   * a run-level flag cannot tell you which side of it any single decision sat on.
+   *
+   * Note the two are not even the same session: the stored close is the PREVIOUS
+   * session's (the quant stage runs ~02:30 UTC and stamps `date` with now()), while a
+   * live trade is from the session in progress. Comparing a CLOSE-priced decision with
+   * a LIVE_TRADE-priced one is therefore comparing different days.
+   *
+   * Optional only because logs written before this existed genuinely lack it —
+   * `auditRunProvenance` turns that absence into a finding rather than a shrug.
+   */
+  priceSource?: PriceSource;
 };
+
+/** Live tape (session in progress) vs the stored close (previous session). */
+export type PriceSource = "LIVE_TRADE" | "CLOSE";
 
 export type LoggedAction = {
   type: "OPEN" | "CLOSE" | "MARK" | "NONE";
@@ -110,14 +127,35 @@ export type PaperRunLog = {
   ranAt: string;
   flags: {
     // Optional: run logs predating live-quote pricing have no such field. True means
-    // this day's decisions were priced off the live tape, not the previous close — the
-    // two are not comparable, so anything trending across days must account for it.
+    // at least one of this day's decisions was priced off the live tape, not the
+    // previous close — the two are not comparable, so anything trending across days
+    // must account for it. `pricing` below says HOW MANY, which is the number that
+    // actually matters, because the overlay is partial.
     liveQuotes?: boolean;
     riskBooks: boolean;
     riskLimits: boolean;
     brokerStops: boolean;
     insiderBook: boolean;
     nearClose: boolean;
+  };
+  /**
+   * How this run was priced. A boolean flag proved insufficient: the overlay only
+   * applies while the market is open and only to names the feed returned, so a run is
+   * routinely a mix of live-tape and previous-session prices, and "was live pricing on"
+   * does not answer "what was this book actually marked against".
+   *
+   * Optional for logs written before it existed; `auditRunProvenance` reports the
+   * absence so a missing block is visible rather than read as "off".
+   */
+  pricing?: {
+    /** PAPER_LIVE_QUOTES=1 and market-data keys configured. */
+    enabled: boolean;
+    /** Broker clock said the session was open (the overlay no-ops otherwise). */
+    marketOpen: boolean;
+    /** Stocks whose price came from the live tape. */
+    livePriced: number;
+    /** Stocks with any price at all — the denominator for the above. */
+    totalPriced: number;
   };
   cfg: RiskConfig;
   decisions: DecisionRecord[];
@@ -523,6 +561,55 @@ export function auditEntries(openedToday: AuditPosition[], cfg: RiskConfig): Fin
     }
   }
   return out;
+}
+
+/**
+ * Report what the run recorded about ITSELF, and complain when it recorded nothing.
+ *
+ * This exists because of a specific silent failure. `flags.liveQuotes` was declared in
+ * this type, documented as the thing that makes cross-day comparison valid, consumed by
+ * readers — and never written by the stage. Being optional, its absence was
+ * indistinguishable from "off", so for the whole life of the live-quote feature every
+ * run log asserted nothing and every reader inferred "closes" and was wrong. The
+ * per-stock overlay count was computed in the same function and discarded.
+ *
+ * The general rule this encodes: a field that says how the run was configured must
+ * either be present or be a finding. An optional provenance field that silently reads
+ * as a default is worse than no field, because it converts "unknown" into a confident
+ * wrong answer — which is exactly how it failed.
+ *
+ * `info` when present (it is a statement of fact, not a fault) and `warn` when absent,
+ * because a run that cannot say how it was priced cannot be compared with one that can.
+ */
+export function auditRunProvenance(log: PaperRunLog): Finding[] {
+  const p = log.pricing;
+  if (!p) {
+    return [
+      finding(
+        "warn",
+        "RUN_PROVENANCE_MISSING",
+        "Run log records no pricing provenance",
+        "The paper run did not record whether its decisions were priced from the live tape or from stored closes. Those are different sessions — a stored close is the PREVIOUS session's — so this day's marks and P&L cannot be soundly compared with a day that did record it. Logs written before the `pricing` block existed will report this until they age out.",
+        { hasFlag: log.flags.liveQuotes ?? null }
+      ),
+    ];
+  }
+
+  const mixed = p.livePriced > 0 && p.livePriced < p.totalPriced;
+  return [
+    finding(
+      "info",
+      "RUN_PRICING",
+      `Priced ${p.livePriced}/${p.totalPriced} names from the live tape`,
+      `Live quotes ${p.enabled ? "enabled" : "disabled"}, market ${p.marketOpen ? "open" : "closed"} at run time. ` +
+        (mixed
+          ? `${p.totalPriced - p.livePriced} name(s) fell back to their stored close, which is the PREVIOUS session's — this run mixes two sessions and per-name comparisons must read inputs.priceSource.`
+          : p.livePriced === 0
+            ? "Every name was priced from its stored close (the previous session's)."
+            : "Every name was priced from the live tape."),
+      { enabled: p.enabled, marketOpen: p.marketOpen, livePriced: p.livePriced, totalPriced: p.totalPriced }
+    ),
+  ];
 }
 
 /**
