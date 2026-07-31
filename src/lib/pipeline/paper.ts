@@ -314,6 +314,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
   const livePricedStockIds = new Set<string>();
   const liveQuotesEnabled = isLiveQuotesEnabled() && isMarketDataConfigured();
   let marketOpenAtRun = false;
+  // The convergence sweep prices its own names (they have no estimate this run, so they
+  // are absent from `priceByStock`). Counted separately because "how was this run priced"
+  // must cover every path that submits an order, not just the main one.
+  let sweepLivePriced = 0;
+  let sweepTotalPriced = 0;
   if (liveQuotesEnabled && estimates.length > 0) {
     try {
       const open = isPaperTradingConfigured() ? (await getClock()).isOpen : false;
@@ -1416,14 +1421,47 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             });
             const quantByStock = new Map<string, { price: number; atrPct: number | null; staleSessions: number }>();
             for (const q of lastQuant) {
-              // These names have no estimate today by construction, so their reference
-              // close is the stalest in the run — exactly where the buffer widening matters.
+              // These names have no estimate today by construction, so their stored close
+              // is the stalest in the run — which is why the tape overlay below matters
+              // more here than anywhere else.
               if (!quantByStock.has(q.stockId))
                 quantByStock.set(q.stockId, {
                   price: q.price!,
                   atrPct: q.atrPct ?? null,
                   staleSessions: sessionsStale(q.sessionDate, todayUTC),
                 });
+            }
+            sweepTotalPriced = quantByStock.size;
+
+            // Price the sweep off the tape as well.
+            //
+            // Without this the sweep was the ONE order-submitting path still anchored to a
+            // two-session-old close while every other name in the run priced live — and it
+            // is the path whose entire job is repairing divergence, so it was retrying
+            // exactly the names nothing else had refreshed. Same rules as the main overlay:
+            // only while the market is genuinely open, per-stock fallback so a partial
+            // response degrades name-by-name, and only for names that already have a stored
+            // price (a quote alone must not conjure an entry the sweep would otherwise skip).
+            if (liveQuotesEnabled && marketOpenAtRun && quantByStock.size > 0) {
+              try {
+                const { prices: live, errors: quoteErrors } = await getLatestTrades(
+                  missing.filter((p) => quantByStock.has(p.stockId)).map((p) => p.stock.ticker)
+                );
+                errors.push(...quoteErrors);
+                for (const p of missing) {
+                  const q = quantByStock.get(p.stockId);
+                  const px = live.get(p.stock.ticker);
+                  if (q && px != null && px > 0) {
+                    q.price = px;
+                    q.staleSessions = 1; // priced off the tape this instant — no lag left
+                    sweepLivePriced++;
+                  }
+                }
+              } catch (e) {
+                // Degrade to closes rather than skipping the sweep: a quote feed must never
+                // stop the run that repairs live-vs-sim divergence.
+                errors.push(`Sweep live quote overlay failed (priced from closes): ${String(e)}`);
+              }
             }
             // Attempt history for THIS set — the maps built above only cover names with
             // an estimate today, so reusing them would leave the guard permanently
@@ -1598,6 +1636,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         marketOpen: marketOpenAtRun,
         livePriced: livePricedStockIds.size,
         totalPriced: priceByStock.size,
+        // The convergence sweep prices its own names and submits its own orders, so it
+        // needs its own numbers — a run where the main path is 100% live and the sweep is
+        // 0% is not a live-priced run, and one aggregate would hide that.
+        sweepLivePriced,
+        sweepTotalPriced,
       },
       cfg,
       decisions,

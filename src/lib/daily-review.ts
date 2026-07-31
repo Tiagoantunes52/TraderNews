@@ -156,6 +156,14 @@ export type PaperRunLog = {
     livePriced: number;
     /** Stocks with any price at all — the denominator for the above. */
     totalPriced: number;
+    /**
+     * The convergence sweep's own pricing. It prices names that have no estimate this
+     * run, and submits its own orders, so it needs its own numerator/denominator: a run
+     * where the main path is 100% live and the sweep is 0% is not a live-priced run.
+     * Optional — logs written before the sweep overlay existed omit both.
+     */
+    sweepLivePriced?: number;
+    sweepTotalPriced?: number;
   };
   cfg: RiskConfig;
   decisions: DecisionRecord[];
@@ -596,7 +604,7 @@ export function auditRunProvenance(log: PaperRunLog): Finding[] {
   }
 
   const mixed = p.livePriced > 0 && p.livePriced < p.totalPriced;
-  return [
+  const out = [
     finding(
       "info",
       "RUN_PRICING",
@@ -606,10 +614,37 @@ export function auditRunProvenance(log: PaperRunLog): Finding[] {
           ? `${p.totalPriced - p.livePriced} name(s) fell back to their stored close, which is the PREVIOUS session's — this run mixes two sessions and per-name comparisons must read inputs.priceSource.`
           : p.livePriced === 0
             ? "Every name was priced from its stored close (the previous session's)."
-            : "Every name was priced from the live tape."),
-      { enabled: p.enabled, marketOpen: p.marketOpen, livePriced: p.livePriced, totalPriced: p.totalPriced }
+            : "Every name was priced from the live tape.") +
+        (p.sweepTotalPriced
+          ? ` Convergence sweep: ${p.sweepLivePriced ?? 0}/${p.sweepTotalPriced} live.`
+          : ""),
+      {
+        enabled: p.enabled,
+        marketOpen: p.marketOpen,
+        livePriced: p.livePriced,
+        totalPriced: p.totalPriced,
+        sweepLivePriced: p.sweepLivePriced ?? null,
+        sweepTotalPriced: p.sweepTotalPriced ?? null,
+      }
     ),
   ];
+
+  // The sweep submits real entry orders off its own prices. If the main path priced live
+  // and the sweep did not, the run is quietly entering some names on a two-session-old
+  // close — the exact asymmetry the sweep overlay was added to remove, so it must be
+  // audible rather than inferable from two numbers in a JSON blob.
+  if (p.sweepTotalPriced && (p.sweepLivePriced ?? 0) === 0 && p.livePriced > 0) {
+    out.push(
+      finding(
+        "warn",
+        "SWEEP_PRICED_STALE",
+        `Convergence sweep priced 0/${p.sweepTotalPriced} names live while the main path priced ${p.livePriced}/${p.totalPriced}`,
+        "The sweep submits its own entry orders. Pricing them from stored closes while everything else uses the tape re-creates the stale-anchor bias for exactly the names the sweep exists to repair — it retries the names nothing else refreshed. Check the quote feed's response for those tickers.",
+        { sweepTotalPriced: p.sweepTotalPriced, livePriced: p.livePriced }
+      )
+    );
+  }
+  return out;
 }
 
 /**

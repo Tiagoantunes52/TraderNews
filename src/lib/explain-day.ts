@@ -118,7 +118,14 @@ export type DayExplanation = {
     rows: number;
   };
   pricing:
-    | { enabled: boolean; marketOpen: boolean; livePriced: number; totalPriced: number }
+    | {
+        enabled: boolean;
+        marketOpen: boolean;
+        livePriced: number;
+        totalPriced: number;
+        sweepLivePriced?: number;
+        sweepTotalPriced?: number;
+      }
     | null;
   decisions: {
     total: number;
@@ -438,7 +445,10 @@ export function formatDayExplanation(x: DayExplanation): string {
 
   L.push(
     x.pricing
-      ? `pricing    liveQuotes=${x.pricing.enabled} marketOpen=${x.pricing.marketOpen} → ${x.pricing.livePriced}/${x.pricing.totalPriced} names on the live tape`
+      ? `pricing    liveQuotes=${x.pricing.enabled} marketOpen=${x.pricing.marketOpen} → ${x.pricing.livePriced}/${x.pricing.totalPriced} names on the live tape` +
+        (x.pricing.sweepTotalPriced
+          ? ` (convergence sweep ${x.pricing.sweepLivePriced ?? 0}/${x.pricing.sweepTotalPriced})`
+          : "")
       : x.ranAt
         ? `pricing    UNDECLARED — this run predates pricing provenance`
         : `pricing    — no run to price —`

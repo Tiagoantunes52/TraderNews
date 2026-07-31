@@ -464,9 +464,21 @@ widening binds on the convergence sweep, on names the feed misses, and on closed
 failed-quote runs. It is a floor under the failure modes, not the main fix — the main fix
 was already in place and I mis-read the log into thinking otherwise.
 
-**The remaining real gap is the convergence sweep**, which never consults the quote feed
-at all even when the overlay is on and the market is open. Extending the overlay to cover
-it would remove the staleness rather than compensate for it, and is the natural next step.
+**The convergence sweep now prices off the tape too (2026-07-31).** It was the ONE
+order-submitting path still anchored to a stored close while every other name in the run
+priced live — and it is the path whose whole job is repairing divergence, so it was
+retrying exactly the names nothing else had refreshed. It now runs the same overlay under
+the same rules: only while the market is genuinely open, per-stock fallback so a partial
+response degrades name-by-name, and only for names that already have a stored price, so a
+quote alone can never conjure an entry the sweep would otherwise have skipped.
+
+**And the run log can now tell the difference.** `pricing` carries `sweepLivePriced` /
+`sweepTotalPriced` separately from the main path, because one aggregate would hide the
+failure that matters: a run at 100% live on the main path and 0% on the sweep is not a
+live-priced run. `auditRunProvenance` emits `SWEEP_PRICED_STALE` (warn) for exactly that
+shape, and stays silent when the sweep had no names, when the market was closed, and on
+logs written before the fields existed — an alarm that fires on old logs is one nobody
+reads.
 
 **Still unmeasured:** whether any of the execution work helped. Only **11 live BUY orders**
 exist since the 2026-07-27 fixes (the book was frozen most of July), and fill rate sat at
