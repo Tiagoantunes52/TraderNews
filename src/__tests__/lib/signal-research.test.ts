@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   buildFeatures,
   classifyMarketRegime,
+  regimeOf,
+  DEFAULT_REGIME_BOUNDARIES,
   excessBySession,
   noiseThreshold,
   evaluatePeriod,
@@ -53,6 +55,7 @@ function mkRow(sess: string, stockId: string, close: number, h5: number): Featur
     sma20: null, rsi14: null, atr14: null, adx14: null, macdHist: null, bollPctB: null,
     vol30: null, volRatio10: null, change7d: null, change30d: null, relStr7d: null,
     marketRegime: "UNCLASSIFIED",
+    benchClose: null, benchSma20: null, benchRsi14: null, benchAdx14: null,
     forward: { h1: h5, h5, h10: h5 },
   };
 }
@@ -190,6 +193,40 @@ describe("classifyMarketRegime()", () => {
     expect(classifyMarketRegime(null, 110, 100, 55)).toBe("UNCLASSIFIED");
     expect(classifyMarketRegime(30, 110, null, 55)).toBe("UNCLASSIFIED");
     expect(classifyMarketRegime(30, 110, 100, null)).toBe("UNCLASSIFIED");
+  });
+
+  it("honours fitted boundaries instead of the textbook ones", () => {
+    // ADX 22 is UNCLASSIFIED under the shipped 25 cut and a trend under a fitted 20 cut.
+    expect(classifyMarketRegime(22, 110, 100, 55)).toBe("UNCLASSIFIED");
+    expect(classifyMarketRegime(22, 110, 100, 55, { adxTrend: 20, adxCalm: 20, rsiLo: 40, rsiHi: 60 })).toBe("TREND_BULL");
+  });
+
+  it("defaults to DEFAULT_REGIME_BOUNDARIES when none are passed", () => {
+    expect(classifyMarketRegime(30, 110, 100, 55)).toBe(
+      classifyMarketRegime(30, 110, 100, 55, DEFAULT_REGIME_BOUNDARIES)
+    );
+  });
+});
+
+// ── regimeOf ─────────────────────────────────────────────────────────────────
+
+describe("regimeOf()", () => {
+  const row = { benchAdx14: 22, benchClose: 110, benchSma20: 100, benchRsi14: 55 };
+
+  it("re-classifies a built row under different boundaries", () => {
+    expect(regimeOf(row, DEFAULT_REGIME_BOUNDARIES)).toBe("UNCLASSIFIED");
+    expect(regimeOf(row, { adxTrend: 20, adxCalm: 20, rsiLo: 40, rsiHi: 60 })).toBe("TREND_BULL");
+  });
+
+  it("is UNCLASSIFIED for a row with no benchmark reading", () => {
+    expect(regimeOf({ benchAdx14: null, benchClose: null, benchSma20: null, benchRsi14: null }, DEFAULT_REGIME_BOUNDARIES)).toBe(
+      "UNCLASSIFIED"
+    );
+  });
+
+  it("agrees with the label buildFeatures stored, on the default boundaries", () => {
+    const rows = buildFeatures(universe(12));
+    expect(rows.every((f) => regimeOf(f, DEFAULT_REGIME_BOUNDARIES) === f.marketRegime)).toBe(true);
   });
 });
 

@@ -5,7 +5,14 @@ import {
   standardizersFor,
   fitFamaMacBeth,
   scoreWithWeights,
+  boundaryGrid,
+  fitByRegime,
+  scoreByRegime,
+  selectBoundaries,
+  ADX_TREND_GRID,
+  RSI_LO_GRID,
 } from "@/lib/signal-research-fit";
+import type { FeatureRow } from "@/lib/signal-research";
 
 const KEYS = ["a", "b"] as const;
 
@@ -180,5 +187,147 @@ describe("scoreWithWeights", () => {
     );
     const byRaw = [...rows].sort((x, y) => raw(x[0], x[1]) - raw(y[0], y[1]));
     expect(byScore).toEqual(byRaw);
+  });
+});
+
+// ── Regime boundary fitting ──────────────────────────────────────────────────
+
+/** A FeatureRow carrying just enough to exercise regime selection. */
+function mkFeature(
+  session: string,
+  stockId: string,
+  opts: { a: number; b: number; ret: number; adx: number; benchClose?: number; benchSma20?: number; rsi?: number }
+): FeatureRow {
+  return {
+    stockId,
+    ticker: stockId,
+    session,
+    close: 100,
+    sma20: null,
+    rsi14: null,
+    atr14: null,
+    adx14: null,
+    macdHist: null,
+    bollPctB: null,
+    vol30: null,
+    volRatio10: null,
+    // The two terms ride on these fields so `extract` has something real to read.
+    change7d: opts.a,
+    change30d: opts.b,
+    relStr7d: null,
+    marketRegime: "UNCLASSIFIED",
+    benchClose: opts.benchClose ?? 100,
+    benchSma20: opts.benchSma20 ?? 90,
+    benchRsi14: opts.rsi ?? 50,
+    benchAdx14: opts.adx,
+    forward: { h1: opts.ret, h5: opts.ret, h10: opts.ret },
+  };
+}
+
+const extractAB = (f: FeatureRow) => ({ a: f.change7d, b: f.change30d });
+const retOf = (f: FeatureRow) => f.forward.h5;
+
+/** `sessions` x `n` rows, all in one regime, with a return built from term `a`. */
+function regimeRows(prefix: string, sessions: number, n: number, adx: number, slope = 1): FeatureRow[] {
+  const out: FeatureRow[] = [];
+  for (let s = 0; s < sessions; s++) {
+    for (let i = 0; i < n; i++) {
+      const a = wobble(s * 31 + i);
+      const b = wobble(s * 31 + i + 11);
+      out.push(mkFeature(`${prefix}-${String(s + 1).padStart(3, "0")}`, `T${i}`, { a, b, ret: slope * a, adx }));
+    }
+  }
+  return out;
+}
+
+describe("boundaryGrid", () => {
+  const grid = boundaryGrid();
+
+  it("never proposes a calm cut above the trend cut", () => {
+    expect(grid.every((b) => b.adxCalm <= b.adxTrend)).toBe(true);
+  });
+
+  it("pins the RSI band symmetric around 50 rather than searching both edges", () => {
+    expect(grid.every((b) => b.rsiHi === 100 - b.rsiLo)).toBe(true);
+    expect(new Set(grid.map((b) => b.rsiLo))).toEqual(new Set(RSI_LO_GRID));
+  });
+
+  it("covers every trend cut in the pre-registered list", () => {
+    expect(new Set(grid.map((b) => b.adxTrend))).toEqual(new Set(ADX_TREND_GRID));
+  });
+
+  it("is the size the report claims, so the noise threshold is not understated", () => {
+    expect(grid.length).toBe(116);
+  });
+});
+
+describe("fitByRegime / scoreByRegime", () => {
+  const boundaries = { adxTrend: 25, adxCalm: 20, rsiLo: 30, rsiHi: 70 };
+
+  it("fits a separate weight vector per regime", () => {
+    // adx 30 + close above sma → TREND_BULL ; adx 10 + rsi 50 → MEAN_REVERTING
+    const rows = [...regimeRows("2024-01", 20, 15, 30, 1), ...regimeRows("2024-02", 20, 15, 10, -1)];
+    const fits = fitByRegime(rows, boundaries, extractAB, retOf, KEYS);
+    expect(fits.TREND_BULL).toBeDefined();
+    expect(fits.MEAN_REVERTING).toBeDefined();
+    // Opposite slopes must produce opposite signs on the `a` weight.
+    expect(Math.sign(fits.TREND_BULL!.w.a)).toBe(1);
+    expect(Math.sign(fits.MEAN_REVERTING!.w.a)).toBe(-1);
+  });
+
+  it("returns null for a row whose regime has no fit", () => {
+    const rows = regimeRows("2024-01", 20, 15, 30, 1);
+    const fits = fitByRegime(rows, boundaries, extractAB, retOf, KEYS);
+    const orphan = mkFeature("2024-03-01", "T0", { a: 0.5, b: 0.1, ret: 0, adx: 10 });
+    expect(fits.MEAN_REVERTING).toBeUndefined();
+    expect(scoreByRegime(orphan, boundaries, fits, extractAB)).toBeNull();
+  });
+});
+
+describe("selectBoundaries", () => {
+  const grid = [
+    { adxTrend: 25, adxCalm: 20, rsiLo: 30, rsiHi: 70 },
+    { adxTrend: 20, adxCalm: 20, rsiLo: 40, rsiHi: 60 },
+  ];
+
+  it("returns one trial per boundary set", () => {
+    const fit = regimeRows("2024-01", 40, 15, 30, 1);
+    const val = regimeRows("2024-06", 40, 15, 30, 1);
+    expect(selectBoundaries(fit, val, extractAB, retOf, KEYS, grid)).toHaveLength(2);
+  });
+
+  it("scores on the VALIDATION rows, which the weights never saw", () => {
+    // Weights fitted where ret = +a; validation also ret = +a, so a correctly fitted
+    // score ranks validation perfectly and IC comes back at ~1.
+    const fit = regimeRows("2024-01", 40, 15, 30, 1);
+    const val = regimeRows("2024-06", 40, 15, 30, 1);
+    const [best] = selectBoundaries(fit, val, extractAB, retOf, KEYS, grid);
+    expect(best.validation.mean).toBeGreaterThan(0.9);
+  });
+
+  it("marks a trial unusable when a regime is too thin to fit, and sorts it last", () => {
+    // Only 5 sessions of the mean-reverting regime, under a 30-session floor.
+    const fit = [...regimeRows("2024-01", 40, 15, 30, 1), ...regimeRows("2024-02", 5, 15, 10, -1)];
+    const val = regimeRows("2024-06", 20, 15, 30, 1);
+    const trials = selectBoundaries(fit, val, extractAB, retOf, KEYS, grid, { minSessionsPerRegime: 30 });
+    expect(trials.every((t) => !t.usable)).toBe(true);
+    // With a floor of 5 the same data is usable — proving the flag tracks the floor.
+    const relaxed = selectBoundaries(fit, val, extractAB, retOf, KEYS, grid, { minSessionsPerRegime: 5 });
+    expect(relaxed.some((t) => t.usable)).toBe(true);
+  });
+
+  it("puts every usable trial ahead of every unusable one", () => {
+    const fit = [...regimeRows("2024-01", 40, 15, 30, 1), ...regimeRows("2024-02", 3, 15, 10, -1)];
+    const val = regimeRows("2024-06", 20, 15, 30, 1);
+    const trials = selectBoundaries(fit, val, extractAB, retOf, KEYS, grid, { minSessionsPerRegime: 3 });
+    const firstUnusable = trials.findIndex((t) => !t.usable);
+    if (firstUnusable >= 0) expect(trials.slice(firstUnusable).every((t) => !t.usable)).toBe(true);
+  });
+
+  it("reports the fitting sessions behind each regime", () => {
+    const fit = regimeRows("2024-01", 40, 15, 30, 1);
+    const val = regimeRows("2024-06", 20, 15, 30, 1);
+    const [best] = selectBoundaries(fit, val, extractAB, retOf, KEYS, grid);
+    expect(best.regimeSessions.TREND_BULL).toBe(40);
   });
 });

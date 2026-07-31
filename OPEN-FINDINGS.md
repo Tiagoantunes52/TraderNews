@@ -319,6 +319,45 @@ summary is *"we can stop the score being actively wrong; we have not shown it is
 `f1` failing while `f2` is flat also says the regime conditioning — not the refit — is
 what carried it, which is the part worth pursuing next.
 
+### Fitting the regime boundaries, 2026-07-31 — the search won in validation and lost in the holdout
+
+The cut-points were the last unfitted constants in the chain, so `npm run
+signal-research-fit -- --boundaries` fits them too, by **nested selection inside train**:
+weights fitted on sessions < 2024-01-01, a 116-set grid ranked on the 252 sessions after
+it that those weights never saw, then the weights refitted on all of train under the
+winner. The holdout saw none of it. `rsiHi` is pinned to `100 - rsiLo` and `adxCalm <=
+adxTrend` is enforced, so the grid searches a partition rather than an overlap.
+
+**In validation the textbook numbers looked indefensible.** The shipped
+`adx>25 / adx<20 / rsi 30-70` ranked **52nd of 73 usable sets** at +0.0020 (t=0.16). The
+winner, `adx>20 / adx<20 / rsi 40-60`, scored +0.0318 (2.61) — and the entire top ten
+wanted `adxTrend` at 20-22.5, so this was not one lucky cell.
+
+**It did not transfer.**
+
+| | inner validation | HOLDOUT | folds |
+|---|---|---|---|
+| `f2-refit-by-regime` (textbook cuts) | +0.0020 (0.16) | **+0.0068 (0.62)** | 4/4 |
+| `f3-fitted-regimes` (fitted cuts) | **+0.0318 (2.61)** | **+0.0009 (0.09)** | 4/4 |
+
+**The candidate that won validation by 16x came last out of sample.** It is not a
+disaster — `f3` still does not invert, and it beats `f2` in `MEAN_REVERTING` (+0.0429 vs
++0.0361) — but it gives back most of `f2`'s bear-market repair (`TREND_BEAR` -0.0316 vs
+-0.0048) and nets out flat.
+
+**This was predicted before the holdout ran, and that is the point.** Searching 116
+partitions has a noise threshold of |t| ≈ **3.08**; the winner's validation t was
+**2.61**, i.e. already below what the search produces on its own. The selection-adjusted
+threshold is not decoration — it called this one in advance, and reading the winner
+against zero instead would have shipped a 16x "improvement" that is worth nothing.
+
+**What this settles:** the regime *cut-points* are not where the edge is. Conditioning on
+regime **at all** is what moved `TREND_BEAR` from -0.1393 to -0.0048; refining where the
+line sits is fitting noise. Stop tuning the boundary. Two conclusions follow — the ADX
+20-vs-25 question is closed (it does not matter out of sample), and the remaining
+candidates for the next real gain are the term *transforms* (the clamps, the ±20%
+momentum normaliser, the RSI regime flip), which are still unfitted, and a longer holdout.
+
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
 is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's

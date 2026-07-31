@@ -29,6 +29,14 @@
 // Pure.
 
 import { tStatOneSample } from "@/lib/stats";
+import {
+  crossSectionalIc,
+  regimeOf,
+  type FeatureRow,
+  type IcStat,
+  type MarketRegime,
+  type RegimeBoundaries,
+} from "@/lib/signal-research";
 
 /** Mean and spread of one term over the fitting period. */
 export type Standardizer = { mean: number; sd: number };
@@ -228,4 +236,137 @@ export function scoreWithWeights(
   }
   if (total === 0) return null;
   return clamp(sum / total, -1, 1);
+}
+
+// ── Fitting the regime boundaries ────────────────────────────────────────────
+//
+// ADX 25 / ADX 20 / RSI 30-70 are textbook numbers. Nobody here fitted them, which makes
+// them exactly the kind of constant this investigation keeps finding at the bottom of a
+// failure. Fitting them is legitimate — and it is also the single most overfittable thing
+// in the whole harness, because a grid search over four cut-points will always find a
+// partition that flatters the data it searched.
+//
+// Two defences, both structural rather than advisory:
+//
+// 1. NESTED SELECTION. The grid is scored on an INNER VALIDATION slice of train that the
+//    per-regime weights were never fitted on. Boundaries chosen on the same rows that
+//    fitted the weights would be chosen for fitting noise, and the real holdout would be
+//    the first thing to notice.
+// 2. THE GRID SIZE IS REPORTED. `noiseThreshold(trials)` for a ~116-point grid is |t| ~ 3.1,
+//    so a winner is read against what searching 116 partitions produces on its own.
+//
+// The holdout is still touched exactly once, after both the boundaries and the weights
+// are frozen into constants.
+
+/** Sessions a regime must have in the fitting slice before its weights mean anything. */
+export const MIN_SESSIONS_PER_REGIME = 30;
+
+/**
+ * The pre-registered search grid.
+ *
+ * `rsiHi` is pinned to `100 - rsiLo` rather than searched independently: RSI is symmetric
+ * around 50 by construction, an asymmetric band would need a reason nobody has, and it
+ * halves the parameters being searched. `adxCalm <= adxTrend` is enforced because the
+ * reverse is not a partition, it is an overlap.
+ */
+export const ADX_TREND_GRID = [20, 22.5, 25, 27.5, 30, 35] as const;
+export const ADX_CALM_GRID = [12.5, 15, 17.5, 20, 22.5] as const;
+export const RSI_LO_GRID = [25, 30, 35, 40] as const;
+
+export function boundaryGrid(): RegimeBoundaries[] {
+  const out: RegimeBoundaries[] = [];
+  for (const adxTrend of ADX_TREND_GRID) {
+    for (const adxCalm of ADX_CALM_GRID) {
+      if (adxCalm > adxTrend) continue;
+      for (const rsiLo of RSI_LO_GRID) out.push({ adxTrend, adxCalm, rsiLo, rsiHi: 100 - rsiLo });
+    }
+  }
+  return out;
+}
+
+export type RegimeFit = { w: Record<string, number>; std: Record<string, Standardizer>; sessions: number };
+
+/** Per-regime weights under one set of boundaries, fitted on `rows`. */
+export function fitByRegime(
+  rows: FeatureRow[],
+  boundaries: RegimeBoundaries,
+  extract: (f: FeatureRow) => Terms,
+  ret: (f: FeatureRow) => number,
+  keys: readonly string[],
+  opts: FitOptions = {}
+): Partial<Record<MarketRegime, RegimeFit>> {
+  const groups = new Map<MarketRegime, FeatureRow[]>();
+  for (const f of rows) {
+    const r = regimeOf(f, boundaries);
+    const list = groups.get(r);
+    if (list) list.push(f);
+    else groups.set(r, [f]);
+  }
+  const out: Partial<Record<MarketRegime, RegimeFit>> = {};
+  for (const [regime, group] of groups) {
+    const fit = fitFamaMacBeth(group, extract, ret, keys, opts);
+    out[regime] = { w: fit.weights, std: fit.standardizers, sessions: fit.sessions };
+  }
+  return out;
+}
+
+/** Score rows with a per-regime weight set. Null where the regime has no fit. */
+export function scoreByRegime(
+  f: FeatureRow,
+  boundaries: RegimeBoundaries,
+  fits: Partial<Record<MarketRegime, RegimeFit>>,
+  extract: (f: FeatureRow) => Terms
+): number | null {
+  const fit = fits[regimeOf(f, boundaries)];
+  return fit ? scoreWithWeights(extract(f), fit.w, fit.std) : null;
+}
+
+export type BoundaryTrial = {
+  boundaries: RegimeBoundaries;
+  /** IC on the inner validation slice — the selection criterion. */
+  validation: IcStat;
+  /** Sessions per regime in the FITTING slice; a thin regime is why a trial is rejected. */
+  regimeSessions: Partial<Record<MarketRegime, number>>;
+  /** False when some regime is too thin to fit; such a trial is never selected. */
+  usable: boolean;
+};
+
+/**
+ * Score every boundary set in the grid by nested validation.
+ *
+ * Weights are fitted on `fitRows`; boundaries are ranked by IC on `validateRows`, which
+ * the weights never saw. Returns the whole ranking, not just the winner — a grid whose
+ * top ten are all within noise of each other is telling you the boundary does not matter,
+ * and that is only visible if the runner-up numbers survive.
+ */
+export function selectBoundaries(
+  fitRows: FeatureRow[],
+  validateRows: FeatureRow[],
+  extract: (f: FeatureRow) => Terms,
+  ret: (f: FeatureRow) => number,
+  keys: readonly string[],
+  grid: RegimeBoundaries[] = boundaryGrid(),
+  opts: FitOptions & { minSessionsPerRegime?: number } = {}
+): BoundaryTrial[] {
+  const minSessions = opts.minSessionsPerRegime ?? MIN_SESSIONS_PER_REGIME;
+  const trials: BoundaryTrial[] = [];
+
+  for (const boundaries of grid) {
+    const fits = fitByRegime(fitRows, boundaries, extract, ret, keys, opts);
+    const regimeSessions: Partial<Record<MarketRegime, number>> = {};
+    for (const [regime, fit] of Object.entries(fits)) regimeSessions[regime as MarketRegime] = fit.sessions;
+    const usable = Object.values(fits).every((f) => f.sessions >= minSessions);
+
+    const scored: { session: string; score: number; ret: number }[] = [];
+    for (const f of validateRows) {
+      const s = scoreByRegime(f, boundaries, fits, extract);
+      if (s != null && Number.isFinite(s)) scored.push({ session: f.session, score: s, ret: ret(f) });
+    }
+    trials.push({ boundaries, validation: crossSectionalIc(scored), regimeSessions, usable });
+  }
+
+  return trials.sort((a, b) => {
+    if (a.usable !== b.usable) return a.usable ? -1 : 1;
+    return (b.validation.mean ?? -Infinity) - (a.validation.mean ?? -Infinity);
+  });
 }

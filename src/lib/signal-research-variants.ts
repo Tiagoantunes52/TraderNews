@@ -11,7 +11,7 @@
 // from an instrument that just demonstrated it can detect something.
 
 import { calcQuantScore, TREND_REGIME_MIN } from "@/lib/indicators";
-import type { Candidate, MarketRegime, ScoreInput } from "@/lib/signal-research";
+import { regimeOf, type Candidate, type MarketRegime, type RegimeBoundaries, type ScoreInput } from "@/lib/signal-research";
 import { scoreWithWeights } from "@/lib/signal-research-fit";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -158,6 +158,15 @@ export const CANDIDATES: Candidate[] = [
       return scoreWithWeights(quantTerms(f), r.w, r.std);
     },
   },
+  {
+    id: "f3-fitted-regimes",
+    hypothesis:
+      "The regime cut-points are unfitted constants too, and fitting them beats fitting only the weights on top of them. ADX 25 / ADX 20 / RSI 30-70 are textbook numbers that rank 52nd of 73 on inner validation (+0.0020, t=0.16); a nested search wants adx>20 with no dead band, and the whole top ten agrees on 20-22.5. If f2 recovered something real, moving the boundary to where the data puts it should recover more of it.",
+    score: (f) => {
+      const r = REFIT2[regimeOf(f, REFIT2_BOUNDARIES)];
+      return scoreWithWeights(quantTerms(f), r.w, r.std);
+    },
+  },
 ];
 
 // ── Fitted weights ───────────────────────────────────────────────────────────
@@ -225,6 +234,48 @@ export const REFIT_BY_REGIME: Record<
       volume: { mean: -0.003444, sd: 0.189063 },
       macd: { mean: 0.013591, sd: 0.630299 },
     },
+  },
+};
+
+/**
+ * Fitted regime cut-points, chosen by NESTED selection inside train.
+ *
+ * Weights were fitted on sessions < 2024-01-01; the 116-set grid was ranked on the year
+ * after that, which those weights never saw; then the weights were refitted on all of
+ * train under the winner. The holdout saw none of it.
+ *
+ * Selection result: the textbook cuts (adx>25 / adx<20 / rsi 30-70) ranked **52nd of 73
+ * usable sets** at +0.0020 (0.16), while the top ten all wanted `adxTrend` at 20-22.5.
+ * The ADX trend threshold is what the data cares about; the RSI band and the calm cut
+ * barely move it (ranks 1-10 span +0.0283 to +0.0318).
+ *
+ * Read the winner against the GRID's noise threshold (|t| ~ 3.08 for 116 trials), not
+ * against zero: at validation t = 2.61 the winning cell is NOT distinguishable from what
+ * searching 116 partitions produces by itself. What is more than a lucky cell is the
+ * clustering — 20 beats 25 across the whole top of the table.
+ */
+export const REFIT2_BOUNDARIES: RegimeBoundaries = { adxTrend: 20, adxCalm: 20, rsiLo: 40, rsiHi: 60 };
+
+/** Per-regime weights under `REFIT2_BOUNDARIES`, refitted on all 801 train sessions. */
+export const REFIT2: Record<MarketRegime, { w: Record<string, number>; std: Record<string, { mean: number; sd: number }> }> = {
+  TREND_BULL: {
+    w: { momentum: 0.003945, rsi: -0.000168, boll: 0.000809, volume: 0.002312, macd: -0.003138 },
+    std: { momentum: { mean: 0.022567, sd: 0.283762 }, rsi: { mean: -0.075726, sd: 0.260644 }, boll: { mean: 0.277022, sd: 0.559390 }, volume: { mean: 0.026897, sd: 0.185797 }, macd: { mean: 0.164518, sd: 0.565120 } },
+  },
+  TREND_BEAR: {
+    w: { momentum: 0.002268, rsi: 0.000140, boll: -0.000924, volume: -0.000850, macd: -0.000870 },
+    std: { momentum: { mean: -0.015031, sd: 0.296087 }, rsi: { mean: 0.054790, sd: 0.241501 }, boll: { mean: -0.298475, sd: 0.567062 }, volume: { mean: -0.040458, sd: 0.191866 }, macd: { mean: -0.276516, sd: 0.596943 } },
+  },
+  MEAN_REVERTING: {
+    w: { momentum: 0.004970, rsi: 0.000044, boll: -0.004311, volume: 0.001716, macd: 0.002807 },
+    std: { momentum: { mean: 0.012004, sd: 0.291721 }, rsi: { mean: -0.009584, sd: 0.233851 }, boll: { mean: 0.028243, sd: 0.633842 }, volume: { mean: -0.004165, sd: 0.200316 }, macd: { mean: -0.028370, sd: 0.618370 } },
+  },
+  // Fitted on 65 sessions — by far the thinnest bucket, and its weights look it (momentum
+  // comes back NEGATIVE here and nowhere else). Under these boundaries UNCLASSIFIED is
+  // only 8.1% of rows, so it does little damage, but it is the least trustworthy row here.
+  UNCLASSIFIED: {
+    w: { momentum: -0.006402, rsi: 0.003043, boll: -0.000528, volume: 0.005938, macd: 0.010305 },
+    std: { momentum: { mean: 0.000102, sd: 0.276501 }, rsi: { mean: -0.034207, sd: 0.259595 }, boll: { mean: 0.107819, sd: 0.675030 }, volume: { mean: 0.005901, sd: 0.187447 }, macd: { mean: 0.074802, sd: 0.634457 } },
   },
 };
 
