@@ -40,6 +40,7 @@ export const TRADING_KNOBS: Record<TradingKnobKey, TradingKnobSpec> = {
   // ── Entry gates ──────────────────────────────────────────────────────────────
   entryScoreMin: { env: "PAPER_ENTRY_SCORE_MIN", def: DEFAULT_RISK_CONFIG.entryScoreMin, min: 0, max: 1, group: "entry", label: "Score required to open (deadband above the BUY line)" },
   minConfidence: { env: "PAPER_MIN_CONFIDENCE", def: DEFAULT_RISK_CONFIG.minConfidence, min: 0, max: 1, group: "entry", label: "Confidence floor for an entry" },
+  combinedEntryUsesQuant: { env: "PAPER_COMBINED_ENTRY_QUANT", def: DEFAULT_RISK_CONFIG.combinedEntryUsesQuant, min: 0, max: 1, int: true, group: "entry", label: "COMBINED_RM entry reads the quant leg (0 = sentiment only; exits keep quant either way)" },
   // ── Sizing ───────────────────────────────────────────────────────────────────
   riskPerTrade: { env: "PAPER_RISK_PER_TRADE", def: DEFAULT_RISK_CONFIG.riskPerTrade, min: 1, max: 10_000, group: "sizing", label: "$ lost if the stop fires at confidence 1" },
   // ── Exit ladder ──────────────────────────────────────────────────────────────

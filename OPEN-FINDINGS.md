@@ -228,12 +228,170 @@ non-`paper-api` host), so the cost is measurement time, not money.
 source's entry-bucket excess over the universe, emitting `SIGNAL_INVERTED` when it turns
 significantly negative. That is a prompt to investigate, not a trigger to act.
 
-**Next step: a signal research harness, not the portfolio backtest.** The study above ran
-in throwaway scripts in ~20 minutes; promoting it (IC both ways, bucket monotonicity,
-train/test split, regime conditioning, pre-registered hypotheses) is roughly a tenth of
-the Phase-2 portfolio backtest and shares its metrics layer. `quantScore`'s defect is a
-signal defect — fill modelling is not needed to fix it. Hypothesis #1 is the 7-day vs
-30-day momentum horizon, the one result with prior evidence on both sides of the split.
+**The study above is now reproducible.** It originally ran in throwaway scripts that were
+deleted; `npm run signal-research` (`src/lib/signal-research.ts`, pure) rebuilds it from
+`PriceBar` — daily cross-sectional IC with the t-stat across sessions, time-series IC,
+`scoreToSignal` buckets, entry excess over the session universe, fixed split plus rolling
+walk-forward, all conditioned on market regime. It models **no fills, sizing, exits, caps
+or cash**, so it cannot say a change makes money; it can only say whether one score ranks
+names better than another out of sample. Candidates are **pre-registered in
+`signal-research-variants.ts`**, so `k` stays honest and the reported noise threshold
+means something. Two controls run on every invocation regardless of `--candidates`, and
+the driver exits non-zero if they fail: `oracle` must return IC exactly 1.0000, `mom30`
+must detect the known momentum effect. A null result off an unverified instrument is
+worth nothing.
+
+**First run, 2026-07-31 — all three pre-registered hypotheses FAILED.** Split 2025-01-01,
+horizon 5, 801 train / 383 holdout sessions:
+
+| candidate | TRAIN | HOLDOUT | entry excess | verdict |
+|---|---|---|---|---|
+| `oracle` | +1.0000 | +1.0000 | — | control ok |
+| `mom30` | +0.0227 (2.63) | +0.0201 (1.68) | +7.4 bps | control ok |
+| `baseline` | +0.0109 (1.55) | **-0.0232 (-2.25)** | -28.2 bps | FAILS |
+| `h1-momentum-horizon` | +0.0205 (2.80) | -0.0014 (-0.14) | +6.5 bps | FAILS |
+| `h2-no-vol-damper` | +0.0125 (1.62) | -0.0230 (-2.04) | +4.3 bps | FAILS |
+| `h3-spread-normalised` | +0.0079 (1.11) | -0.0246 (-2.36) | -13.1 bps | FAILS |
+
+`k=4` → noise threshold |t| ≈ 1.67, which nothing above clears out of sample. **`h1` is
+the informative failure:** `change30d` on its own survives the holdout (+0.0201, and 4/4
+folds sign-consistent), but dropped into the composite in place of `change7d` it collapses
+to -0.0014 and holds sign in only 1/4 folds. The momentum leg is not what is broken — the
+composite destroys a leg that works on its own. Swapping single terms is therefore the
+wrong move; the blend itself needs refitting.
+
+Holdout by market regime says the same thing louder. `baseline` is **-0.1393 (t=-6.68)**
+in `TREND_BEAR` and +0.0336 (1.97) in `MEAN_REVERTING`; every variant repeats that shape.
+The score is not uniformly weak — it is actively wrong when the market trends down, which
+is where a long-only book takes its losses.
+
+### Refitting the blend, 2026-07-31 — the inversion is fixable, but nothing has earned a ship yet
+
+`npm run signal-research-fit` estimates the weights instead of declaring them:
+Fama-MacBeth (one cross-sectional OLS per session, coefficients averaged and t-tested
+**across** sessions) on terms standardised over the fitting period. It reads **train
+sessions only** — it filters to `session < --split` before it reads anything and prints
+the sessions it used — and emits a constant block that is pasted into
+`signal-research-variants.ts`. The candidate therefore stays a pure per-row function that
+cannot reach the data it was fitted on, and the holdout is scored once, afterwards.
+
+**The train fit alone convicts the designed weights.** Over 797 sessions / 79,464 obs:
+
+| term | designed weight | fitted t |
+|---|---|---|
+| momentum | 30% | **+3.51** |
+| volume | 10% | +1.75 |
+| bollinger | 10% | -0.88 |
+| rsi | **30%** | +0.65 |
+| macd | **20%** | -0.60 |
+
+Half the weight is paid to two terms that fit at |t| < 1. And **MACD flips sign by
+regime** — **-4.27** in `TREND_BULL`, **+3.03** in `MEAN_REVERTING` — two significant
+effects with opposite signs cancelling to -0.60 globally. That is the same cancellation
+that hid the score's regime split, one level down.
+
+Two refits were pre-registered before the holdout saw either:
+
+| candidate | TRAIN | HOLDOUT | folds | entry excess | verdict |
+|---|---|---|---|---|---|
+| `f1-refit-global` | +0.0099 (1.34) | -0.0091 (-0.85) | 2/4 | +3.2 bps | FAILS |
+| `f2-refit-by-regime` | +0.0270 (3.72) | **+0.0068 (0.62)** | **4/4** | +6.6 bps | WEAK |
+
+**`f2` is the first candidate in this entire investigation that does not invert out of
+sample**, and the regime table shows where it came from:
+
+| | `baseline` | `f2-refit-by-regime` |
+|---|---|---|
+| TREND_BULL | -0.0420 (-2.35) | -0.0262 (-1.41) |
+| **TREND_BEAR** | **-0.1393 (-6.68)** | **-0.0048 (-0.17)** |
+| MEAN_REVERTING | +0.0336 (1.97) | +0.0361 (1.95) |
+| entry excess | **-28.2 bps** | **+6.6 bps** |
+
+The catastrophic bear-market inversion is essentially gone. That is a structural result:
+the anti-predictiveness was **not** irreducible noise, and it was **not** one bad term —
+it was one weight vector being applied to terms whose signs depend on the regime.
+
+**It still does not ship, and nothing here changes a live weight.** Holdout t = 0.62
+against a `k=6` noise threshold of **1.89**: `f2` is indistinguishable from no edge. It
+buys four times the parameters on a quarter of the sessions each, and the regime label
+itself comes from cut-points (ADX 20/25, RSI 30/70) that nobody fitted either. The honest
+summary is *"we can stop the score being actively wrong; we have not shown it is right"*.
+`f1` failing while `f2` is flat also says the regime conditioning — not the refit — is
+what carried it, which is the part worth pursuing next.
+
+### Fitting the regime boundaries, 2026-07-31 — the search won in validation and lost in the holdout
+
+The cut-points were the last unfitted constants in the chain, so `npm run
+signal-research-fit -- --boundaries` fits them too, by **nested selection inside train**:
+weights fitted on sessions < 2024-01-01, a 116-set grid ranked on the 252 sessions after
+it that those weights never saw, then the weights refitted on all of train under the
+winner. The holdout saw none of it. `rsiHi` is pinned to `100 - rsiLo` and `adxCalm <=
+adxTrend` is enforced, so the grid searches a partition rather than an overlap.
+
+**In validation the textbook numbers looked indefensible.** The shipped
+`adx>25 / adx<20 / rsi 30-70` ranked **52nd of 73 usable sets** at +0.0020 (t=0.16). The
+winner, `adx>20 / adx<20 / rsi 40-60`, scored +0.0318 (2.61) — and the entire top ten
+wanted `adxTrend` at 20-22.5, so this was not one lucky cell.
+
+**It did not transfer.**
+
+| | inner validation | HOLDOUT | folds |
+|---|---|---|---|
+| `f2-refit-by-regime` (textbook cuts) | +0.0020 (0.16) | **+0.0068 (0.62)** | 4/4 |
+| `f3-fitted-regimes` (fitted cuts) | **+0.0318 (2.61)** | **+0.0009 (0.09)** | 4/4 |
+
+**The candidate that won validation by 16x came last out of sample.** It is not a
+disaster — `f3` still does not invert, and it beats `f2` in `MEAN_REVERTING` (+0.0429 vs
++0.0361) — but it gives back most of `f2`'s bear-market repair (`TREND_BEAR` -0.0316 vs
+-0.0048) and nets out flat.
+
+**This was predicted before the holdout ran, and that is the point.** Searching 116
+partitions has a noise threshold of |t| ≈ **3.08**; the winner's validation t was
+**2.61**, i.e. already below what the search produces on its own. The selection-adjusted
+threshold is not decoration — it called this one in advance, and reading the winner
+against zero instead would have shipped a 16x "improvement" that is worth nothing.
+
+**What this settles:** the regime *cut-points* are not where the edge is. Conditioning on
+regime **at all** is what moved `TREND_BEAR` from -0.1393 to -0.0048; refining where the
+line sits is fitting noise. Stop tuning the boundary. Two conclusions follow — the ADX
+20-vs-25 question is closed (it does not matter out of sample), and the remaining
+candidates for the next real gain are the term *transforms* (the clamps, the ±20%
+momentum normaliser, the RSI regime flip), which are still unfitted, and a longer holdout.
+
+### ACTED ON 2026-07-31: quant dropped from the entry, kept in the exit
+
+The first trading-behaviour change this investigation has produced. `COMBINED_RM` (and
+therefore the live Alpaca book that mirrors it) now gates **entry** on the SENTIMENT
+score. Its **exit** path still reads the full combined score. Knob:
+`combinedEntryUsesQuant` (default **0**; set to 1 to restore, env `PAPER_COMBINED_ENTRY_QUANT`
+as break-glass).
+
+**Why the split rather than dropping quant outright.** The harness only ever measured
+*ranking* — which name to buy. It never tested when to leave, and the books say those two
+questions have different answers:
+
+| | evidence | reading |
+|---|---|---|
+| ENTRY | Names quant ADDED to COMBINED: **38.8% win, -0.71%/trade** (n=134). Names quant VETOED: **44.5%, -0.00%** (n=146). Welch t = -1.21 | quant's distinctive picks are the worse ones |
+| ENTRY | Paired on same name + same day, COMBINED vs SENTIMENT: 42.3% vs 43.0% over 305 pairs | with entry held fixed, quant adds nothing |
+| EXIT | Paired `_RM`, same name + same entry day: COMBINED_RM won **4** trades SENTIMENT_RM lost, **0** the other way (58 pairs, McNemar p≈0.125) | can only be the exit path — one-directional |
+
+**Scope, deliberately narrow.** Only the `_RM` books change. The pure `COMBINED` book
+keeps the combined entry and stays the untouched attribution baseline, so the change can
+be measured against something. Confidence is untouched — quant still moves it, including
+the disagreement penalty at `estimate.ts:163`.
+
+**One invariant had to move with it.** The DECAY exit fires when "the conviction that
+justified the entry has been gone for N runs", so it now reads the *entry* score too —
+otherwise it would stop mirroring the gate it is supposed to mirror. The confirmed-bearish
+`SIGNAL` exit deliberately does NOT follow: that one keeps the full combined read, and it
+is the leg the paired evidence supported.
+
+**Honesty about the evidence.** The entry result is t = -1.21, and the exit result is 4
+discordant events at p ≈ 0.125. Neither is significant. What justifies acting anyway is
+the asymmetry: the holdout study is strong evidence that quant ranks badly, and "stop
+acting on something shown to be actively wrong" is a lower bar than "start acting on
+something new". If the books disagree over the next few months, the knob reverses it.
 
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it

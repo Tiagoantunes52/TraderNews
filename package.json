@@ -15,7 +15,8 @@
     "promote-admin": "tsx scripts/promote-admin.ts",
     "backfill-price-bars": "tsx scripts/backfill-price-bars.ts",
     "explain-day": "tsx scripts/explain-day.ts",
-    "signal-research": "tsx scripts/signal-research.ts"
+    "signal-research": "tsx scripts/signal-research.ts",
+    "signal-research-fit": "tsx scripts/signal-research-fit.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.6.2",

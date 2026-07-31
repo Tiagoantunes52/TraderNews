@@ -58,3 +58,6 @@ AGENTS.md
 
 # Signal-research feature cache (rebuildable from PriceBar)
 .cache/
+
+# VScounter
+.VSCodeCounter

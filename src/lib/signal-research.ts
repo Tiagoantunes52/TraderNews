@@ -75,6 +75,30 @@ export const WARMUP_BARS = 60;
 export type MarketRegime = "TREND_BULL" | "TREND_BEAR" | "MEAN_REVERTING" | "UNCLASSIFIED";
 
 /**
+ * The cut-points that turn SPY's ADX/RSI into a regime label.
+ *
+ * Broken out as data rather than literals so they can be FITTED. The defaults below are
+ * the conventional textbook numbers — which is to say, exactly the kind of unfitted
+ * constant this whole investigation exists to be suspicious of.
+ */
+export type RegimeBoundaries = {
+  /** ADX above this is a trend. */
+  adxTrend: number;
+  /** ADX below this is calm enough to mean-revert. */
+  adxCalm: number;
+  /** RSI band for MEAN_REVERTING — outside it, the market is going somewhere. */
+  rsiLo: number;
+  rsiHi: number;
+};
+
+export const DEFAULT_REGIME_BOUNDARIES: RegimeBoundaries = {
+  adxTrend: 25,
+  adxCalm: 20,
+  rsiLo: 30,
+  rsiHi: 70,
+};
+
+/**
  * Point-in-time features for one (stock, session).
  *
  * Every field is computed from bars at or before `session`. `forward` is the only
@@ -99,6 +123,19 @@ export type FeatureRow = {
   /** 7-day return minus SPY's, the input `calcQuantScore` prefers over `change7d`. */
   relStr7d: number | null;
   marketRegime: MarketRegime;
+  /**
+   * The benchmark's own readings on this session, carried on every row.
+   *
+   * Redundant across the ~105 names sharing a session, and stored anyway: it is what
+   * lets a candidate RE-CLASSIFY the regime under different boundaries while staying a
+   * pure per-row function. Handing candidates a session-keyed benchmark map instead
+   * would mean handing them their whole cross-section, which is the door the harness
+   * keeps shut. The cost is ~25% on a gitignored, rebuildable cache.
+   */
+  benchClose: number | null;
+  benchSma20: number | null;
+  benchRsi14: number | null;
+  benchAdx14: number | null;
   forward: Record<`h${Horizon}`, number>;
 };
 
@@ -143,12 +180,19 @@ export function classifyMarketRegime(
   adx: number | null,
   close: number,
   sma20: number | null,
-  rsi: number | null
+  rsi: number | null,
+  b: RegimeBoundaries = DEFAULT_REGIME_BOUNDARIES
 ): MarketRegime {
   if (adx == null || sma20 == null || rsi == null) return "UNCLASSIFIED";
-  if (adx > 25) return close >= sma20 ? "TREND_BULL" : "TREND_BEAR";
-  if (adx < 20 && rsi >= 30 && rsi <= 70) return "MEAN_REVERTING";
+  if (adx > b.adxTrend) return close >= sma20 ? "TREND_BULL" : "TREND_BEAR";
+  if (adx < b.adxCalm && rsi >= b.rsiLo && rsi <= b.rsiHi) return "MEAN_REVERTING";
   return "UNCLASSIFIED";
+}
+
+/** Re-classify a built row under different boundaries. Pure, per-row, no cross-section. */
+export function regimeOf(f: Pick<FeatureRow, "benchAdx14" | "benchClose" | "benchSma20" | "benchRsi14">, b: RegimeBoundaries): MarketRegime {
+  if (f.benchClose == null) return "UNCLASSIFIED";
+  return classifyMarketRegime(f.benchAdx14, f.benchClose, f.benchSma20, f.benchRsi14, b);
 }
 
 const bySession = (a: { session: string }, b: { session: string }) => a.session.localeCompare(b.session);
@@ -185,7 +229,10 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
   // Benchmark: 7-day return and the market regime, both keyed by session.
   const benchmark = [...stocks.values()].find((s) => s[0]?.ticker === benchmarkTicker) ?? [];
   const benchChange7d = new Map<string, number>();
-  const regimeBySession = new Map<string, MarketRegime>();
+  const benchState = new Map<
+    string,
+    { close: number; sma20: number | null; rsi14: number | null; adx14: number | null }
+  >();
   for (let i = 0; i < benchmark.length; i++) {
     if (i >= 7) {
       const prev = benchmark[i - 7].close;
@@ -194,15 +241,12 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
     if (i < WARMUP_BARS) continue;
     const w = benchmark.slice(i - WARMUP_BARS + 1, i + 1);
     const closes = w.map((b) => b.close);
-    regimeBySession.set(
-      benchmark[i].session,
-      classifyMarketRegime(
-        calcADX(w.map((b) => b.high), w.map((b) => b.low), closes),
-        benchmark[i].close,
-        calcSMA(closes, 20),
-        calcRSI(closes)
-      )
-    );
+    benchState.set(benchmark[i].session, {
+      close: benchmark[i].close,
+      sma20: calcSMA(closes, 20),
+      rsi14: calcRSI(closes),
+      adx14: calcADX(w.map((b) => b.high), w.map((b) => b.low), closes),
+    });
   }
 
   const out: FeatureRow[] = [];
@@ -219,6 +263,7 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
 
       const change7d = calcMomentum(closes, 7);
       const bench = benchChange7d.get(bar.session);
+      const bs = benchState.get(bar.session);
       const forward = {} as Record<`h${Horizon}`, number>;
       for (const h of HORIZONS) forward[`h${h}`] = (series[i + h].close - bar.close) / bar.close;
 
@@ -238,7 +283,11 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
         change7d,
         change30d: calcMomentum(closes, 30),
         relStr7d: change7d != null && bench != null ? change7d - bench : null,
-        marketRegime: regimeBySession.get(bar.session) ?? "UNCLASSIFIED",
+        marketRegime: bs ? classifyMarketRegime(bs.adx14, bs.close, bs.sma20, bs.rsi14) : "UNCLASSIFIED",
+        benchClose: bs?.close ?? null,
+        benchSma20: bs?.sma20 ?? null,
+        benchRsi14: bs?.rsi14 ?? null,
+        benchAdx14: bs?.adx14 ?? null,
         forward,
       });
     }
@@ -352,6 +401,17 @@ function icAcross<K>(
     if (ic != null && Number.isFinite(ic)) ics.push(ic);
   }
   return { mean: ics.length ? mean(ics) : null, tStat: ics.length > 1 ? tStatOneSample(ics) : null, groups: ics.length };
+}
+
+/**
+ * Cross-sectional IC of an arbitrary score, t-stat across sessions.
+ *
+ * Exported so model selection (`signal-research-fit.ts`) scores candidate boundaries with
+ * the same statistic the verdict uses — selecting on one metric and reporting another is
+ * a good way to pick something that only wins on the metric nobody checks.
+ */
+export function crossSectionalIc(rows: { session: string; score: number; ret: number }[]): IcStat {
+  return icAcross(rows.map((r) => ({ key: r.session, x: r.score, y: r.ret })), MIN_NAMES_PER_SESSION);
 }
 
 /**

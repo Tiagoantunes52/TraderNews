@@ -122,6 +122,20 @@ export type RiskConfig = {
   insiderHoldDays: number; // event-book fixed holding period (UTC days ≈ 40 trading days)
   insiderNotional: number; // $ per insider-event position (flat — no confidence weighting)
   brokerReentryRuns: number; // runs before the live book may re-enter a name it exited (0 = never)
+  /**
+   * 1 = COMBINED_RM enters on the combined score (legacy). 0 = it enters on the
+   * SENTIMENT score, dropping the quant leg from the ENTRY decision only.
+   *
+   * The quant leg stays in the exit path either way. That split is the finding: over
+   * 119k stock-days `calcQuantScore`'s holdout ranking IC is -0.0232 (t=-2.25), and in
+   * the books the names quant *added* to COMBINED did worse than the ones it vetoed
+   * (38.8% vs 44.5% win, -0.71% vs -0.00% per trade, n=134/146). But the harness only
+   * ever measured RANKING — which name to buy — and never when to leave. Paired on the
+   * same name and same entry day, COMBINED_RM beat SENTIMENT_RM on 4 trades and lost 0
+   * (58 pairs, McNemar p≈0.125), and that difference can only come from the exit path.
+   * So the evidence against quant is specific to entry, and it is dropped only there.
+   */
+  combinedEntryUsesQuant: number;
 };
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
@@ -147,6 +161,9 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   // of the research-backed 20–60-day drift window for insider cluster buys.
   insiderHoldDays: 56,
   insiderNotional: 1000,
+  // 0 = drop the quant leg from the COMBINED entry decision (it stays in the exit).
+  // See the field comment on RiskConfig for the evidence behind the split.
+  combinedEntryUsesQuant: 0,
   // Runs after a broker entry attempt before the live book may re-enter a name the
   // sim still holds. The re-entry guard exists so a stopped-out name isn't bought
   // straight back, but an unbounded guard leaves the live book flat for as long as
@@ -178,6 +195,7 @@ export function riskConfig(): RiskConfig {
     insiderHoldDays: numEnv("PAPER_INSIDER_HOLD_DAYS", DEFAULT_RISK_CONFIG.insiderHoldDays),
     insiderNotional: numEnv("PAPER_INSIDER_NOTIONAL", DEFAULT_RISK_CONFIG.insiderNotional),
     brokerReentryRuns: numEnv("PAPER_BROKER_REENTRY_RUNS", DEFAULT_RISK_CONFIG.brokerReentryRuns),
+    combinedEntryUsesQuant: numEnv("PAPER_COMBINED_ENTRY_QUANT", DEFAULT_RISK_CONFIG.combinedEntryUsesQuant),
   };
 }
 
@@ -314,6 +332,28 @@ export function deriveSignals(estimate: {
     QUANT: estimate.quantScore == null ? null : scoreToSignal(estimate.quantScore),
     COMBINED: scoreToSignal(estimate.combinedScore),
   };
+}
+
+/**
+ * The score that gates a strategy's ENTRY, which is not always the score it exits on.
+ *
+ * Only COMBINED books can differ, and only when `combinedEntryUsesQuant` is 0: they then
+ * enter on sentiment and keep exiting on the combined read. Every other strategy returns
+ * its own source score unchanged, so this is a no-op for them.
+ *
+ * Returns null when the entry score is unavailable — the caller skips the strategy rather
+ * than falling back to a score the operator asked not to enter on.
+ */
+export function entryScoreFor(
+  strategy: Strategy,
+  scores: { SENTIMENT: number; QUANT: number | null; COMBINED: number },
+  cfg: RiskConfig
+): number | null {
+  const source = STRATEGY_SOURCE[strategy];
+  if (source === "COMBINED" && STRATEGY_IS_RM[strategy] && cfg.combinedEntryUsesQuant === 0) {
+    return scores.SENTIMENT;
+  }
+  return scores[source];
 }
 
 /** Confidence-weighted notional ($). confidence is clamped to [0, 1] defensively. */
@@ -479,6 +519,17 @@ export function riskDistancePct(cfg: RiskConfig, atrPct: number | null | undefin
 export function reconcileRiskManaged(args: {
   score: number;
   signal: string;
+  /**
+   * Score for the ENTRY gate and its decay mirror. Defaults to `score`.
+   *
+   * Split out so the COMBINED books can enter on sentiment alone while still exiting on
+   * the combined read (`combinedEntryUsesQuant`). The decay exit follows this and not
+   * `score` on purpose: it fires when "the conviction that justified the entry has been
+   * gone for N runs", so it has to be measured on whatever justified the entry. The
+   * confirmed-bearish exit deliberately does NOT follow it — that one keeps reading the
+   * full combined signal, which is the leg the paired book evidence supported.
+   */
+  entryScore?: number;
   price: number;
   confidence: number;
   atrPct: number | null; // today's ATR% — entry sizing only
@@ -496,6 +547,7 @@ export function reconcileRiskManaged(args: {
 }): PositionAction {
   const cfg = args.cfg ?? DEFAULT_RISK_CONFIG;
   const { score, signal, price, confidence, atrPct, runsSinceEntry, isNewRun, open } = args;
+  const entryScore = args.entryScore ?? score;
 
   if (open) {
     const { qty, entryPrice } = open;
@@ -504,8 +556,9 @@ export function reconcileRiskManaged(args: {
     // Reset to 0 on any non-bearish read (idempotent); only advance on a new run.
     const bearishStreak = bearish ? (isNewRun ? open.bearishStreak + 1 : open.bearishStreak) : 0;
     // Stale = no entry-grade conviction (score at/below the deadband) — the mirror
-    // of the entry gate. Same advance/reset discipline as the bearish streak.
-    const stale = score <= cfg.entryScoreMin;
+    // of the entry gate, so it reads the SAME score the gate does. Same advance/reset
+    // discipline as the bearish streak.
+    const stale = entryScore <= cfg.entryScoreMin;
     const staleStreak = stale ? (isNewRun ? open.staleStreak + 1 : open.staleStreak) : 0;
     const close = (reason: ExitReason): PositionAction => ({
       type: "CLOSE",
@@ -558,7 +611,7 @@ export function reconcileRiskManaged(args: {
 
   // Flat → enter only on real conviction (deadband) at a meaningful size, sized
   // off the entry-day stop distance so every stop-out costs the same $.
-  if (score > cfg.entryScoreMin && confidence >= cfg.minConfidence && price > 0) {
+  if (entryScore > cfg.entryScoreMin && confidence >= cfg.minConfidence && price > 0) {
     const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
     const qty = riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price;
     if (qty > 0) return { type: "OPEN", qty, price };
