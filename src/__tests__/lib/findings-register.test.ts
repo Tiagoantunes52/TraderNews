@@ -5,14 +5,14 @@ import {
   auditFindingsRegister,
   REGISTER_ASSERTIONS,
   EXIT_LADDER_SAMPLE,
-  ENTRY_SCORE_SAMPLE,
+  ARTICLE_COUNT_SLICE,
   type RegisterFacts,
 } from "@/lib/findings-register";
 
 /** Production as of 2026-07-30, when every claim in the register holds. */
 const asWritten: RegisterFacts = {
   labelledRmExits: 27,
-  closesWithEntryScore: 141,
+  maxArticleCount: 10,
   tradingConfigRowExists: false,
   staleMarkedPositions: 0,
   staleMarkDays: 4,
@@ -49,9 +49,21 @@ describe("auditFindingsRegister()", () => {
     expect(staleIds({ labelledRmExits: EXIT_LADDER_SAMPLE })).toEqual(["exit-labels-too-few"]);
   });
 
-  it("fires once entry scores are numerous enough to bucket", () => {
-    expect(staleIds({ closesWithEntryScore: ENTRY_SCORE_SAMPLE - 1 })).toEqual([]);
-    expect(staleIds({ closesWithEntryScore: ENTRY_SCORE_SAMPLE })).toEqual(["entry-score-too-few"]);
+  // Inverted relative to the sample-size assertions: this one HOLDS while the defect is
+  // live, so it fires when the code is fixed. That is the prompt to delete the bullet.
+  it("stays quiet while articleCount is still capped by the slice", () => {
+    expect(staleIds({ maxArticleCount: ARTICLE_COUNT_SLICE })).toEqual([]);
+    expect(staleIds({ maxArticleCount: ARTICLE_COUNT_SLICE - 4 })).toEqual([]);
+  });
+
+  it("fires once articleCount exceeds the slice — i.e. once someone fixes the ordering", () => {
+    expect(staleIds({ maxArticleCount: ARTICLE_COUNT_SLICE + 1 })).toEqual(["article-count-capped"]);
+  });
+
+  it("names what else moves when that fix lands", () => {
+    const [f] = auditFindingsRegister({ ...asWritten, maxArticleCount: 45 });
+    expect(f.detail).toContain("sentWeight");
+    expect(f.detail).toContain("articleVelocityRatio");
   });
 
   it("escalates the deferred unmanaged-positions defect from latent to active", () => {

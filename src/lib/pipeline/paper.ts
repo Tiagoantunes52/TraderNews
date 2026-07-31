@@ -22,6 +22,7 @@ import {
   reconcileRiskManaged,
   reconcileEventPosition,
   planBrokerAction,
+  sessionsStale,
   entryAttemptHistory,
   isRiskBooksEnabled,
   isInsiderBookEnabled,
@@ -278,10 +279,20 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           where: { stockId: { in: stockIds }, price: { not: null } },
           orderBy: { date: "desc" },
           distinct: ["stockId"],
-          select: { stockId: true, price: true, atrPct: true },
+          select: { stockId: true, price: true, atrPct: true, sessionDate: true },
         })
       : [];
   const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
+
+  // How stale each reference close is, in trading sessions. A stored close is 2 sessions
+  // old: QuantAnalysis is written ~02:20 UTC about a session that had already closed, and
+  // the paper stage acts near the NEXT close. The entry limit buffer is widened by sqrt of
+  // this so a stale anchor stops biasing WHICH orders fill (see `stalenessScaledBuffer`).
+  //
+  // With the live overlay on — it is, in production — every name it covers drops back to 1
+  // below and the widening is a no-op. This matters for what the overlay does not reach:
+  // names the feed omits, and runs where the market is closed or the quote call fails.
+  const staleSessionsByStock = new Map(quantRows.map((q) => [q.stockId, sessionsStale(q.sessionDate, todayUTC)]));
 
   // Price an in-hours run against the live tape (PAPER_LIVE_QUOTES=1, ship-dark).
   //
@@ -303,6 +314,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
   const livePricedStockIds = new Set<string>();
   const liveQuotesEnabled = isLiveQuotesEnabled() && isMarketDataConfigured();
   let marketOpenAtRun = false;
+  // The convergence sweep prices its own names (they have no estimate this run, so they
+  // are absent from `priceByStock`). Counted separately because "how was this run priced"
+  // must cover every path that submits an order, not just the main one.
+  let sweepLivePriced = 0;
+  let sweepTotalPriced = 0;
   if (liveQuotesEnabled && estimates.length > 0) {
     try {
       const open = isPaperTradingConfigured() ? (await getClock()).isOpen : false;
@@ -316,6 +332,8 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           if (p != null && priceByStock.has(stockId)) {
             priceByStock.set(stockId, p);
             livePricedStockIds.add(stockId);
+            // Priced off the tape this instant — no reference lag left to compensate for.
+            staleSessionsByStock.set(stockId, 1);
           }
         }
       }
@@ -1208,6 +1226,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             atrPct: rmOpen ? rmOpen.entryAtrPct : atrPctByStock.get(est.stockId) ?? null,
             confidence: confCalibrator.calibrate(est.confidence),
             cfg,
+            referenceSessions: staleSessionsByStock.get(est.stockId) ?? 1,
           });
           try {
             // The gate may hand back less than asked; re-floor to whole shares (the
@@ -1398,11 +1417,51 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             const lastQuant = await db.quantAnalysis.findMany({
               where: { stockId: { in: missing.map((p) => p.stockId) }, price: { not: null } },
               orderBy: { date: "desc" },
-              select: { stockId: true, price: true, atrPct: true },
+              select: { stockId: true, price: true, atrPct: true, sessionDate: true },
             });
-            const quantByStock = new Map<string, { price: number; atrPct: number | null }>();
+            const quantByStock = new Map<string, { price: number; atrPct: number | null; staleSessions: number }>();
             for (const q of lastQuant) {
-              if (!quantByStock.has(q.stockId)) quantByStock.set(q.stockId, { price: q.price!, atrPct: q.atrPct ?? null });
+              // These names have no estimate today by construction, so their stored close
+              // is the stalest in the run — which is why the tape overlay below matters
+              // more here than anywhere else.
+              if (!quantByStock.has(q.stockId))
+                quantByStock.set(q.stockId, {
+                  price: q.price!,
+                  atrPct: q.atrPct ?? null,
+                  staleSessions: sessionsStale(q.sessionDate, todayUTC),
+                });
+            }
+            sweepTotalPriced = quantByStock.size;
+
+            // Price the sweep off the tape as well.
+            //
+            // Without this the sweep was the ONE order-submitting path still anchored to a
+            // two-session-old close while every other name in the run priced live — and it
+            // is the path whose entire job is repairing divergence, so it was retrying
+            // exactly the names nothing else had refreshed. Same rules as the main overlay:
+            // only while the market is genuinely open, per-stock fallback so a partial
+            // response degrades name-by-name, and only for names that already have a stored
+            // price (a quote alone must not conjure an entry the sweep would otherwise skip).
+            if (liveQuotesEnabled && marketOpenAtRun && quantByStock.size > 0) {
+              try {
+                const { prices: live, errors: quoteErrors } = await getLatestTrades(
+                  missing.filter((p) => quantByStock.has(p.stockId)).map((p) => p.stock.ticker)
+                );
+                errors.push(...quoteErrors);
+                for (const p of missing) {
+                  const q = quantByStock.get(p.stockId);
+                  const px = live.get(p.stock.ticker);
+                  if (q && px != null && px > 0) {
+                    q.price = px;
+                    q.staleSessions = 1; // priced off the tape this instant — no lag left
+                    sweepLivePriced++;
+                  }
+                }
+              } catch (e) {
+                // Degrade to closes rather than skipping the sweep: a quote feed must never
+                // stop the run that repairs live-vs-sim divergence.
+                errors.push(`Sweep live quote overlay failed (priced from closes): ${String(e)}`);
+              }
             }
             // Attempt history for THIS set — the maps built above only cover names with
             // an estimate today, so reusing them would leave the guard permanently
@@ -1441,6 +1500,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
                 atrPct: entryAtrPct ?? quant.atrPct,
                 confidence,
                 cfg,
+                referenceSessions: quant.staleSessions,
               });
               if (action.type !== "ENTER") continue;
               const qty = Math.min(action.qty, Math.floor(allowedAlpacaBuy(ticker, action.qty * quant.price) / quant.price));
@@ -1576,6 +1636,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         marketOpen: marketOpenAtRun,
         livePriced: livePricedStockIds.size,
         totalPriced: priceByStock.size,
+        // The convergence sweep prices its own names and submits its own orders, so it
+        // needs its own numbers — a run where the main path is 100% live and the sweep is
+        // 0% is not a live-priced run, and one aggregate would hide that.
+        sweepLivePriced,
+        sweepTotalPriced,
       },
       cfg,
       decisions,

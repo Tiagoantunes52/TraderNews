@@ -26,8 +26,6 @@ import type { Finding } from "@/lib/daily-review";
 export type RegisterFacts = {
   /** `_RM` closes carrying a real `exitReason` — the sample the exit ladder can be tuned on. */
   labelledRmExits: number;
-  /** Closes carrying an `entryScore`, across ALL books — the claim is not `_RM`-scoped. */
-  closesWithEntryScore: number;
   /** An `AppSetting` row keyed `tradingConfig` exists (knobs no longer at code defaults). */
   tradingConfigRowExists: boolean;
   /** OPEN positions whose last mark is older than `staleMarkDays` — unmanaged in practice. */
@@ -43,6 +41,13 @@ export type RegisterFacts = {
    * Null when there is not yet enough history to score it.
    */
   quantEntryExcessBps: number | null;
+  /**
+   * Largest `articleCount` ever written by the sentiment stage. The `.slice(0, 10)` at
+   * `sentiment.ts:57` runs BEFORE the count, so while the defect is live this cannot
+   * exceed `ARTICLE_COUNT_SLICE`. The moment it does, the slice was moved and the
+   * register's bullet is out of date.
+   */
+  maxArticleCount: number;
 };
 
 export type RegisterAssertion = {
@@ -64,8 +69,8 @@ export type RegisterAssertion = {
  */
 export const EXIT_LADDER_SAMPLE = 60;
 
-/** Same idea for entry-score buckets, which need more rows to be non-degenerate. */
-export const ENTRY_SCORE_SAMPLE = 150;
+/** The `.slice(0, 10)` in `sentiment.ts` that caps `articleCount`. */
+export const ARTICLE_COUNT_SLICE = 10;
 
 export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
   {
@@ -92,15 +97,19 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
     }),
   },
   {
-    id: "entry-score-too-few",
-    section: "Strategy thread",
-    claim: "`entryScore` exists on only 59 closes and is non-monotonic across buckets.",
+    id: "article-count-capped",
+    section: "Confirmed but deliberately deferred",
+    claim: "`articleCount` counts the LLM prompt, not the news — capped at 10 by a slice that runs before the count.",
     check: (f) => ({
-      holds: f.closesWithEntryScore < ENTRY_SCORE_SAMPLE,
+      // Deliberately inverted relative to the "too few samples" assertions: this one
+      // holds while the DEFECT is live, so it goes stale by being FIXED. That is the
+      // point — the prompt to delete the bullet should arrive when the code changes,
+      // not when someone happens to re-read the register.
+      holds: f.maxArticleCount <= ARTICLE_COUNT_SLICE,
       detail:
-        f.closesWithEntryScore >= ENTRY_SCORE_SAMPLE
-          ? `${f.closesWithEntryScore} closes now carry an \`entryScore\` (threshold ${ENTRY_SCORE_SAMPLE}); the bucket monotonicity claim is worth re-running rather than quoting.`
-          : `${f.closesWithEntryScore}/${ENTRY_SCORE_SAMPLE} closes carry a score.`,
+        f.maxArticleCount > ARTICLE_COUNT_SLICE
+          ? `articleCount now reaches ${f.maxArticleCount}, above the slice of ${ARTICLE_COUNT_SLICE} — the count/slice ordering was fixed. Delete this bullet, and re-read anything derived from sentWeight, the confidence bump or articleVelocityRatio, all of which now move.`
+          : `max articleCount ${f.maxArticleCount} ≤ slice ${ARTICLE_COUNT_SLICE}; defect still live.`,
     }),
   },
   {

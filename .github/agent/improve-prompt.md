@@ -26,7 +26,10 @@ understand exactly what invariant was violated.
    corrected behavior is incomplete.
 4. **Prove it green.** Run `npm test` and `npx tsc --noEmit` and iterate until both pass.
    Do not open the PR while either is red.
-5. **Open a PR to `main`:**
+5. **Open a PR to `dev`** — NOT to `main`. `dev` is the integration branch and is
+   routinely ahead of `main`; a PR based on `main` conflicts with work already merged.
+   Pass the base explicitly, since the repo default is `main`:
+   `gh pr create --base dev ...`
    - Title: `auto-improve: <code>` (the finding's `code`).
    - Create the PR **first**, then add the label as a separate step:
      `gh pr create ...` followed by `gh pr edit <n> --add-label auto-improve`.
@@ -45,7 +48,7 @@ understand exactly what invariant was violated.
 ## Hard constraints
 
 - **One finding only.** Fix the finding you were given and nothing else.
-- **Do not merge**, do not push to `main`, do not close other PRs.
+- **Do not merge**, do not push to `dev` or `main` directly, do not close other PRs.
 - **Do not touch unrelated code**, config, secrets, or workflows.
 - If you cannot find a safe, minimal fix, open no PR — explain why in your final message
   instead of guessing. A wrong change to trading logic is worse than none.

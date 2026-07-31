@@ -393,6 +393,104 @@ the asymmetry: the holdout study is strong evidence that quant ranks badly, and 
 acting on something shown to be actively wrong" is a lower bar than "start acting on
 something new". If the books disagree over the next few months, the knob reverses it.
 
+---
+
+## ACTED ON 2026-07-31: the entry limit was anchored to a two-session-old price
+
+**The exits are not the problem — measure before tuning them.** Post-exit drift over the
+10 trading days after every close, excess over SPY: `COMBINED_RM` **-2.97%** (n=44),
+`SENTIMENT_RM` -2.02% (n=56), pure books ≈ -0.9%. Every book sells names that then
+underperform. The `_RM` ladder is the single biggest positive contributor in the system:
+same signals and sizing as pure `COMBINED`, ladder added, and per-trade goes from -0.94%
+(439 closes, -$2,494) to +0.04% (81 closes, +$8). **Leave the exits alone.**
+
+**What was still leaking is the entry anchor.** The 2026-07-27 audit fixed the obvious
+half — buffer 0.5% → 2%, stale entry orders expire, stops re-anchor after the fill
+(cancel-first, 2026-07-29). It missed where the reference price comes from.
+
+`planBrokerAction` prices the limit at `price × (1 + 2%)`, where `price` is the live trade
+when the quote overlay covers the name and the latest stored `QuantAnalysis.price`
+otherwise.
+
+**The overlay IS on in production.** `PAPER_LIVE_QUOTES=1` is set, and the decision log
+confirms it: on 2026-07-30, the only run for which `priceSource` exists, **630 of 630
+decisions are `LIVE_TRADE`** and none are `CLOSE`. Estimate-carrying names are therefore
+anchored to the tape, not to a stale close.
+
+<!-- An earlier draft of this section claimed the overlay was off, from a query that
+     tested `priceSource = 'LIVE'` at the top level. The recorded value is `LIVE_TRADE`
+     and it lives inside `inputs`, so the query matched nothing and absence-of-match was
+     read as absence-of-feature. Corrected the same day; the code below was already
+     written to no-op on live-priced names, so nothing shipped on the bad premise. -->
+
+**The stale-anchor problem is real but narrower than that draft claimed.** It survives
+only where the overlay does not reach:
+
+- the **convergence sweep**, which prices names that have no estimate today from
+  `lastQuant` and never consults the quote feed — by construction the stalest prices in
+  the run;
+- any name the feed omits (the overlay falls back per-stock, deliberately);
+- any run where the market is closed, or the clock/quote call fails.
+
+For those paths the anchor is genuinely two sessions old: `sessionDate` makes it
+measurable rather than arguable, and for all 109 priced names `current_date - sessionDate`
+is **2** — `QuantAnalysis` is written ~02:20 UTC about a session that already closed,
+while the paper stage acts near the *next* close.
+
+**So the buffer was sized against the wrong distribution.** It was chosen from the ONE-day
+gap distribution. Over `PriceBar` since 2025-01-01, the share of moves clearing +2%:
+
+| reference age | miss rate |
+|---|---|
+| 1 session | 16.7% |
+| **2 sessions (production)** | **24.6%** |
+| 3 sessions | 29.6% |
+
+Staleness alone inflates the miss rate by half, and a miss is always a name that *ran* —
+which is precisely the adverse selection the audit identified, re-entering through the
+anchor rather than the buffer.
+
+**Fix shipped:** the entry buffer is scaled by `sqrt(sessions stale)`
+(`stalenessScaledBuffer`), with staleness derived per-name from `sessionDate`
+(`sessionsStale`, weekday count, capped at 5, unknown treated as maximally stale). Chosen
+by measurement, not assumption: scaling this way flattens the miss rate to **16.7% /
+17.4% / 18.1%** across one, two and three sessions. The stop distance and the position
+size are deliberately unchanged — staleness is a fill-certainty problem, not a risk one —
+and a live-priced name drops back to 1, so this is a no-op the moment the real fix lands.
+
+**Scope, stated honestly: on the main path this is already a no-op.** The live overlay
+covers estimate-carrying names, so their staleness is 1 and the buffer is unchanged. The
+widening binds on the convergence sweep, on names the feed misses, and on closed-market or
+failed-quote runs. It is a floor under the failure modes, not the main fix — the main fix
+was already in place and I mis-read the log into thinking otherwise.
+
+**The convergence sweep now prices off the tape too (2026-07-31).** It was the ONE
+order-submitting path still anchored to a stored close while every other name in the run
+priced live — and it is the path whose whole job is repairing divergence, so it was
+retrying exactly the names nothing else had refreshed. It now runs the same overlay under
+the same rules: only while the market is genuinely open, per-stock fallback so a partial
+response degrades name-by-name, and only for names that already have a stored price, so a
+quote alone can never conjure an entry the sweep would otherwise have skipped.
+
+**And the run log can now tell the difference.** `pricing` carries `sweepLivePriced` /
+`sweepTotalPriced` separately from the main path, because one aggregate would hide the
+failure that matters: a run at 100% live on the main path and 0% on the sweep is not a
+live-priced run. `auditRunProvenance` emits `SWEEP_PRICED_STALE` (warn) for exactly that
+shape, and stays silent when the sweep had no names, when the market was closed, and on
+logs written before the fields existed — an alarm that fires on old logs is one nobody
+reads.
+
+**Still unmeasured:** whether any of the execution work helped. Only **11 live BUY orders**
+exist since the 2026-07-27 fixes (the book was frozen most of July), and fill rate sat at
+91-93% both before and after — which was never the right metric anyway, since the audit's
+point was *which* orders miss, not how many. The honest position is that the bias is now
+bounded by construction; there is not yet data to show the outcome moved.
+
+**Method note.** `priceSource` existing on only ONE run is why a wrong query looked like a
+finding. A field that is absent for 13 of 14 days cannot distinguish "feature off" from
+"logging added yesterday" — which is the same absence-reads-as-a-default failure this
+register was created to stop, committed by its own author against his own instrument.
+
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
 is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's
@@ -440,18 +538,65 @@ listed so they are not silently forgotten.
   a fresh estimate is neither marked nor exited. Verified **zero occurrences in prod**
   (all 151 open positions marked 2026-07-24), so this is latent, not active — but
   unguarded.
+<!-- check: article-count-capped -->
+- **`articleCount` counts the LLM prompt, not the news** (traced 2026-07-31, deferred
+  by decision). `sentiment.ts:42-59` fetches the 20 most recent articles in a 7-day
+  window, dedupes by normalised headline, **`.slice(0, 10)`** to bound the prompt — and
+  only *then* sets `articleCount = uniqueArticles.length`. The slice is a legitimate
+  cost control; measuring after it is the defect. Over the window the median stock has
+  **45.5** articles (mean 93, max 1,076) and **91% exceed 10**, so for nine names in ten
+  the field is the constant 10. Three consequences:
+
+  1. `sentWeight = min(0.3 + articleCount/15 × 0.3, 0.6)` (`estimate.ts:139`) is built
+     to reach 0.6 at 15 articles. It **cannot exceed 0.5**, and 88% of rows sit there —
+     the top third of the designed range is dead code and the "dynamic" blend is nearly
+     a constant.
+  2. The `articleCount >= 10 → confidence +0.15` bump fires when the **slice hit its
+     cap**, not when a name is newsworthy. 1,076 articles and exactly 10 are
+     indistinguishable.
+  3. `articleVelocityRatio = last24hCount / (articleCount / 7)` divides an **uncapped**
+     count by a **capped** one, so for 91% of names the denominator is a fixed 1.43/day.
+     Observed median **3.50**, max 196, and **3,177 of 4,787 rows read above 2×** — two
+     thirds of all estimates permanently look like a news spike. Currently persisted but
+     **not consumed anywhere**, so it is a corrupted field awaiting its first reader
+     rather than something distorting trades today.
+
+  **The fix is to count before the slice** — two lines. Deferred deliberately: it moves
+  `sentWeight` for essentially every name, which shifts `combinedScore`, which since
+  2026-07-31 drives `COMBINED_RM`'s **exits**. Entry weighting changed the same day, and
+  the exits are the one component measured to be working (-2.97% post-exit drift excess
+  over SPY). Changing both in one week makes neither measurable. Revisit once the entry
+  change has a few weeks of closes behind it.
 
 ---
 
 ## Strategy thread (predates the execution review)
 
-<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few --> <!-- check: entry-score-too-few -->
+<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few -->
 - **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
   are at code defaults, and that is currently correct. `exitReason` only began
   persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
-  13 labelled exits. Tuning the exit ladder against that is fitting noise. `entryScore`
-  exists on only 59 closes and is non-monotonic across buckets. Revisit after ~4–6 weeks
-  of labelled exits.
+  13 labelled exits. Tuning the exit ladder against that is fitting noise. Revisit after
+  ~4–6 weeks of labelled exits.
+- **Entry score buckets: RESOLVED 2026-07-31, and they do not slope the right way.** The
+  sample passed its threshold (178 closes, was 59), so the claim was re-run instead of
+  requoted. Quintiles of `entryScore` against trade return:
+
+  | quintile | score range | n | mean return | win |
+  |---|---|---|---|---|
+  | 1 (lowest) | 0.203–0.240 | 36 | **-0.90%** | 38.9% |
+  | 2 | 0.240–0.286 | 36 | -1.06% | 44.4% |
+  | 3 | 0.291–0.360 | 36 | -0.98% | 38.9% |
+  | 4 | 0.360–0.465 | 35 | **-1.59%** | 34.3% |
+  | 5 (highest) | 0.480–0.860 | 35 | -1.44% | 40.0% |
+
+  Not monotonic, and mildly **inverted** — the best-scoring quintile underperforms the
+  worst by 0.5pp. Spearman **-0.0917** (n=178, t ≈ -1.22). Underpowered and pooled across
+  overlapping books (COMBINED 89, SENTIMENT 77, QUANT 10, QUANT_RM 2 — the same names on
+  the same days), so the effective N is well below 178 and -1.22 is an upper bound on the
+  evidence. **Do not tune an entry threshold on this.** It is recorded because it is the
+  third independent line pointing the same way as the holdout study and the fill audit,
+  not because it is significant on its own.
 - **The real signal is payoff, not hit rate.** Across 176 `_RM` trades: hit rate
   55–62% (good), payoff 0.54–0.66, losses ~1.6× winners. Classic cut-winners-short
   signature, consistent across three independent books. Cannot be attributed to a

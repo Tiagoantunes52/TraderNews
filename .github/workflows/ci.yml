@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    # `dev` is here because it is the integration branch: day-to-day work and the
+    # improvement agent's PRs both target it, and CI that only watched `main` would let
+    # every one of them through ungated.
+    branches: [main, dev]
 
 jobs:
   unit:

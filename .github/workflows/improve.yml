@@ -3,7 +3,8 @@ name: Improvement Agent
 # Closes the observe → interpret → ACT loop: after the daily post-close review lands,
 # read the latest findings, pick ONE code-addressable finding not already handled, and
 # run the Claude Code Action to implement a minimal fix and open a PR. CI gates the PR;
-# a human reviews and merges — nothing here reaches main on its own.
+# a human reviews and merges into `dev`, then promotes `dev` to `main` separately —
+# nothing here reaches either branch on its own.
 #
 # Trigger: once per trading day, after the review window (the review's pg_cron tick
 # produces the report ~1h after the close, and the interpret step posts to Slack right
@@ -35,7 +36,12 @@ jobs:
       APP_URL: ${{ secrets.APP_URL }}
       PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
     steps:
+      # `dev` explicitly, not the default branch. The agent branches from whatever is
+      # checked out, so checking out `main` would have it diff against a tree that is
+      # behind — re-fixing work already merged into `dev` and opening PRs that conflict.
       - uses: actions/checkout@v7
+        with:
+          ref: dev
 
       - uses: actions/setup-node@v7
         with:

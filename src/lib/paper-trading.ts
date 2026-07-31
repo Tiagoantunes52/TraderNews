@@ -247,6 +247,61 @@ const ENTRY_LIMIT_BUFFER_PCT = numEnv("PAPER_ENTRY_LIMIT_BUFFER_PCT", 0.02);
  */
 const STOP_REANCHOR_TOLERANCE_PCT = numEnv("PAPER_STOP_REANCHOR_TOLERANCE_PCT", 0.005);
 
+/**
+ * Cap on how many sessions of staleness the entry buffer will compensate for.
+ *
+ * Past about a week the reference close is not a stale price, it is a different price,
+ * and widening further buys fills at the cost of entering wherever the name has drifted
+ * to. At that point the honest move is to skip the name, not to chase it — but that is a
+ * behaviour change on top of a behaviour change, so this only bounds the widening.
+ */
+const MAX_STALE_SESSIONS = 5;
+
+/**
+ * Trading sessions between the close a price came from and the run acting on it.
+ *
+ * Weekday count, so a Friday run on Wednesday's close returns 2. Holidays are NOT
+ * modelled, which over-counts staleness by a session around them — that widens the entry
+ * buffer slightly, which is the safe direction (a marginally worse fill price rather than
+ * a miss). Returns at least 1: a same-day reference still has a full session of drift
+ * between the close it came from and the order it prices.
+ */
+export function sessionsStale(sessionDate: Date | null | undefined, asOf: Date): number {
+  if (sessionDate == null) return MAX_STALE_SESSIONS; // unknown staleness is not "fresh"
+  const days = utcDaysBetween(sessionDate, asOf);
+  if (!Number.isFinite(days) || days <= 0) return 1;
+  let sessions = 0;
+  for (let i = 1; i <= days; i++) {
+    const d = new Date(Date.UTC(sessionDate.getUTCFullYear(), sessionDate.getUTCMonth(), sessionDate.getUTCDate() + i));
+    const dow = d.getUTCDay();
+    if (dow !== 0 && dow !== 6) sessions++;
+  }
+  return clampNum(Math.max(1, sessions), 1, MAX_STALE_SESSIONS);
+}
+
+/**
+ * Widen the entry limit buffer to cover the drift a stale reference price hides.
+ *
+ * The 2% buffer was sized against the ONE-day gap distribution. Over the corpus since
+ * 2025-01-01 the fraction of moves clearing +2% is 16.7% at one session, **24.6% at two,
+ * 29.6% at three** — staleness alone inflates the miss rate by half, and every one of
+ * those misses is a name that RAN, which is exactly the adverse selection being fixed.
+ *
+ * sqrt(sessions) because dispersion grows with the square root of horizon. Measured, not
+ * assumed: scaling this way puts the miss rate at 16.7% / 17.4% / 18.1% across one, two
+ * and three sessions — flat, which is the whole point.
+ *
+ * WHEN THIS ACTUALLY BINDS: `PAPER_LIVE_QUOTES=1` is on in production and the overlay
+ * prices estimate-carrying names off the tape, so those come through at 1 session and the
+ * scaling is a no-op for them. It binds on the paths the overlay does not reach — the
+ * convergence sweep (which prices from `lastQuant` and never consults the feed), names the
+ * feed omits, and closed-market or failed-quote runs. A floor under the failure modes, not
+ * the main entry path.
+ */
+export function stalenessScaledBuffer(buffer: number, sessions: number): number {
+  return buffer * Math.sqrt(clampNum(sessions, 1, MAX_STALE_SESSIONS));
+}
+
 // A recorded intent that has NOT yet been confirmed at the broker. Written before the
 // submission so a crash in between leaves something to recover from, and cleared to the
 // real Alpaca status the moment the broker responds.
@@ -724,9 +779,18 @@ export function planBrokerAction(input: {
   confidence: number;
   cfg?: RiskConfig;
   entryLimitBufferPct?: number;
+  /**
+   * Trading sessions between the close `price` came from and now (see `sessionsStale`).
+   * Widens the entry buffer to cover the drift a stale reference hides. Defaults to 1,
+   * which is the old behaviour exactly.
+   */
+  referenceSessions?: number;
 }): BrokerAction {
   const cfg = input.cfg ?? DEFAULT_RISK_CONFIG;
-  const buffer = input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT;
+  const buffer = stalenessScaledBuffer(
+    input.entryLimitBufferPct ?? ENTRY_LIMIT_BUFFER_PCT,
+    input.referenceSessions ?? 1
+  );
   const { opened, stillLong, exitReason, held, avgEntryPrice, currentPrice, restingProtectiveType, restingTrailPercent, restingStopPrice, price, atrPct, confidence } = input;
   // Unknown history ⇒ assume the broker already acted, so we never catch-up-buy a name
   // that was actually stopped out. Only an explicit `false` unlocks a catch-up entry.

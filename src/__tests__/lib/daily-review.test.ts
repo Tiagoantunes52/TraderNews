@@ -415,6 +415,48 @@ describe("auditRunProvenance", () => {
     const f = auditRunProvenance(withPricing({ enabled: false, marketOpen: false, livePriced: 0, totalPriced: 12 }));
     expect(f[0].detail).toContain("Live quotes disabled");
   });
+
+  // The convergence sweep submits its OWN entry orders off its OWN prices. Before the
+  // sweep overlay it was the only order-submitting path still anchored to a two-session-
+  // old close while everything else priced live — and it retries precisely the names
+  // nothing else refreshed, so the bias landed where it did the most damage.
+  it("reports the sweep's own pricing alongside the main path", () => {
+    const f = auditRunProvenance(
+      withPricing({ enabled: true, marketOpen: true, livePriced: 12, totalPriced: 12, sweepLivePriced: 3, sweepTotalPriced: 3 })
+    );
+    expect(f).toHaveLength(1);
+    expect(f[0].detail).toContain("Convergence sweep: 3/3 live");
+  });
+
+  it("WARNS when the sweep priced stale while the main path priced live", () => {
+    const f = auditRunProvenance(
+      withPricing({ enabled: true, marketOpen: true, livePriced: 12, totalPriced: 12, sweepLivePriced: 0, sweepTotalPriced: 4 })
+    );
+    const warn = f.find((x) => x.code === "SWEEP_PRICED_STALE");
+    expect(warn).toBeDefined();
+    expect(warn!.severity).toBe("warn");
+    expect(warn!.title).toContain("0/4");
+  });
+
+  it("does not warn when the sweep had no names to price", () => {
+    const f = auditRunProvenance(
+      withPricing({ enabled: true, marketOpen: true, livePriced: 12, totalPriced: 12, sweepLivePriced: 0, sweepTotalPriced: 0 })
+    );
+    expect(f.some((x) => x.code === "SWEEP_PRICED_STALE")).toBe(false);
+  });
+
+  it("does not warn when nothing was live-priced — that is the market-closed case, not a gap", () => {
+    const f = auditRunProvenance(
+      withPricing({ enabled: true, marketOpen: false, livePriced: 0, totalPriced: 12, sweepLivePriced: 0, sweepTotalPriced: 4 })
+    );
+    expect(f.some((x) => x.code === "SWEEP_PRICED_STALE")).toBe(false);
+  });
+
+  it("stays silent about the sweep on logs written before it recorded any", () => {
+    const f = auditRunProvenance(withPricing({ enabled: true, marketOpen: true, livePriced: 12, totalPriced: 12 }));
+    expect(f[0].detail).not.toContain("Convergence sweep");
+    expect(f.some((x) => x.code === "SWEEP_PRICED_STALE")).toBe(false);
+  });
 });
 
 describe("auditRiskBlocks", () => {
