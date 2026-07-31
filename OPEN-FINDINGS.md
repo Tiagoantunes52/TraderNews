@@ -228,12 +228,42 @@ non-`paper-api` host), so the cost is measurement time, not money.
 source's entry-bucket excess over the universe, emitting `SIGNAL_INVERTED` when it turns
 significantly negative. That is a prompt to investigate, not a trigger to act.
 
-**Next step: a signal research harness, not the portfolio backtest.** The study above ran
-in throwaway scripts in ~20 minutes; promoting it (IC both ways, bucket monotonicity,
-train/test split, regime conditioning, pre-registered hypotheses) is roughly a tenth of
-the Phase-2 portfolio backtest and shares its metrics layer. `quantScore`'s defect is a
-signal defect — fill modelling is not needed to fix it. Hypothesis #1 is the 7-day vs
-30-day momentum horizon, the one result with prior evidence on both sides of the split.
+**The study above is now reproducible.** It originally ran in throwaway scripts that were
+deleted; `npm run signal-research` (`src/lib/signal-research.ts`, pure) rebuilds it from
+`PriceBar` — daily cross-sectional IC with the t-stat across sessions, time-series IC,
+`scoreToSignal` buckets, entry excess over the session universe, fixed split plus rolling
+walk-forward, all conditioned on market regime. It models **no fills, sizing, exits, caps
+or cash**, so it cannot say a change makes money; it can only say whether one score ranks
+names better than another out of sample. Candidates are **pre-registered in
+`signal-research-variants.ts`**, so `k` stays honest and the reported noise threshold
+means something. Two controls run on every invocation regardless of `--candidates`, and
+the driver exits non-zero if they fail: `oracle` must return IC exactly 1.0000, `mom30`
+must detect the known momentum effect. A null result off an unverified instrument is
+worth nothing.
+
+**First run, 2026-07-31 — all three pre-registered hypotheses FAILED.** Split 2025-01-01,
+horizon 5, 801 train / 383 holdout sessions:
+
+| candidate | TRAIN | HOLDOUT | entry excess | verdict |
+|---|---|---|---|---|
+| `oracle` | +1.0000 | +1.0000 | — | control ok |
+| `mom30` | +0.0227 (2.63) | +0.0201 (1.68) | +7.4 bps | control ok |
+| `baseline` | +0.0109 (1.55) | **-0.0232 (-2.25)** | -28.2 bps | FAILS |
+| `h1-momentum-horizon` | +0.0205 (2.80) | -0.0014 (-0.14) | +6.5 bps | FAILS |
+| `h2-no-vol-damper` | +0.0125 (1.62) | -0.0230 (-2.04) | +4.3 bps | FAILS |
+| `h3-spread-normalised` | +0.0079 (1.11) | -0.0246 (-2.36) | -13.1 bps | FAILS |
+
+`k=4` → noise threshold |t| ≈ 1.67, which nothing above clears out of sample. **`h1` is
+the informative failure:** `change30d` on its own survives the holdout (+0.0201, and 4/4
+folds sign-consistent), but dropped into the composite in place of `change7d` it collapses
+to -0.0014 and holds sign in only 1/4 folds. The momentum leg is not what is broken — the
+composite destroys a leg that works on its own. Swapping single terms is therefore the
+wrong move; the blend itself needs refitting.
+
+Holdout by market regime says the same thing louder. `baseline` is **-0.1393 (t=-6.68)**
+in `TREND_BEAR` and +0.0336 (1.97) in `MEAN_REVERTING`; every variant repeats that shape.
+The score is not uniformly weak — it is actively wrong when the market trends down, which
+is where a long-only book takes its losses.
 
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
