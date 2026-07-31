@@ -16,6 +16,7 @@ import {
   RM_STRATEGIES,
   STRATEGY_BOOK,
   STRATEGY_SOURCE,
+  entryScoreFor,
   STRATEGY_IS_RM,
   reconcilePosition,
   reconcileRiskManaged,
@@ -582,11 +583,18 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
       const isNewRun = open ? startOfUtcDay(open.lastMarkDate) < todayUTC : true;
       const decisionConfidence = STRATEGY_IS_RM[strategy] ? rmConfidence : est.confidence;
 
+      // Entry may be gated on a different score than the exit reads — COMBINED_RM
+      // enters on sentiment alone when `combinedEntryUsesQuant` is 0, while its exits
+      // keep the full combined signal. Identity for every other strategy.
+      const entryScore = entryScoreFor(strategy, sourceScores, cfg);
+      if (entryScore == null) continue;
+
       let action: PositionAction;
       if (STRATEGY_IS_RM[strategy]) {
         action = reconcileRiskManaged({
           score,
           signal,
+          entryScore,
           price,
           confidence: rmConfidence,
           atrPct,

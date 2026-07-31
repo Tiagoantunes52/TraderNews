@@ -358,6 +358,41 @@ line sits is fitting noise. Stop tuning the boundary. Two conclusions follow —
 candidates for the next real gain are the term *transforms* (the clamps, the ±20%
 momentum normaliser, the RSI regime flip), which are still unfitted, and a longer holdout.
 
+### ACTED ON 2026-07-31: quant dropped from the entry, kept in the exit
+
+The first trading-behaviour change this investigation has produced. `COMBINED_RM` (and
+therefore the live Alpaca book that mirrors it) now gates **entry** on the SENTIMENT
+score. Its **exit** path still reads the full combined score. Knob:
+`combinedEntryUsesQuant` (default **0**; set to 1 to restore, env `PAPER_COMBINED_ENTRY_QUANT`
+as break-glass).
+
+**Why the split rather than dropping quant outright.** The harness only ever measured
+*ranking* — which name to buy. It never tested when to leave, and the books say those two
+questions have different answers:
+
+| | evidence | reading |
+|---|---|---|
+| ENTRY | Names quant ADDED to COMBINED: **38.8% win, -0.71%/trade** (n=134). Names quant VETOED: **44.5%, -0.00%** (n=146). Welch t = -1.21 | quant's distinctive picks are the worse ones |
+| ENTRY | Paired on same name + same day, COMBINED vs SENTIMENT: 42.3% vs 43.0% over 305 pairs | with entry held fixed, quant adds nothing |
+| EXIT | Paired `_RM`, same name + same entry day: COMBINED_RM won **4** trades SENTIMENT_RM lost, **0** the other way (58 pairs, McNemar p≈0.125) | can only be the exit path — one-directional |
+
+**Scope, deliberately narrow.** Only the `_RM` books change. The pure `COMBINED` book
+keeps the combined entry and stays the untouched attribution baseline, so the change can
+be measured against something. Confidence is untouched — quant still moves it, including
+the disagreement penalty at `estimate.ts:163`.
+
+**One invariant had to move with it.** The DECAY exit fires when "the conviction that
+justified the entry has been gone for N runs", so it now reads the *entry* score too —
+otherwise it would stop mirroring the gate it is supposed to mirror. The confirmed-bearish
+`SIGNAL` exit deliberately does NOT follow: that one keeps the full combined read, and it
+is the leg the paired evidence supported.
+
+**Honesty about the evidence.** The entry result is t = -1.21, and the exit result is 4
+discordant events at p ≈ 0.125. Neither is significant. What justifies acting anyway is
+the asymmetry: the holdout study is strong evidence that quant ranks badly, and "stop
+acting on something shown to be actively wrong" is a lower bar than "start acting on
+something new". If the books disagree over the next few months, the knob reverses it.
+
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
 is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's

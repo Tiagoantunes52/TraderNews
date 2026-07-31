@@ -12,6 +12,7 @@ import {
   isPaperTradeEligible,
   reconcilePosition,
   reconcileRiskManaged,
+  entryScoreFor,
   planBrokerAction,
   entryAttemptHistory,
   isBrokerStopsEnabled,
@@ -1007,5 +1008,126 @@ describe("planBrokerAction() — stop re-anchoring after the fill", () => {
   it("does not flag a repair with nothing resting — there is no order to cancel", () => {
     const action = planBrokerAction({ ...base, restingProtectiveType: null });
     expect(action).toMatchObject({ type: "REPAIR_STOP", replacesResting: false });
+  });
+});
+
+// ── Quant dropped from the entry, kept in the exit ───────────────────────────
+//
+// The finding this encodes: `calcQuantScore` ranks names badly out of sample
+// (holdout IC -0.0232, t=-2.25), and in the books the names quant ADDED to COMBINED
+// did worse than the ones it vetoed. But that is all about ENTRY selection — the
+// research harness never measured when to leave, and the paired book evidence
+// (4-0 on discordant pairs) points the other way for the exit. So quant leaves the
+// entry gate and stays in the exit path, and these tests pin that split.
+
+describe("entryScoreFor()", () => {
+  const off: RiskConfig = { ...DEFAULT_RISK_CONFIG, combinedEntryUsesQuant: 0 };
+  const on: RiskConfig = { ...DEFAULT_RISK_CONFIG, combinedEntryUsesQuant: 1 };
+  const scores = { SENTIMENT: 0.7, QUANT: -0.9, COMBINED: 0.1 };
+
+  it("gates COMBINED_RM entry on sentiment alone when the quant leg is off", () => {
+    expect(entryScoreFor("COMBINED_RM", scores, off)).toBe(0.7);
+  });
+
+  it("gates COMBINED_RM entry on the combined score when the quant leg is on", () => {
+    expect(entryScoreFor("COMBINED_RM", scores, on)).toBe(0.1);
+  });
+
+  it("leaves the PURE COMBINED book alone — it stays the untouched attribution baseline", () => {
+    expect(entryScoreFor("COMBINED", scores, off)).toBe(0.1);
+    expect(entryScoreFor("COMBINED", scores, on)).toBe(0.1);
+  });
+
+  it("is identity for every non-COMBINED strategy", () => {
+    expect(entryScoreFor("SENTIMENT_RM", scores, off)).toBe(0.7);
+    expect(entryScoreFor("QUANT_RM", scores, off)).toBe(-0.9);
+    expect(entryScoreFor("SENTIMENT", scores, off)).toBe(0.7);
+    expect(entryScoreFor("QUANT", scores, off)).toBe(-0.9);
+  });
+
+  it("returns null when the source score is absent, rather than substituting another", () => {
+    expect(entryScoreFor("QUANT_RM", { ...scores, QUANT: null }, off)).toBeNull();
+  });
+});
+
+describe("reconcileRiskManaged() — entry/exit score split", () => {
+  const cfg: RiskConfig = DEFAULT_RISK_CONFIG;
+  const openPos = {
+    qty: 10,
+    entryPrice: 100,
+    peakPrice: 100,
+    bearishStreak: 0,
+    staleStreak: 0,
+    entryAtrPct: null as number | null,
+  };
+  const call = (o: Record<string, unknown>) =>
+    reconcileRiskManaged({
+      score: 0.5,
+      signal: "BUY",
+      price: 100,
+      confidence: 0.5,
+      atrPct: null,
+      runsSinceEntry: 5,
+      isNewRun: true,
+      open: null,
+      cfg,
+      ...o,
+    } as Parameters<typeof reconcileRiskManaged>[0]);
+
+  it("opens on the entry score even when the exit score is below the deadband", () => {
+    // Sentiment says buy (0.6), the combined read is weak (0.1). Entry follows sentiment.
+    expect(call({ score: 0.1, entryScore: 0.6 }).type).toBe("OPEN");
+  });
+
+  it("refuses to open when the entry score is below the deadband, whatever the exit score says", () => {
+    expect(call({ score: 0.9, entryScore: 0.1 }).type).toBe("NONE");
+  });
+
+  it("defaults entryScore to score, so every other book is unaffected", () => {
+    expect(call({ score: 0.5 }).type).toBe("OPEN");
+    expect(call({ score: 0.1 }).type).toBe("NONE");
+  });
+
+  it("measures staleness on the ENTRY score — the decay exit mirrors the gate it entered on", () => {
+    // Entry score has decayed below the deadband for long enough, in profit → DECAY.
+    const decayed = call({
+      score: 0.9,
+      entryScore: 0.0,
+      signal: "NEUTRAL",
+      price: 110,
+      open: { ...openPos, staleStreak: cfg.decayRuns - 1 },
+    });
+    expect(decayed.type).toBe("CLOSE");
+    expect((decayed as { reason?: string }).reason).toBe("DECAY");
+  });
+
+  it("does NOT decay out while the entry score still has conviction", () => {
+    const held = call({
+      score: 0.0,
+      entryScore: 0.9,
+      signal: "NEUTRAL",
+      price: 110,
+      open: { ...openPos, staleStreak: cfg.decayRuns - 1 },
+    });
+    expect(held.type).toBe("MARK");
+  });
+
+  it("keeps the confirmed-bearish exit on the FULL signal — this is the leg quant stays in", () => {
+    // Sentiment is still strong, but the combined read has gone bearish for N runs.
+    // That exit must still fire; it is the whole point of keeping quant in the exit.
+    const exited = call({
+      score: -0.5,
+      entryScore: 0.9,
+      signal: "SELL",
+      open: { ...openPos, bearishStreak: cfg.signalConfirmRuns - 1 },
+    });
+    expect(exited.type).toBe("CLOSE");
+    expect((exited as { reason?: string }).reason).toBe("SIGNAL");
+  });
+
+  it("still stops out on price regardless of either score", () => {
+    const stopped = call({ score: 0.9, entryScore: 0.9, signal: "BUY", price: 80, open: openPos });
+    expect(stopped.type).toBe("CLOSE");
+    expect((stopped as { reason?: string }).reason).toBe("STOP");
   });
 });
