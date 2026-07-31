@@ -287,13 +287,16 @@ listed so they are not silently forgotten.
 
 ## Strategy thread (predates the execution review)
 
-<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few --> <!-- check: entry-score-too-few -->
+<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few -->
 - **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
   are at code defaults, and that is currently correct. `exitReason` only began
   persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
-  13 labelled exits. Tuning the exit ladder against that is fitting noise. `entryScore`
-  exists on only 59 closes and is non-monotonic across buckets. Revisit after ~4–6 weeks
-  of labelled exits.
+  13 labelled exits. Tuning the exit ladder against that is fitting noise. Revisit after
+  ~4–6 weeks of labelled exits. `entryScore` now carries on 178 closes, past the
+  150-close bucketing threshold as of 2026-07-31 — the earlier "59 closes,
+  non-monotonic" reading no longer holds and is retracted rather than requoted; bucket
+  monotonicity needs a fresh run against current data before it can be claimed either
+  way.
 - **The real signal is payoff, not hit rate.** Across 176 `_RM` trades: hit rate
   55–62% (good), payoff 0.54–0.66, losses ~1.6× winners. Classic cut-winners-short
   signature, consistent across three independent books. Cannot be attributed to a
