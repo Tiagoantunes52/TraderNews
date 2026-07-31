@@ -41,6 +41,13 @@ export type RegisterFacts = {
    * Null when there is not yet enough history to score it.
    */
   quantEntryExcessBps: number | null;
+  /**
+   * Largest `articleCount` ever written by the sentiment stage. The `.slice(0, 10)` at
+   * `sentiment.ts:57` runs BEFORE the count, so while the defect is live this cannot
+   * exceed `ARTICLE_COUNT_SLICE`. The moment it does, the slice was moved and the
+   * register's bullet is out of date.
+   */
+  maxArticleCount: number;
 };
 
 export type RegisterAssertion = {
@@ -61,6 +68,9 @@ export type RegisterAssertion = {
  * and being early costs a prompt, while being late costs weeks of untuned exits.
  */
 export const EXIT_LADDER_SAMPLE = 60;
+
+/** The `.slice(0, 10)` in `sentiment.ts` that caps `articleCount`. */
+export const ARTICLE_COUNT_SLICE = 10;
 
 export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
   {
@@ -84,6 +94,22 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
         f.labelledRmExits >= EXIT_LADDER_SAMPLE
           ? `${f.labelledRmExits} labelled \`_RM\` exits have now accumulated (threshold ${EXIT_LADDER_SAMPLE}). The exit ladder can be attributed to a rung — this is the register's own revisit trigger firing.`
           : `${f.labelledRmExits}/${EXIT_LADDER_SAMPLE} labelled exits.`,
+    }),
+  },
+  {
+    id: "article-count-capped",
+    section: "Confirmed but deliberately deferred",
+    claim: "`articleCount` counts the LLM prompt, not the news — capped at 10 by a slice that runs before the count.",
+    check: (f) => ({
+      // Deliberately inverted relative to the "too few samples" assertions: this one
+      // holds while the DEFECT is live, so it goes stale by being FIXED. That is the
+      // point — the prompt to delete the bullet should arrive when the code changes,
+      // not when someone happens to re-read the register.
+      holds: f.maxArticleCount <= ARTICLE_COUNT_SLICE,
+      detail:
+        f.maxArticleCount > ARTICLE_COUNT_SLICE
+          ? `articleCount now reaches ${f.maxArticleCount}, above the slice of ${ARTICLE_COUNT_SLICE} — the count/slice ordering was fixed. Delete this bullet, and re-read anything derived from sentWeight, the confidence bump or articleVelocityRatio, all of which now move.`
+          : `max articleCount ${f.maxArticleCount} ≤ slice ${ARTICLE_COUNT_SLICE}; defect still live.`,
     }),
   },
   {

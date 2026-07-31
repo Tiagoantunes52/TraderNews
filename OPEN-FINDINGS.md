@@ -538,6 +538,35 @@ listed so they are not silently forgotten.
   a fresh estimate is neither marked nor exited. Verified **zero occurrences in prod**
   (all 151 open positions marked 2026-07-24), so this is latent, not active — but
   unguarded.
+<!-- check: article-count-capped -->
+- **`articleCount` counts the LLM prompt, not the news** (traced 2026-07-31, deferred
+  by decision). `sentiment.ts:42-59` fetches the 20 most recent articles in a 7-day
+  window, dedupes by normalised headline, **`.slice(0, 10)`** to bound the prompt — and
+  only *then* sets `articleCount = uniqueArticles.length`. The slice is a legitimate
+  cost control; measuring after it is the defect. Over the window the median stock has
+  **45.5** articles (mean 93, max 1,076) and **91% exceed 10**, so for nine names in ten
+  the field is the constant 10. Three consequences:
+
+  1. `sentWeight = min(0.3 + articleCount/15 × 0.3, 0.6)` (`estimate.ts:139`) is built
+     to reach 0.6 at 15 articles. It **cannot exceed 0.5**, and 88% of rows sit there —
+     the top third of the designed range is dead code and the "dynamic" blend is nearly
+     a constant.
+  2. The `articleCount >= 10 → confidence +0.15` bump fires when the **slice hit its
+     cap**, not when a name is newsworthy. 1,076 articles and exactly 10 are
+     indistinguishable.
+  3. `articleVelocityRatio = last24hCount / (articleCount / 7)` divides an **uncapped**
+     count by a **capped** one, so for 91% of names the denominator is a fixed 1.43/day.
+     Observed median **3.50**, max 196, and **3,177 of 4,787 rows read above 2×** — two
+     thirds of all estimates permanently look like a news spike. Currently persisted but
+     **not consumed anywhere**, so it is a corrupted field awaiting its first reader
+     rather than something distorting trades today.
+
+  **The fix is to count before the slice** — two lines. Deferred deliberately: it moves
+  `sentWeight` for essentially every name, which shifts `combinedScore`, which since
+  2026-07-31 drives `COMBINED_RM`'s **exits**. Entry weighting changed the same day, and
+  the exits are the one component measured to be working (-2.97% post-exit drift excess
+  over SPY). Changing both in one week makes neither measurable. Revisit once the entry
+  change has a few weeks of closes behind it.
 
 ---
 

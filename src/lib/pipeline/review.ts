@@ -473,7 +473,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
   // there being trusted.
   try {
-    const [labelledRmExits, cfgRow, staleMarked, rmEntries] = await Promise.all([
+    const [labelledRmExits, cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
       db.simPosition.count({
         where: { strategy: { in: RM_STRATEGIES }, status: "CLOSED", exitReason: { not: null } },
       }),
@@ -487,10 +487,14 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
           entryDate: { gte: new Date(todayUTC.getTime() - REGISTER_ENTRY_WINDOW_DAYS * 86_400_000) },
         },
       }),
+      // All-time, not windowed: while the slice/count ordering defect is live no row can
+      // exceed the slice, so the first row that does is the signal that it was fixed.
+      db.sentiment.aggregate({ _max: { articleCount: true } }),
     ]);
 
     const facts: RegisterFacts = {
       labelledRmExits,
+      maxArticleCount: maxArticles._max.articleCount ?? 0,
       tradingConfigRowExists: cfgRow != null,
       staleMarkedPositions: staleMarked,
       staleMarkDays: REGISTER_STALE_MARK_DAYS,
