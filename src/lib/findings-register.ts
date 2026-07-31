@@ -26,8 +26,6 @@ import type { Finding } from "@/lib/daily-review";
 export type RegisterFacts = {
   /** `_RM` closes carrying a real `exitReason` — the sample the exit ladder can be tuned on. */
   labelledRmExits: number;
-  /** Closes carrying an `entryScore`, across ALL books — the claim is not `_RM`-scoped. */
-  closesWithEntryScore: number;
   /** An `AppSetting` row keyed `tradingConfig` exists (knobs no longer at code defaults). */
   tradingConfigRowExists: boolean;
   /** OPEN positions whose last mark is older than `staleMarkDays` — unmanaged in practice. */
@@ -64,9 +62,6 @@ export type RegisterAssertion = {
  */
 export const EXIT_LADDER_SAMPLE = 60;
 
-/** Same idea for entry-score buckets, which need more rows to be non-degenerate. */
-export const ENTRY_SCORE_SAMPLE = 150;
-
 export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
   {
     id: "knobs-at-defaults",
@@ -89,18 +84,6 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
         f.labelledRmExits >= EXIT_LADDER_SAMPLE
           ? `${f.labelledRmExits} labelled \`_RM\` exits have now accumulated (threshold ${EXIT_LADDER_SAMPLE}). The exit ladder can be attributed to a rung — this is the register's own revisit trigger firing.`
           : `${f.labelledRmExits}/${EXIT_LADDER_SAMPLE} labelled exits.`,
-    }),
-  },
-  {
-    id: "entry-score-too-few",
-    section: "Strategy thread",
-    claim: "`entryScore` exists on only 59 closes and is non-monotonic across buckets.",
-    check: (f) => ({
-      holds: f.closesWithEntryScore < ENTRY_SCORE_SAMPLE,
-      detail:
-        f.closesWithEntryScore >= ENTRY_SCORE_SAMPLE
-          ? `${f.closesWithEntryScore} closes now carry an \`entryScore\` (threshold ${ENTRY_SCORE_SAMPLE}); the bucket monotonicity claim is worth re-running rather than quoting.`
-          : `${f.closesWithEntryScore}/${ENTRY_SCORE_SAMPLE} closes carry a score.`,
     }),
   },
   {

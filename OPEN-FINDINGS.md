@@ -543,13 +543,31 @@ listed so they are not silently forgotten.
 
 ## Strategy thread (predates the execution review)
 
-<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few --> <!-- check: entry-score-too-few -->
+<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few -->
 - **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
   are at code defaults, and that is currently correct. `exitReason` only began
   persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
-  13 labelled exits. Tuning the exit ladder against that is fitting noise. `entryScore`
-  exists on only 59 closes and is non-monotonic across buckets. Revisit after ~4–6 weeks
-  of labelled exits.
+  13 labelled exits. Tuning the exit ladder against that is fitting noise. Revisit after
+  ~4–6 weeks of labelled exits.
+- **Entry score buckets: RESOLVED 2026-07-31, and they do not slope the right way.** The
+  sample passed its threshold (178 closes, was 59), so the claim was re-run instead of
+  requoted. Quintiles of `entryScore` against trade return:
+
+  | quintile | score range | n | mean return | win |
+  |---|---|---|---|---|
+  | 1 (lowest) | 0.203–0.240 | 36 | **-0.90%** | 38.9% |
+  | 2 | 0.240–0.286 | 36 | -1.06% | 44.4% |
+  | 3 | 0.291–0.360 | 36 | -0.98% | 38.9% |
+  | 4 | 0.360–0.465 | 35 | **-1.59%** | 34.3% |
+  | 5 (highest) | 0.480–0.860 | 35 | -1.44% | 40.0% |
+
+  Not monotonic, and mildly **inverted** — the best-scoring quintile underperforms the
+  worst by 0.5pp. Spearman **-0.0917** (n=178, t ≈ -1.22). Underpowered and pooled across
+  overlapping books (COMBINED 89, SENTIMENT 77, QUANT 10, QUANT_RM 2 — the same names on
+  the same days), so the effective N is well below 178 and -1.22 is an upper bound on the
+  evidence. **Do not tune an entry threshold on this.** It is recorded because it is the
+  third independent line pointing the same way as the holdout study and the fill audit,
+  not because it is significant on its own.
 - **The real signal is payoff, not hit rate.** Across 176 `_RM` trades: hit rate
   55–62% (good), payoff 0.54–0.66, losses ~1.6× winners. Classic cut-winners-short
   signature, consistent across three independent books. Cannot be attributed to a

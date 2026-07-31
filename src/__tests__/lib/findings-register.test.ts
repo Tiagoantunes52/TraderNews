@@ -5,14 +5,12 @@ import {
   auditFindingsRegister,
   REGISTER_ASSERTIONS,
   EXIT_LADDER_SAMPLE,
-  ENTRY_SCORE_SAMPLE,
   type RegisterFacts,
 } from "@/lib/findings-register";
 
 /** Production as of 2026-07-30, when every claim in the register holds. */
 const asWritten: RegisterFacts = {
   labelledRmExits: 27,
-  closesWithEntryScore: 141,
   tradingConfigRowExists: false,
   staleMarkedPositions: 0,
   staleMarkDays: 4,
@@ -47,11 +45,6 @@ describe("auditFindingsRegister()", () => {
   it("fires the register's own revisit trigger once labelled exits accumulate", () => {
     expect(staleIds({ labelledRmExits: EXIT_LADDER_SAMPLE - 1 })).toEqual([]);
     expect(staleIds({ labelledRmExits: EXIT_LADDER_SAMPLE })).toEqual(["exit-labels-too-few"]);
-  });
-
-  it("fires once entry scores are numerous enough to bucket", () => {
-    expect(staleIds({ closesWithEntryScore: ENTRY_SCORE_SAMPLE - 1 })).toEqual([]);
-    expect(staleIds({ closesWithEntryScore: ENTRY_SCORE_SAMPLE })).toEqual(["entry-score-too-few"]);
   });
 
   it("escalates the deferred unmanaged-positions defect from latent to active", () => {
