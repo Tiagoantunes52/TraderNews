@@ -13,6 +13,8 @@ import {
   reconcilePosition,
   reconcileRiskManaged,
   entryScoreFor,
+  sessionsStale,
+  stalenessScaledBuffer,
   planBrokerAction,
   entryAttemptHistory,
   isBrokerStopsEnabled,
@@ -1129,5 +1131,102 @@ describe("reconcileRiskManaged() — entry/exit score split", () => {
     const stopped = call({ score: 0.9, entryScore: 0.9, signal: "BUY", price: 80, open: openPos });
     expect(stopped.type).toBe("CLOSE");
     expect((stopped as { reason?: string }).reason).toBe("STOP");
+  });
+});
+
+// ── Stale reference prices bias which entries fill ───────────────────────────
+//
+// The entry limit is priced off the latest stored close, which in production is TWO
+// sessions old (QuantAnalysis is written ~02:20 UTC about an already-closed session,
+// and the paper stage acts near the next close). The 2% buffer was sized against the
+// ONE-day gap distribution. Measured over PriceBar since 2025-01-01, the share of moves
+// clearing +2% is 16.7% at one session, 24.6% at two, 29.6% at three — so staleness
+// alone inflates the miss rate by half, and a miss is always a name that ran. That is
+// the adverse selection the 2026-07-27 audit found, still leaking in through the anchor.
+
+describe("sessionsStale()", () => {
+  const at = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
+
+  it("counts a Friday run on Wednesday's close as two sessions — the production case", () => {
+    expect(sessionsStale(at("2026-07-29"), at("2026-07-31"))).toBe(2);
+  });
+
+  it("skips the weekend: a Monday run on Friday's close is one session", () => {
+    expect(sessionsStale(at("2026-07-24"), at("2026-07-27"))).toBe(1);
+  });
+
+  it("never returns less than 1 — a same-day close still has a session of drift to cover", () => {
+    expect(sessionsStale(at("2026-07-31"), at("2026-07-31"))).toBe(1);
+    expect(sessionsStale(at("2026-08-03"), at("2026-07-31"))).toBe(1); // future date, defensive
+  });
+
+  it("treats an UNKNOWN session date as maximally stale, never as fresh", () => {
+    expect(sessionsStale(null, at("2026-07-31"))).toBe(5);
+  });
+
+  it("caps the widening rather than chasing a price that is simply old", () => {
+    expect(sessionsStale(at("2026-06-01"), at("2026-07-31"))).toBe(5);
+  });
+});
+
+describe("stalenessScaledBuffer()", () => {
+  it("is the identity at one session, so a fresh reference behaves exactly as before", () => {
+    expect(stalenessScaledBuffer(0.02, 1)).toBeCloseTo(0.02, 12);
+  });
+
+  it("scales by sqrt(sessions) — measured to flatten the miss rate, not assumed", () => {
+    // 16.7% / 17.4% / 18.1% at 1/2/3 sessions, vs 16.7% / 24.6% / 29.6% unscaled.
+    expect(stalenessScaledBuffer(0.02, 2)).toBeCloseTo(0.02 * Math.SQRT2, 12);
+    expect(stalenessScaledBuffer(0.02, 3)).toBeCloseTo(0.02 * Math.sqrt(3), 12);
+  });
+
+  it("stops widening past the cap", () => {
+    expect(stalenessScaledBuffer(0.02, 50)).toBeCloseTo(stalenessScaledBuffer(0.02, 5), 12);
+  });
+});
+
+describe("planBrokerAction() — entry limit vs reference staleness", () => {
+  const enter = (over: Record<string, unknown> = {}) =>
+    planBrokerAction({
+      opened: true,
+      stillLong: true,
+      exitReason: null,
+      held: false,
+      everAttempted: false,
+      avgEntryPrice: null,
+      currentPrice: 100,
+      restingProtectiveType: null,
+      price: 100,
+      atrPct: null,
+      confidence: 1,
+      entryLimitBufferPct: 0.02,
+      ...over,
+    } as Parameters<typeof planBrokerAction>[0]);
+
+  it("prices the limit at the plain buffer when the reference is fresh", () => {
+    const a = enter({ referenceSessions: 1 });
+    expect(a.type).toBe("ENTER");
+    expect((a as { limitPrice: number }).limitPrice).toBeCloseTo(102, 2);
+  });
+
+  it("widens the limit for a two-session-stale reference", () => {
+    const a = enter({ referenceSessions: 2 });
+    expect((a as { limitPrice: number }).limitPrice).toBeCloseTo(102.83, 2);
+  });
+
+  it("defaults to the old behaviour when staleness is not supplied", () => {
+    expect((enter() as { limitPrice: number }).limitPrice).toBeCloseTo(102, 2);
+  });
+
+  it("does NOT widen the stop — staleness is a fill-certainty problem, not a risk one", () => {
+    const fresh = enter({ referenceSessions: 1 }) as { stopPrice: number };
+    const stale = enter({ referenceSessions: 4 }) as { stopPrice: number };
+    expect(stale.stopPrice).toBe(fresh.stopPrice);
+  });
+
+  it("leaves sizing alone — a wider limit must not buy more shares", () => {
+    const fresh = enter({ referenceSessions: 1 }) as { qty: number };
+    const stale = enter({ referenceSessions: 4 }) as { qty: number };
+    expect(stale.qty).toBe(fresh.qty);
   });
 });

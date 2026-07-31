@@ -22,6 +22,7 @@ import {
   reconcileRiskManaged,
   reconcileEventPosition,
   planBrokerAction,
+  sessionsStale,
   entryAttemptHistory,
   isRiskBooksEnabled,
   isInsiderBookEnabled,
@@ -278,10 +279,17 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           where: { stockId: { in: stockIds }, price: { not: null } },
           orderBy: { date: "desc" },
           distinct: ["stockId"],
-          select: { stockId: true, price: true, atrPct: true },
+          select: { stockId: true, price: true, atrPct: true, sessionDate: true },
         })
       : [];
   const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
+
+  // How stale each reference close is, in trading sessions. In production this is 2:
+  // QuantAnalysis is written ~02:20 UTC about a session that had already closed, and the
+  // paper stage acts near the NEXT close. The entry limit buffer is widened by sqrt of
+  // this so a stale anchor stops biasing which orders fill (see `stalenessScaledBuffer`).
+  // A live-priced name is fresh by construction and drops back to 1 below.
+  const staleSessionsByStock = new Map(quantRows.map((q) => [q.stockId, sessionsStale(q.sessionDate, todayUTC)]));
 
   // Price an in-hours run against the live tape (PAPER_LIVE_QUOTES=1, ship-dark).
   //
@@ -316,6 +324,8 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           if (p != null && priceByStock.has(stockId)) {
             priceByStock.set(stockId, p);
             livePricedStockIds.add(stockId);
+            // Priced off the tape this instant — no reference lag left to compensate for.
+            staleSessionsByStock.set(stockId, 1);
           }
         }
       }
@@ -1208,6 +1218,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             atrPct: rmOpen ? rmOpen.entryAtrPct : atrPctByStock.get(est.stockId) ?? null,
             confidence: confCalibrator.calibrate(est.confidence),
             cfg,
+            referenceSessions: staleSessionsByStock.get(est.stockId) ?? 1,
           });
           try {
             // The gate may hand back less than asked; re-floor to whole shares (the
@@ -1398,11 +1409,18 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             const lastQuant = await db.quantAnalysis.findMany({
               where: { stockId: { in: missing.map((p) => p.stockId) }, price: { not: null } },
               orderBy: { date: "desc" },
-              select: { stockId: true, price: true, atrPct: true },
+              select: { stockId: true, price: true, atrPct: true, sessionDate: true },
             });
-            const quantByStock = new Map<string, { price: number; atrPct: number | null }>();
+            const quantByStock = new Map<string, { price: number; atrPct: number | null; staleSessions: number }>();
             for (const q of lastQuant) {
-              if (!quantByStock.has(q.stockId)) quantByStock.set(q.stockId, { price: q.price!, atrPct: q.atrPct ?? null });
+              // These names have no estimate today by construction, so their reference
+              // close is the stalest in the run — exactly where the buffer widening matters.
+              if (!quantByStock.has(q.stockId))
+                quantByStock.set(q.stockId, {
+                  price: q.price!,
+                  atrPct: q.atrPct ?? null,
+                  staleSessions: sessionsStale(q.sessionDate, todayUTC),
+                });
             }
             // Attempt history for THIS set — the maps built above only cover names with
             // an estimate today, so reusing them would leave the guard permanently
@@ -1441,6 +1459,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
                 atrPct: entryAtrPct ?? quant.atrPct,
                 confidence,
                 cfg,
+                referenceSessions: quant.staleSessions,
               });
               if (action.type !== "ENTER") continue;
               const qty = Math.min(action.qty, Math.floor(allowedAlpacaBuy(ticker, action.qty * quant.price) / quant.price));

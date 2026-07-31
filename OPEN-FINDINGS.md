@@ -393,6 +393,64 @@ the asymmetry: the holdout study is strong evidence that quant ranks badly, and 
 acting on something shown to be actively wrong" is a lower bar than "start acting on
 something new". If the books disagree over the next few months, the knob reverses it.
 
+---
+
+## ACTED ON 2026-07-31: the entry limit was anchored to a two-session-old price
+
+**The exits are not the problem — measure before tuning them.** Post-exit drift over the
+10 trading days after every close, excess over SPY: `COMBINED_RM` **-2.97%** (n=44),
+`SENTIMENT_RM` -2.02% (n=56), pure books ≈ -0.9%. Every book sells names that then
+underperform. The `_RM` ladder is the single biggest positive contributor in the system:
+same signals and sizing as pure `COMBINED`, ladder added, and per-trade goes from -0.94%
+(439 closes, -$2,494) to +0.04% (81 closes, +$8). **Leave the exits alone.**
+
+**What was still leaking is the entry anchor.** The 2026-07-27 audit fixed the obvious
+half — buffer 0.5% → 2%, stale entry orders expire, stops re-anchor after the fill
+(cancel-first, 2026-07-29). It missed where the reference price comes from.
+
+`planBrokerAction` prices the limit at `price × (1 + 2%)`, and `price` is the latest
+stored `QuantAnalysis.price`. Two production facts collide there:
+
+1. **The live-quote overlay is off.** `PAPER_LIVE_QUOTES` is ship-dark, and the decision
+   log confirms it: **0 of 630 decisions per day** are `LIVE`-priced, every day of the
+   last two weeks. Every order is anchored to a stored close.
+2. **That close is two sessions old.** `sessionDate` (added 2026-07-30) finally makes this
+   measurable rather than arguable: for all 109 priced names, `current_date - sessionDate`
+   is **2**. `QuantAnalysis` is written ~02:20 UTC about a session that already closed,
+   and the paper stage acts near the *next* close.
+
+**So the buffer was sized against the wrong distribution.** It was chosen from the ONE-day
+gap distribution. Over `PriceBar` since 2025-01-01, the share of moves clearing +2%:
+
+| reference age | miss rate |
+|---|---|
+| 1 session | 16.7% |
+| **2 sessions (production)** | **24.6%** |
+| 3 sessions | 29.6% |
+
+Staleness alone inflates the miss rate by half, and a miss is always a name that *ran* —
+which is precisely the adverse selection the audit identified, re-entering through the
+anchor rather than the buffer.
+
+**Fix shipped:** the entry buffer is scaled by `sqrt(sessions stale)`
+(`stalenessScaledBuffer`), with staleness derived per-name from `sessionDate`
+(`sessionsStale`, weekday count, capped at 5, unknown treated as maximally stale). Chosen
+by measurement, not assumption: scaling this way flattens the miss rate to **16.7% /
+17.4% / 18.1%** across one, two and three sessions. The stop distance and the position
+size are deliberately unchanged — staleness is a fill-certainty problem, not a risk one —
+and a live-priced name drops back to 1, so this is a no-op the moment the real fix lands.
+
+**This is a workaround, and the real fix is a flag.** `PAPER_LIVE_QUOTES=1` prices against
+the tape during the run and removes the lag entirely rather than compensating for it. It
+is already built and already ship-dark; enabling it needs Alpaca market-data credentials
+(`isMarketDataConfigured`). **That is the next action, and it is an env change, not code.**
+
+**Still unmeasured:** whether any of the execution work helped. Only **11 live BUY orders**
+exist since the 2026-07-27 fixes (the book was frozen most of July), and fill rate sat at
+91-93% both before and after — which was never the right metric anyway, since the audit's
+point was *which* orders miss, not how many. The honest position is that the bias is now
+bounded by construction; there is not yet data to show the outcome moved.
+
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
 is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's
