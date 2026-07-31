@@ -408,16 +408,34 @@ same signals and sizing as pure `COMBINED`, ladder added, and per-trade goes fro
 half — buffer 0.5% → 2%, stale entry orders expire, stops re-anchor after the fill
 (cancel-first, 2026-07-29). It missed where the reference price comes from.
 
-`planBrokerAction` prices the limit at `price × (1 + 2%)`, and `price` is the latest
-stored `QuantAnalysis.price`. Two production facts collide there:
+`planBrokerAction` prices the limit at `price × (1 + 2%)`, where `price` is the live trade
+when the quote overlay covers the name and the latest stored `QuantAnalysis.price`
+otherwise.
 
-1. **The live-quote overlay is off.** `PAPER_LIVE_QUOTES` is ship-dark, and the decision
-   log confirms it: **0 of 630 decisions per day** are `LIVE`-priced, every day of the
-   last two weeks. Every order is anchored to a stored close.
-2. **That close is two sessions old.** `sessionDate` (added 2026-07-30) finally makes this
-   measurable rather than arguable: for all 109 priced names, `current_date - sessionDate`
-   is **2**. `QuantAnalysis` is written ~02:20 UTC about a session that already closed,
-   and the paper stage acts near the *next* close.
+**The overlay IS on in production.** `PAPER_LIVE_QUOTES=1` is set, and the decision log
+confirms it: on 2026-07-30, the only run for which `priceSource` exists, **630 of 630
+decisions are `LIVE_TRADE`** and none are `CLOSE`. Estimate-carrying names are therefore
+anchored to the tape, not to a stale close.
+
+<!-- An earlier draft of this section claimed the overlay was off, from a query that
+     tested `priceSource = 'LIVE'` at the top level. The recorded value is `LIVE_TRADE`
+     and it lives inside `inputs`, so the query matched nothing and absence-of-match was
+     read as absence-of-feature. Corrected the same day; the code below was already
+     written to no-op on live-priced names, so nothing shipped on the bad premise. -->
+
+**The stale-anchor problem is real but narrower than that draft claimed.** It survives
+only where the overlay does not reach:
+
+- the **convergence sweep**, which prices names that have no estimate today from
+  `lastQuant` and never consults the quote feed — by construction the stalest prices in
+  the run;
+- any name the feed omits (the overlay falls back per-stock, deliberately);
+- any run where the market is closed, or the clock/quote call fails.
+
+For those paths the anchor is genuinely two sessions old: `sessionDate` makes it
+measurable rather than arguable, and for all 109 priced names `current_date - sessionDate`
+is **2** — `QuantAnalysis` is written ~02:20 UTC about a session that already closed,
+while the paper stage acts near the *next* close.
 
 **So the buffer was sized against the wrong distribution.** It was chosen from the ONE-day
 gap distribution. Over `PriceBar` since 2025-01-01, the share of moves clearing +2%:
@@ -440,16 +458,26 @@ by measurement, not assumption: scaling this way flattens the miss rate to **16.
 size are deliberately unchanged — staleness is a fill-certainty problem, not a risk one —
 and a live-priced name drops back to 1, so this is a no-op the moment the real fix lands.
 
-**This is a workaround, and the real fix is a flag.** `PAPER_LIVE_QUOTES=1` prices against
-the tape during the run and removes the lag entirely rather than compensating for it. It
-is already built and already ship-dark; enabling it needs Alpaca market-data credentials
-(`isMarketDataConfigured`). **That is the next action, and it is an env change, not code.**
+**Scope, stated honestly: on the main path this is already a no-op.** The live overlay
+covers estimate-carrying names, so their staleness is 1 and the buffer is unchanged. The
+widening binds on the convergence sweep, on names the feed misses, and on closed-market or
+failed-quote runs. It is a floor under the failure modes, not the main fix — the main fix
+was already in place and I mis-read the log into thinking otherwise.
+
+**The remaining real gap is the convergence sweep**, which never consults the quote feed
+at all even when the overlay is on and the market is open. Extending the overlay to cover
+it would remove the staleness rather than compensate for it, and is the natural next step.
 
 **Still unmeasured:** whether any of the execution work helped. Only **11 live BUY orders**
 exist since the 2026-07-27 fixes (the book was frozen most of July), and fill rate sat at
 91-93% both before and after — which was never the right metric anyway, since the audit's
 point was *which* orders miss, not how many. The honest position is that the bias is now
 bounded by construction; there is not yet data to show the outcome moved.
+
+**Method note.** `priceSource` existing on only ONE run is why a wrong query looked like a
+finding. A field that is absent for 13 of 14 days cannot distinguish "feature off" from
+"logging added yesterday" — which is the same absence-reads-as-a-default failure this
+register was created to stop, committed by its own author against his own instrument.
 
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it

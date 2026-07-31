@@ -282,20 +282,21 @@ export function sessionsStale(sessionDate: Date | null | undefined, asOf: Date):
 /**
  * Widen the entry limit buffer to cover the drift a stale reference price hides.
  *
- * The 2% buffer was sized against the ONE-day gap distribution, but the reference is the
- * latest stored close — in production 2 sessions old, because `QuantAnalysis` is written
- * ~02:20 UTC about a session that already closed. Over the corpus since 2025-01-01, the
- * fraction of moves that clear +2% is 16.7% at one session, **24.6% at two, 29.6% at
- * three**: staleness alone inflates the miss rate by half, and every one of those misses
- * is a name that ran, which is exactly the adverse selection being fixed.
+ * The 2% buffer was sized against the ONE-day gap distribution. Over the corpus since
+ * 2025-01-01 the fraction of moves clearing +2% is 16.7% at one session, **24.6% at two,
+ * 29.6% at three** — staleness alone inflates the miss rate by half, and every one of
+ * those misses is a name that RAN, which is exactly the adverse selection being fixed.
  *
  * sqrt(sessions) because dispersion grows with the square root of horizon. Measured, not
  * assumed: scaling this way puts the miss rate at 16.7% / 17.4% / 18.1% across one, two
  * and three sessions — flat, which is the whole point.
  *
- * This is a WORKAROUND. The real fix is to stop using a stale reference at all
- * (`PAPER_LIVE_QUOTES=1` prices against the tape during the run); this keeps the bias
- * bounded while that is off.
+ * WHEN THIS ACTUALLY BINDS: `PAPER_LIVE_QUOTES=1` is on in production and the overlay
+ * prices estimate-carrying names off the tape, so those come through at 1 session and the
+ * scaling is a no-op for them. It binds on the paths the overlay does not reach — the
+ * convergence sweep (which prices from `lastQuant` and never consults the feed), names the
+ * feed omits, and closed-market or failed-quote runs. A floor under the failure modes, not
+ * the main entry path.
  */
 export function stalenessScaledBuffer(buffer: number, sessions: number): number {
   return buffer * Math.sqrt(clampNum(sessions, 1, MAX_STALE_SESSIONS));

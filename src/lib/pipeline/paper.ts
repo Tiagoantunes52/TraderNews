@@ -284,11 +284,14 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
       : [];
   const priceByStock = new Map(quantRows.map((q) => [q.stockId, q.price!]));
 
-  // How stale each reference close is, in trading sessions. In production this is 2:
-  // QuantAnalysis is written ~02:20 UTC about a session that had already closed, and the
-  // paper stage acts near the NEXT close. The entry limit buffer is widened by sqrt of
-  // this so a stale anchor stops biasing which orders fill (see `stalenessScaledBuffer`).
-  // A live-priced name is fresh by construction and drops back to 1 below.
+  // How stale each reference close is, in trading sessions. A stored close is 2 sessions
+  // old: QuantAnalysis is written ~02:20 UTC about a session that had already closed, and
+  // the paper stage acts near the NEXT close. The entry limit buffer is widened by sqrt of
+  // this so a stale anchor stops biasing WHICH orders fill (see `stalenessScaledBuffer`).
+  //
+  // With the live overlay on — it is, in production — every name it covers drops back to 1
+  // below and the widening is a no-op. This matters for what the overlay does not reach:
+  // names the feed omits, and runs where the market is closed or the quote call fails.
   const staleSessionsByStock = new Map(quantRows.map((q) => [q.stockId, sessionsStale(q.sessionDate, todayUTC)]));
 
   // Price an in-hours run against the live tape (PAPER_LIVE_QUOTES=1, ship-dark).
