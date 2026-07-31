@@ -265,6 +265,60 @@ in `TREND_BEAR` and +0.0336 (1.97) in `MEAN_REVERTING`; every variant repeats th
 The score is not uniformly weak — it is actively wrong when the market trends down, which
 is where a long-only book takes its losses.
 
+### Refitting the blend, 2026-07-31 — the inversion is fixable, but nothing has earned a ship yet
+
+`npm run signal-research-fit` estimates the weights instead of declaring them:
+Fama-MacBeth (one cross-sectional OLS per session, coefficients averaged and t-tested
+**across** sessions) on terms standardised over the fitting period. It reads **train
+sessions only** — it filters to `session < --split` before it reads anything and prints
+the sessions it used — and emits a constant block that is pasted into
+`signal-research-variants.ts`. The candidate therefore stays a pure per-row function that
+cannot reach the data it was fitted on, and the holdout is scored once, afterwards.
+
+**The train fit alone convicts the designed weights.** Over 797 sessions / 79,464 obs:
+
+| term | designed weight | fitted t |
+|---|---|---|
+| momentum | 30% | **+3.51** |
+| volume | 10% | +1.75 |
+| bollinger | 10% | -0.88 |
+| rsi | **30%** | +0.65 |
+| macd | **20%** | -0.60 |
+
+Half the weight is paid to two terms that fit at |t| < 1. And **MACD flips sign by
+regime** — **-4.27** in `TREND_BULL`, **+3.03** in `MEAN_REVERTING` — two significant
+effects with opposite signs cancelling to -0.60 globally. That is the same cancellation
+that hid the score's regime split, one level down.
+
+Two refits were pre-registered before the holdout saw either:
+
+| candidate | TRAIN | HOLDOUT | folds | entry excess | verdict |
+|---|---|---|---|---|---|
+| `f1-refit-global` | +0.0099 (1.34) | -0.0091 (-0.85) | 2/4 | +3.2 bps | FAILS |
+| `f2-refit-by-regime` | +0.0270 (3.72) | **+0.0068 (0.62)** | **4/4** | +6.6 bps | WEAK |
+
+**`f2` is the first candidate in this entire investigation that does not invert out of
+sample**, and the regime table shows where it came from:
+
+| | `baseline` | `f2-refit-by-regime` |
+|---|---|---|
+| TREND_BULL | -0.0420 (-2.35) | -0.0262 (-1.41) |
+| **TREND_BEAR** | **-0.1393 (-6.68)** | **-0.0048 (-0.17)** |
+| MEAN_REVERTING | +0.0336 (1.97) | +0.0361 (1.95) |
+| entry excess | **-28.2 bps** | **+6.6 bps** |
+
+The catastrophic bear-market inversion is essentially gone. That is a structural result:
+the anti-predictiveness was **not** irreducible noise, and it was **not** one bad term —
+it was one weight vector being applied to terms whose signs depend on the regime.
+
+**It still does not ship, and nothing here changes a live weight.** Holdout t = 0.62
+against a `k=6` noise threshold of **1.89**: `f2` is indistinguishable from no edge. It
+buys four times the parameters on a quarter of the sessions each, and the regime label
+itself comes from cut-points (ADX 20/25, RSI 30/70) that nobody fitted either. The honest
+summary is *"we can stop the score being actively wrong; we have not shown it is right"*.
+`f1` failing while `f2` is flat also says the regime conditioning — not the refit — is
+what carried it, which is the part worth pursuing next.
+
 **Caveats on record:** ~40 tests across the investigation, so ~2 cells at |t|>2 are
 expected by chance — the out-of-sample split is what separates signal from that, and it
 is why the RSI hypothesis was dropped. **Survivorship bias**: the 104 names are today's

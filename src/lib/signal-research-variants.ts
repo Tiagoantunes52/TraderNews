@@ -11,7 +11,8 @@
 // from an instrument that just demonstrated it can detect something.
 
 import { calcQuantScore, TREND_REGIME_MIN } from "@/lib/indicators";
-import type { Candidate, ScoreInput } from "@/lib/signal-research";
+import type { Candidate, MarketRegime, ScoreInput } from "@/lib/signal-research";
+import { scoreWithWeights } from "@/lib/signal-research-fit";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -58,6 +59,16 @@ export function quantTerms(f: ScoreInput, opts: { momentum?: number | null } = {
 }
 
 export const WEIGHTS = { momentum: 0.3, rsi: 0.3, boll: 0.1, volume: 0.1, macd: 0.2 } as const;
+
+/**
+ * The five additive terms, in a fixed order, for the refit.
+ *
+ * `damp` is excluded deliberately: it is a MULTIPLIER, not a term, so it has no place as
+ * an OLS coefficient. `h2-no-vol-damper` already tested dropping it and it changed
+ * nothing that mattered (holdout -0.0230 vs baseline's -0.0232), so the refit spends its
+ * degrees of freedom on the weights that are actually in dispute.
+ */
+export const TERM_KEYS = ["momentum", "rsi", "boll", "volume", "macd"] as const;
 
 /** Weighted blend with missing legs excluded and the remaining weights rescaled. */
 export function blend(
@@ -130,7 +141,92 @@ export const CANDIDATES: Candidate[] = [
       );
     },
   },
+
+  // ── pre-registered refits (weights fitted on TRAIN only, frozen above) ─────
+  {
+    id: "f1-refit-global",
+    hypothesis:
+      "Weights estimated from train instead of declared beat declared ones. h1/h2/h3 each changed ONE thing about a blend nobody ever fitted; this replaces the 30/30/10/10/20 outright with the train Fama-MacBeth answer, on standardised terms so a weight of 0.3 really does buy 30% of the influence. The fit says momentum is the only significant leg (t=+3.51) and that rsi (+0.65) and macd (-0.60) are being paid 50% of the weight for nothing.",
+    score: (f) => scoreWithWeights(quantTerms(f), REFIT_W, REFIT_STD),
+  },
+  {
+    id: "f2-refit-by-regime",
+    hypothesis:
+      "One weight vector cannot fit a score whose terms reverse by regime. MACD fits at t=-4.27 in TREND_BULL and +3.03 in MEAN_REVERTING — two significant effects with opposite signs that cancel to -0.60 globally, the same cancellation that hid the score's regime split. Fitting per regime should recover both. The risk is stated up front: 4x the parameters on a quarter of the sessions each, and the regime label itself comes from a rule nobody fitted.",
+    score: (f) => {
+      const r = REFIT_BY_REGIME[f.marketRegime];
+      return scoreWithWeights(quantTerms(f), r.w, r.std);
+    },
+  },
 ];
+
+// ── Fitted weights ───────────────────────────────────────────────────────────
+//
+// Produced by `npm run signal-research-fit`, which reads TRAIN SESSIONS ONLY (< 2025-01-01)
+// and prints these blocks for pasting. They are frozen here so the candidate stays a pure
+// per-row function that cannot reach the data it was fitted on. Regenerating them against
+// a different split, horizon or corpus REQUIRES re-running the holdout afterwards — the
+// numbers below are only out-of-sample because nothing refitted them since.
+//
+// Fitted 2026-07-31: split 2025-01-01, horizon 5, 797 usable sessions / 79,464 obs, 0 rows
+// dropped for a missing term.
+
+/** Global fit. Fama-MacBeth t: momentum +3.51, volume +1.75, rsi +0.65, macd -0.60, boll -0.88. */
+export const REFIT_W = { momentum: 0.002853, rsi: 0.000214, boll: -0.000703, volume: 0.001724, macd: -0.000482 };
+export const REFIT_STD = {
+  momentum: { mean: 0.009241, sd: 0.288284 },
+  rsi: { mean: -0.026801, sd: 0.256548 },
+  boll: { mean: 0.070585, sd: 0.631431 },
+  volume: { mean: 0.002268, sd: 0.192289 },
+  macd: { mean: 0.009122, sd: 0.616557 },
+};
+
+/** Per-regime fits. t: TREND_BULL macd -4.27 / momentum +3.42; MEAN_REVERTING macd +3.03 / boll -1.98. */
+export const REFIT_BY_REGIME: Record<
+  MarketRegime,
+  { w: Record<string, number>; std: Record<string, { mean: number; sd: number }> }
+> = {
+  TREND_BULL: {
+    w: { momentum: 0.004779, rsi: 0.000067, boll: 0.001036, volume: 0.003135, macd: -0.005072 },
+    std: {
+      momentum: { mean: 0.027296, sd: 0.282822 },
+      rsi: { mean: -0.082439, sd: 0.267567 },
+      boll: { mean: 0.293895, sd: 0.557315 },
+      volume: { mean: 0.029753, sd: 0.192007 },
+      macd: { mean: 0.137504, sd: 0.556452 },
+    },
+  },
+  TREND_BEAR: {
+    w: { momentum: 0.003645, rsi: -0.000567, boll: -0.001717, volume: -0.001463, macd: -0.001464 },
+    std: {
+      momentum: { mean: -0.015904, sd: 0.309493 },
+      rsi: { mean: 0.047664, sd: 0.246867 },
+      boll: { mean: -0.258199, sd: 0.575995 },
+      volume: { mean: -0.032672, sd: 0.183548 },
+      macd: { mean: -0.224789, sd: 0.615327 },
+    },
+  },
+  MEAN_REVERTING: {
+    w: { momentum: 0.001587, rsi: 0.000842, boll: -0.003157, volume: 0.002830, macd: 0.004943 },
+    std: {
+      momentum: { mean: 0.008547, sd: 0.287390 },
+      rsi: { mean: -0.016279, sd: 0.241699 },
+      boll: { mean: 0.049191, sd: 0.647032 },
+      volume: { mean: -0.001687, sd: 0.196704 },
+      macd: { mean: 0.000038, sd: 0.625189 },
+    },
+  },
+  UNCLASSIFIED: {
+    w: { momentum: 0.001575, rsi: 0.000165, boll: 0.000328, volume: 0.001039, macd: 0.000304 },
+    std: {
+      momentum: { mean: 0.004888, sd: 0.281089 },
+      rsi: { mean: -0.019808, sd: 0.250940 },
+      boll: { mean: 0.039300, sd: 0.628868 },
+      volume: { mean: -0.003444, sd: 0.189063 },
+      macd: { mean: 0.013591, sd: 0.630299 },
+    },
+  },
+};
 
 export const ORACLE_ID = "oracle";
 
