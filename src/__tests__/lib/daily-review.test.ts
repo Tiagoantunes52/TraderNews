@@ -136,6 +136,49 @@ describe("replayDecisions", () => {
     expect(codes(replayDecisions(log))).toEqual(["REPLAY_SIZE_MISMATCH"]);
   });
 
+  it("gates COMBINED_RM entry on the logged entryScore, not the combined score", () => {
+    // combinedEntryUsesQuant=0 books enter on sentiment alone (entryScoreFor), so the
+    // combined `score` can sit below the deadband while the entry is still correct.
+    // Without the logged entryScore the replay has no way to know that and manufactures
+    // a mismatch — this is the CART/COMBINED_RM bug (REPLAY_TYPE_MISMATCH false positive).
+    const log = runLog([
+      decision({
+        inputs: {
+          score: 0.122, // combined score: below entryScoreMin (0.25) on its own
+          entryScore: 0.6, // sentiment score that actually gated the entry
+          signal: "NEUTRAL",
+          price: 44.62,
+          confidence: 0.8,
+          atrPct: 2,
+          runsSinceEntry: 0,
+          isNewRun: true,
+          open: null,
+        },
+        action: { type: "OPEN", qty: (cfg.riskPerTrade * 0.8) / 0.06 / 44.62, price: 44.62 },
+      }),
+    ]);
+    expect(replayDecisions(log)).toEqual([]);
+  });
+
+  it("falls back to score when entryScore is absent (pre-existing logs)", () => {
+    const log = runLog([
+      decision({
+        inputs: {
+          score: 0.122,
+          signal: "NEUTRAL",
+          price: 44.62,
+          confidence: 0.8,
+          atrPct: 2,
+          runsSinceEntry: 0,
+          isNewRun: true,
+          open: null,
+        },
+        action: { type: "NONE" },
+      }),
+    ]);
+    expect(replayDecisions(log)).toEqual([]);
+  });
+
   it("replays the pure books through the signal-only reconciler", () => {
     const log = runLog([
       decision({
