@@ -13,6 +13,7 @@ import {
   evaluateBuy,
   rankEntryCandidates,
   maxAllowedNotional,
+  releasePosition,
   regimeMultiplier,
   type BookExposure,
   type RiskLimits,
@@ -191,6 +192,46 @@ describe("maxAllowedNotional", () => {
       const binary = evaluateBuy(b, candidate, limits).allowed;
       expect(maxAllowedNotional(b, candidate, limits) > 0).toBe(binary);
     }
+  });
+});
+
+describe("releasePosition", () => {
+  const limits = DEFAULT_RISK_LIMITS;
+  const book = (over: Partial<BookExposure> = {}): BookExposure => ({
+    equity: 100_000,
+    peakEquity: 100_000,
+    positions: [],
+    ...over,
+  });
+
+  it("frees a slot so a same-run buy that would otherwise be capped is allowed", () => {
+    // At the position cap: an entry is refused outright...
+    const b = book({ positions: Array.from({ length: limits.maxPositions }, (_, i) => ({ cluster: `C${i}`, notional: 10 })) });
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 1000 }, limits)).toBe(0);
+    // ...but a same-run exit (the mirror of reserving a buy) frees the slot back up.
+    releasePosition(b, "C0", 10);
+    expect(maxAllowedNotional(b, { cluster: "AAA", notional: 1000 }, limits)).toBe(1000);
+  });
+
+  it("removes the closest-notional position within the matching cluster", () => {
+    const b = book({
+      positions: [
+        { cluster: "AAA", notional: 5000 },
+        { cluster: "AAA", notional: 9000 },
+        { cluster: "BBB", notional: 9000 },
+      ],
+    });
+    releasePosition(b, "AAA", 8800);
+    expect(b.positions).toEqual([
+      { cluster: "AAA", notional: 5000 },
+      { cluster: "BBB", notional: 9000 },
+    ]);
+  });
+
+  it("is a no-op when the cluster isn't held", () => {
+    const b = book({ positions: [{ cluster: "AAA", notional: 5000 }] });
+    releasePosition(b, "ZZZ", 5000);
+    expect(b.positions).toEqual([{ cluster: "AAA", notional: 5000 }]);
   });
 });
 
