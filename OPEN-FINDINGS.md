@@ -168,10 +168,22 @@ it cannot establish is *executable* performance — and only the latter is evide
 
 ## Confirmed 2026-07-30: the quant entry signal inverted
 
-<!-- check: quant-signal-inverted -->
-**`calcQuantScore` is anti-predictive out of sample.** Established over the whole
-`PriceBar` corpus — **119,428 stock-days, 104 names, 2021-10-25 → 2026-07-22** — as daily
-cross-sectional IC against 5-day forward returns, t-stat taken across days (pooling would
+**Correction (2026-08-17): the inversion has not persisted.** QUANT entries are now
+beating the universe by +37.5 bps on the live window — the sign flipped back. This was
+checked here as `quant-signal-inverted` (`src/lib/findings-register.ts`), on a bare sign
+of the live excess with no significance test, and it fired `REGISTER_STALE` the moment
+the number crossed zero. That check is now removed rather than corrected: a sign that
+inverts twice is itself the argument against asserting either direction as a durable
+fact, which is exactly what this section already said below. Ongoing monitoring belongs
+to `signal-health.ts`'s `SIGNAL_INVERTED` finding (see "Now monitored" below), which
+requires t ≤ -2 before it fires and so does not flip on noise the way this bullet's
+register check did. The empirical study, its rejected fixes and the entry/exit split it
+led to are unaffected — none of that depended on today's excess staying negative.
+
+**`calcQuantScore` is anti-predictive out of sample** (as measured 2026-07-30).
+Established over the whole `PriceBar` corpus — **119,428 stock-days, 104 names,
+2021-10-25 → 2026-07-22** — as daily cross-sectional IC against 5-day forward returns,
+t-stat taken across days (pooling would
 inflate N ~100x, since names move together). The measurement was validated before being
 trusted: a plumbing control returns IC exactly 1.0000, and 30-day momentum returns
 IC 0.0216 at t = 3.10.
