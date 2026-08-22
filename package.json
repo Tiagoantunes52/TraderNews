@@ -68,9 +68,6 @@
     "vitest": "^4.1.9"
   },
   "overrides": {
-    "sharp": "^0.35.3",
-    "postcss": "^8.5.15",
-    "find-my-way": "^9.7.0",
-    "valibot": "^1.4.2"
+    "deepmerge-ts": "^8.0.2"
   }
 }
