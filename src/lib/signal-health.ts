@@ -61,6 +61,13 @@ export type EntryHealth = {
   n: number;
   meanExcess: number;
   /**
+   * Sessions contributing at least one entry — the denominator `tStat` is actually
+   * computed over. Distinct from `SourceHealth.sessions`, which counts every session
+   * the source SCORED: a source can be scored daily but only reach BUY occasionally,
+   * and it is the entry sessions that carry the significance.
+   */
+  sessions: number;
+  /**
    * Significance of `meanExcess`, computed across SESSIONS with Newey-West errors.
    * Never across observations: see the note above `entryTStat`.
    */
@@ -220,6 +227,7 @@ export function signalHealth(obs: Observation[]): SourceHealth[] {
       entry: {
         n: entryExcess.length,
         meanExcess: entryExcess.length ? mean(entryExcess) : 0,
+        sessions: entryBySession.size,
         tStat: entryTStat(entryBySession),
       },
       sessions: new Set(scored.map((o) => o.session)).size,
@@ -240,7 +248,10 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
   const out: Finding[] = [];
 
   for (const h of health) {
-    if (h.entry.n < MIN_ENTRY_OBSERVATIONS || h.sessions < MIN_SESSIONS) continue;
+    // Bar on the ENTRY sessions, not every scored session: those are what `tStat` is
+    // computed over, so a source scored daily that only reaches BUY on a handful of
+    // days must not clear a session bar it never actually met.
+    if (h.entry.n < MIN_ENTRY_OBSERVATIONS || h.entry.sessions < MIN_SESSIONS) continue;
     const t = h.entry.tStat;
     if (h.entry.meanExcess < 0 && t != null && t <= -2) {
       out.push({
@@ -249,7 +260,8 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
         title: `${h.source} entries are underperforming the universe`,
         detail:
           `Names this book calls BUY/STRONG_BUY returned ${bps(h.entry.meanExcess)} vs the universe ` +
-          `over ${DEFAULT_HORIZON} sessions (t=${t.toFixed(2)} across ${h.sessions} sessions, Newey-West; ` +
+          `over ${DEFAULT_HORIZON} sessions (t=${t.toFixed(2)} across ${h.entry.sessions} entry sessions, ` +
+          `Newey-West; ` +
           `n=${h.entry.n} entries). ` +
           `A ${h.source} entry currently selects against return. This is a prompt to investigate with a ` +
           `train/test split, NOT to flip a weight — one window is one period, and a sign that held for ` +
@@ -259,7 +271,7 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
     }
   }
 
-  const usable = health.filter((h) => h.entry.n >= MIN_ENTRY_OBSERVATIONS && h.sessions >= MIN_SESSIONS);
+  const usable = health.filter((h) => h.entry.n >= MIN_ENTRY_OBSERVATIONS && h.entry.sessions >= MIN_SESSIONS);
   out.push({
     severity: "info",
     code: "SIGNAL_HEALTH",

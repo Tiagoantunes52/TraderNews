@@ -133,6 +133,28 @@ describe("entry significance is judged per session, not per observation", () => 
     expect(auditSignalHealth(signalHealth(obs)).map((f) => f.code)).toEqual(["SIGNAL_HEALTH"]);
   });
 
+  it("counts ENTRY sessions, not every session the source was scored on", () => {
+    // Scored on 30 sessions, but only reaches BUY on 6 of them. The t-stat can only be
+    // computed over those 6, so the 20-session bar must be judged on them too.
+    const scoredEverywhere: Observation[] = [];
+    for (let s = 0; s < 30; s++) {
+      const entering = s < 6;
+      for (let i = 0; i < 40; i++) {
+        scoredEverywhere.push({
+          session: session(s),
+          stockId: `x${i}`,
+          scores: { SENTIMENT: null, QUANT: entering ? 0.4 : 0.0, COMBINED: null },
+          forwardReturn: entering ? -0.02 : 0.01,
+        });
+      }
+    }
+    const h = signalHealth(scoredEverywhere).find((x) => x.source === "QUANT")!;
+    expect(h.sessions).toBe(30); // scored on all of them...
+    expect(h.entry.sessions).toBe(6); // ...but only 6 carry an entry
+    expect(h.entry.n).toBeGreaterThanOrEqual(MIN_ENTRY_OBSERVATIONS);
+    expect(auditSignalHealth(signalHealth(scoredEverywhere)).map((f) => f.code)).toEqual(["SIGNAL_HEALTH"]);
+  });
+
   it("still fires when the excess is negative in nearly every session", () => {
     // Same machinery, a signal that really is inverted: persistent, not noisy.
     const persistent = correlatedBook(Array.from({ length: 25 }, (_, i) => -0.02 + (i % 5) * 0.001));
