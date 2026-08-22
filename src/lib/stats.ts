@@ -218,11 +218,45 @@ export function tStatOneSample(xs: number[], mu0 = 0): number | null {
 }
 
 /**
+ * t-statistic for the MEAN of an autocorrelated series, using a Newey-West (Bartlett)
+ * long-run variance:
+ *
+ *     var(x̄) = (1/n)·[ γ₀ + 2·Σ_{k=1..L} (1 − k/(L+1))·γ_k ]
+ *
+ * Use this instead of `tStatOneSample` whenever consecutive points share data — most
+ * often a rolling forward-return window, where a horizon-H series overlaps on H−1 of
+ * its H periods and the naive SE is badly overstated. Pass `lag = H − 1`.
+ *
+ * Not the same tool as `neweyWestRegression`: that fits `alpha + beta·x` and its
+ * `alphaT` tests a trend intercept, which is not the average level. Null below 5
+ * points or on a non-positive long-run variance.
+ */
+export function neweyWestTStatOfMean(xs: number[], lag: number, mu0 = 0): number | null {
+  const n = xs.length;
+  if (n < 5) return null;
+  const m = xs.reduce((s, v) => s + v, 0) / n;
+  const d = xs.map((x) => x - m);
+  const autocov = (k: number) => {
+    let s = 0;
+    for (let i = k; i < n; i++) s += d[i] * d[i - k];
+    return s / n;
+  };
+  const L = Math.max(0, Math.min(lag, n - 1));
+  let lrv = autocov(0);
+  for (let k = 1; k <= L; k++) lrv += 2 * (1 - k / (L + 1)) * autocov(k);
+  if (!(lrv > 0)) return null;
+  return (m - mu0) / Math.sqrt(lrv / n);
+}
+
+/**
  * Simple linear regression with Newey-West (HAC) standard errors — the right SEs
  * when residuals are autocorrelated (as overlapping or daily strategy returns are),
  * so the alpha/beta t-stats aren't overstated. Bartlett kernel; `lag` defaults to
  * `floor(n^¼)`. Point estimates equal ordinary OLS; only the SEs differ. Null below
  * `minPairs` or when `xs` has zero variance / a degenerate covariance.
+ *
+ * For the mean LEVEL of one series (no regressor), use `neweyWestTStatOfMean` — the
+ * intercept of a trend fit is not the average.
  */
 export function neweyWestRegression(
   xs: number[],

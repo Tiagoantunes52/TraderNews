@@ -188,9 +188,29 @@ three readings** — which is why none of them is asserted here as fact.
 
 Ongoing monitoring belongs to `signal-health.ts`'s `SIGNAL_INVERTED` (see "Now
 monitored" below), which requires t ≤ -2 before firing and so cannot be moved by a
-statistic this noisy. That monitor is live and demonstrably works: as of 2026-08-22 it
-is firing on `COMBINED` (−61.3 bps, t = −3.96, n = 1989 over 51 sessions) while staying
-correctly silent on QUANT.
+statistic this noisy.
+
+**Correction (2026-08-22, same day):** the sentence above originally read that the
+monitor "is demonstrably live and works: it is firing on `COMBINED` (−61.3 bps,
+t = −3.96)". That was wrong, and wrong in the direction this whole section warns
+about — the alert it cited as proof was itself a false positive. `signalHealth`
+computed the entry t-stat by pooling every scored name into one sample, so ~40
+same-day names counted as ~40 independent observations when they are one market
+move. On the same rows, the honest figures are:
+
+| COMBINED entry excess | t |
+|---|---|
+| pooled over observations (old) | −3.96 |
+| across sessions | −1.27 |
+| across sessions, Newey-West (overlapping 5-day windows) | **−0.85** |
+
+Fixed in `entryTStat` (`signal-health.ts`), which now judges significance across
+sessions with Newey-West errors; the alert correctly went silent. A train/test split
+of the same window (25 vs 26 sessions, split 2026-07-09) puts the COMBINED entry
+excess at −49.5 bps (t −1.49) in train and −74.1 bps (t −0.60) in holdout, negative in
+4 of 4 rolling folds. **So the sign is persistent but the magnitude is never
+distinguishable from zero** — worth watching, not worth acting on. Note the whole
+sample is 51 sessions, because `sessionDate` only starts 2026-06-01.
 
 The out-of-sample study below is a separate and much stronger measurement — 119,428
 stock-days with a train/holdout split, not one 90-day live window — and is unaffected

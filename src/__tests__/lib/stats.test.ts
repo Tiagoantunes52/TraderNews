@@ -13,6 +13,7 @@ import {
   maxDrawdown,
   linearRegression,
   tStatOneSample,
+  neweyWestTStatOfMean,
   neweyWestRegression,
 } from "@/lib/stats";
 
@@ -195,6 +196,36 @@ describe("tStatOneSample", () => {
   it("returns null with zero variance or too few points", () => {
     expect(tStatOneSample([5, 5, 5])).toBeNull();
     expect(tStatOneSample([5])).toBeNull();
+  });
+});
+
+describe("neweyWestTStatOfMean", () => {
+  it("at lag 0 reduces to mean / (population sd / √n)", () => {
+    const xs = [1, 2, 3, 4, 5, 6];
+    const m = 3.5;
+    const pop = Math.sqrt(xs.reduce((s, v) => s + (v - m) ** 2, 0) / xs.length);
+    expect(neweyWestTStatOfMean(xs, 0)!).toBeCloseTo(m / (pop / Math.sqrt(xs.length)), 8);
+  });
+
+  it("shrinks the t-stat when the series is positively autocorrelated", () => {
+    // Persistent blocks: consecutive points repeat, so the effective sample is far
+    // smaller than n and the naive SE is too small.
+    const blocky = [3, 3, 3, 3, -1, -1, -1, -1, 3, 3, 3, 3, -1, -1, -1, -1];
+    const naive = Math.abs(tStatOneSample(blocky)!);
+    const hac = Math.abs(neweyWestTStatOfMean(blocky, 4)!);
+    expect(hac).toBeLessThan(naive);
+  });
+
+  it("tests the mean level, not a trend intercept", () => {
+    // A series with a strong trend but a zero mean: the average IS zero, so the
+    // t-stat is ~0 — whereas a trend fit's intercept would be far from it.
+    const trend = [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5];
+    expect(Math.abs(neweyWestTStatOfMean(trend, 2)!)).toBeLessThan(1e-8);
+  });
+
+  it("returns null below 5 points or with no variance", () => {
+    expect(neweyWestTStatOfMean([1, 2, 3, 4], 1)).toBeNull();
+    expect(neweyWestTStatOfMean([2, 2, 2, 2, 2, 2], 1)).toBeNull();
   });
 });
 
