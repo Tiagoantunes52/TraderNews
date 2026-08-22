@@ -1566,6 +1566,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               await submitTracked({ stockId: est.stockId, side: "SELL", signal: sellSignal, qty }, (clientOrderId) =>
                 submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
               );
+              // Same release the brokerStops path does on its sells. Entries and exits
+              // interleave in estimates order here, so this only frees the slot for a
+              // name later in the loop — but leaving it out would keep the gate holding
+              // capacity this run already sold.
+              releaseAlpacaBuy(ticker, qty * (held.currentPrice ?? held.avgEntryPrice ?? 0));
               ordersSubmitted++;
             }
           } catch (e) {
