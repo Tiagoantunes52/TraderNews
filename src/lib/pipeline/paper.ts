@@ -633,6 +633,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         strategy,
         inputs: {
           score,
+          entryScore,
           signal,
           price,
           confidence: decisionConfidence,

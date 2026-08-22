@@ -72,6 +72,13 @@ export type OpenState = {
 
 export type DecisionInputs = {
   score: number;
+  /**
+   * The score that actually gated the entry decision, when it differs from `score`
+   * (COMBINED_RM entering on sentiment alone — see `entryScoreFor`). Optional: pure
+   * books and RM books outside that override have no divergence, and logs written
+   * before this field existed genuinely lack it, so the replay falls back to `score`.
+   */
+  entryScore?: number;
   signal: string;
   price: number;
   confidence: number;
@@ -190,6 +197,7 @@ export function replayDecisions(log: PaperRunLog): Finding[] {
     const expected = STRATEGY_IS_RM[d.strategy]
       ? reconcileRiskManaged({
           score: i.score,
+          entryScore: i.entryScore,
           signal: i.signal,
           price: i.price,
           confidence: i.confidence,
