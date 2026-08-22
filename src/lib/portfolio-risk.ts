@@ -240,6 +240,32 @@ export type BuyCandidate = { cluster: string; notional: number };
 export type BuyDecision = { allowed: boolean; reason: RiskBlockReason | null };
 
 /**
+ * Release one closed position from a running book snapshot, mirroring `reserve`
+ * (callers push a candidate onto `book.positions` once a buy is committed) so a
+ * same-run exit is visible to a later buy check in the same run — without this a
+ * close and an open can't trade places and the book waits for tomorrow's rebuild
+ * to notice the freed capacity.
+ *
+ * Matches within `cluster` first — cluster caps care which cluster shrank — then
+ * the position whose notional is closest to `freedNotional`, so releasing one leg
+ * of a multi-position cluster doesn't free the wrong-sized slot. No-op if nothing
+ * in the cluster is held.
+ */
+export function releasePosition(book: BookExposure, cluster: string, freedNotional: number): void {
+  let best = -1;
+  let bestDelta = Infinity;
+  for (let i = 0; i < book.positions.length; i++) {
+    if (book.positions[i].cluster !== cluster) continue;
+    const delta = Math.abs(book.positions[i].notional - freedNotional);
+    if (delta < bestDelta) {
+      best = i;
+      bestDelta = delta;
+    }
+  }
+  if (best >= 0) book.positions.splice(best, 1);
+}
+
+/**
  * Decide whether a candidate buy may open, given the book's current exposure.
  * Checks run worst-first so the returned `reason` is the most serious breach:
  *

@@ -52,6 +52,7 @@ import {
   regimeMultiplier,
   correlationClusters,
   clusterKeyFor,
+  releasePosition,
   type BookExposure,
 } from "@/lib/portfolio-risk";
 import { loadTradingConfig } from "@/lib/trading-config";
@@ -677,23 +678,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
       // for tomorrow's rebuild to notice the capacity. Mirrors the reservation above.
       if (riskLimitsOn && action.type === "CLOSE" && STRATEGY_IS_RM[strategy] && open) {
         const br = bookRisk.get(strategy);
-        if (br) {
-          const cluster = clusterKeyFor(est.stock.ticker, clusterByTicker);
-          const freed = open.qty * action.price;
-          // Same cluster (cluster caps care), then closest notional, so releasing one
-          // leg of a multi-position cluster doesn't free the wrong-sized slot.
-          let best = -1;
-          let bestDelta = Infinity;
-          for (let i = 0; i < br.positions.length; i++) {
-            if (br.positions[i].cluster !== cluster) continue;
-            const delta = Math.abs(br.positions[i].notional - freed);
-            if (delta < bestDelta) {
-              best = i;
-              bestDelta = delta;
-            }
-          }
-          if (best >= 0) br.positions.splice(best, 1);
-        }
+        if (br) releasePosition(br, clusterKeyFor(est.stock.ticker, clusterByTicker), open.qty * action.price);
       }
 
       // Capture the COMBINED_RM decision so the Alpaca book can mirror it. Fresh opens
@@ -1147,6 +1132,15 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         if (!riskLimitsOn || !alpacaRisk) return;
         alpacaRisk.positions.push({ cluster: clusterKeyFor(symbol, clusterByTicker), notional });
       };
+      // A sell frees a broker slot. `alpacaRisk` is a snapshot taken at run start, so
+      // without this an exit and a catch-up entry on the same run can't trade places —
+      // the live book stays at its own cap even after this run's own exits emptied it,
+      // and a name the sim wants stays unmirrored until tomorrow re-reads the account.
+      // Mirrors the sim-book release above.
+      const releaseAlpacaBuy = (symbol: string, notional: number): void => {
+        if (!riskLimitsOn || !alpacaRisk) return;
+        releasePosition(alpacaRisk, clusterKeyFor(symbol, clusterByTicker), notional);
+      };
 
       if (brokerStops) {
         // One pass over the broker's resting orders → the protective order per symbol.
@@ -1269,6 +1263,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               await submitTracked({ stockId: est.stockId, side: "SELL", signal: action.reason, qty }, (clientOrderId) =>
                 submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
               );
+              releaseAlpacaBuy(ticker, qty * (held.currentPrice ?? held.avgEntryPrice ?? price));
               managedSymbols.add(ticker);
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
@@ -1358,6 +1353,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
                   await submitMarketOrder({ symbol, side: "sell", qty });
                   errors.push(`Orphan-exit sold ${symbol} but found no Stock row to record it`);
                 }
+                releaseAlpacaBuy(symbol, qty * (pos.currentPrice ?? pos.avgEntryPrice ?? 0));
                 ordersSubmitted++;
               } else if (!protective) {
                 // Sim still wants it, but nothing is protecting it → repair the stop.
