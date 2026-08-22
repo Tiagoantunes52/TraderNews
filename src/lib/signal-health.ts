@@ -22,7 +22,7 @@
 
 import { scoreToSignal } from "@/lib/indicators";
 import { isEntrySignal } from "@/lib/paper-trading";
-import { tStatOneSample } from "@/lib/stats";
+import { tStatOneSample, neweyWestTStatOfMean } from "@/lib/stats";
 import type { Finding } from "@/lib/daily-review";
 
 /** The three source scores the books actually trade on (see STRATEGY_SOURCE). */
@@ -56,11 +56,29 @@ export type BucketHealth = {
   tStat: number | null;
 };
 
+export type EntryHealth = {
+  /** Scored entry observations — the sample SIZE, not the significance sample. */
+  n: number;
+  meanExcess: number;
+  /**
+   * Sessions contributing at least one entry — the denominator `tStat` is actually
+   * computed over. Distinct from `SourceHealth.sessions`, which counts every session
+   * the source SCORED: a source can be scored daily but only reach BUY occasionally,
+   * and it is the entry sessions that carry the significance.
+   */
+  sessions: number;
+  /**
+   * Significance of `meanExcess`, computed across SESSIONS with Newey-West errors.
+   * Never across observations: see the note above `entryTStat`.
+   */
+  tStat: number | null;
+};
+
 export type SourceHealth = {
   source: SignalSource;
   buckets: BucketHealth[];
   /** BUY + STRONG_BUY pooled — the bucket that actually opens positions. */
-  entry: { n: number; meanExcess: number; tStat: number | null };
+  entry: EntryHealth;
   sessions: number;
 };
 
@@ -129,6 +147,33 @@ export function buildObservations(
 
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
 
+/**
+ * Significance of a mean entry excess — the number `SIGNAL_INVERTED` gates on.
+ *
+ * Two corrections over a plain t-test of the pooled excesses, both of which this
+ * originally got wrong and both of which inflate the t-stat several-fold:
+ *
+ *  1. **A session is the unit, not an observation.** The ~40 names scored on one day
+ *     move together, so pooling them multiplies the apparent sample by ~40 without
+ *     adding that much independent information. This is the same choice the 5-year
+ *     quant study made — "pooling would inflate N ~100x, since names move together" —
+ *     and the monitor written from that study should not use a weaker test than it.
+ *  2. **Consecutive sessions overlap.** A `horizon`-session forward return shares
+ *     `horizon - 1` of its days with the next session's, so even the session series is
+ *     autocorrelated. Newey-West at that lag absorbs it.
+ *
+ * Measured on live data 2026-08-22, the difference decides whether the alert fires:
+ * COMBINED's entry excess reads t = -3.96 pooled but t = -0.85 here, on the same rows.
+ * The pooled number would have raised SIGNAL_INVERTED against the live book on a
+ * result that is not distinguishable from zero.
+ */
+export function entryTStat(excessBySession: Map<string, number[]>): number | null {
+  const sessions = [...excessBySession.keys()].sort();
+  if (!sessions.length) return null;
+  const perSession = sessions.map((s) => mean(excessBySession.get(s)!));
+  return neweyWestTStatOfMean(perSession, DEFAULT_HORIZON - 1);
+}
+
 /** Per-source bucket statistics on excess-over-universe returns. */
 export function signalHealth(obs: Observation[]): SourceHealth[] {
   // Universe mean per session — subtracting it is what makes a bad signal in a good
@@ -149,19 +194,30 @@ export function signalHealth(obs: Observation[]): SourceHealth[] {
 
     const byLabel = new Map<string, number[]>();
     const entryExcess: number[] = [];
+    // Entry excess kept grouped by session as well as pooled: the mean is a pooled
+    // average, but its significance has to be judged per session (see `entryTStat`).
+    const entryBySession = new Map<string, number[]>();
     for (const o of scored) {
       const label = scoreToSignal(o.scores[source]!);
       const ex = excessOf(o);
       const l = byLabel.get(label);
       if (l) l.push(ex);
       else byLabel.set(label, [ex]);
-      if (isEntrySignal(label)) entryExcess.push(ex);
+      if (isEntrySignal(label)) {
+        entryExcess.push(ex);
+        const e = entryBySession.get(o.session);
+        if (e) e.push(ex);
+        else entryBySession.set(o.session, [ex]);
+      }
     }
 
     const buckets: BucketHealth[] = ["STRONG_BUY", "BUY", "NEUTRAL", "SELL", "STRONG_SELL"]
       .filter((k) => byLabel.has(k))
       .map((label) => {
         const v = byLabel.get(label)!;
+        // Descriptive only — pooled across names within a session, so it overstates
+        // significance the way `entry.tStat` used to. Nothing gates on it and it is
+        // not surfaced in a finding; read it as a spread indicator, not a test.
         return { label, n: v.length, meanExcess: mean(v), tStat: tStatOneSample(v) };
       });
 
@@ -171,7 +227,8 @@ export function signalHealth(obs: Observation[]): SourceHealth[] {
       entry: {
         n: entryExcess.length,
         meanExcess: entryExcess.length ? mean(entryExcess) : 0,
-        tStat: entryExcess.length ? tStatOneSample(entryExcess) : null,
+        sessions: entryBySession.size,
+        tStat: entryTStat(entryBySession),
       },
       sessions: new Set(scored.map((o) => o.session)).size,
     };
@@ -191,7 +248,10 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
   const out: Finding[] = [];
 
   for (const h of health) {
-    if (h.entry.n < MIN_ENTRY_OBSERVATIONS || h.sessions < MIN_SESSIONS) continue;
+    // Bar on the ENTRY sessions, not every scored session: those are what `tStat` is
+    // computed over, so a source scored daily that only reaches BUY on a handful of
+    // days must not clear a session bar it never actually met.
+    if (h.entry.n < MIN_ENTRY_OBSERVATIONS || h.entry.sessions < MIN_SESSIONS) continue;
     const t = h.entry.tStat;
     if (h.entry.meanExcess < 0 && t != null && t <= -2) {
       out.push({
@@ -200,7 +260,9 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
         title: `${h.source} entries are underperforming the universe`,
         detail:
           `Names this book calls BUY/STRONG_BUY returned ${bps(h.entry.meanExcess)} vs the universe ` +
-          `over ${DEFAULT_HORIZON} sessions (t=${t.toFixed(2)}, n=${h.entry.n} over ${h.sessions} sessions). ` +
+          `over ${DEFAULT_HORIZON} sessions (t=${t.toFixed(2)} across ${h.entry.sessions} entry sessions, ` +
+          `Newey-West; ` +
+          `n=${h.entry.n} entries). ` +
           `A ${h.source} entry currently selects against return. This is a prompt to investigate with a ` +
           `train/test split, NOT to flip a weight — one window is one period, and a sign that held for ` +
           `three years has already reversed once here.`,
@@ -209,7 +271,7 @@ export function auditSignalHealth(health: SourceHealth[]): Finding[] {
     }
   }
 
-  const usable = health.filter((h) => h.entry.n >= MIN_ENTRY_OBSERVATIONS && h.sessions >= MIN_SESSIONS);
+  const usable = health.filter((h) => h.entry.n >= MIN_ENTRY_OBSERVATIONS && h.entry.sessions >= MIN_SESSIONS);
   out.push({
     severity: "info",
     code: "SIGNAL_HEALTH",

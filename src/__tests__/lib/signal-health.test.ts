@@ -10,6 +10,7 @@ import {
   type BarClose,
   type Observation,
 } from "@/lib/signal-health";
+import { tStatOneSample } from "@/lib/stats";
 
 const session = (i: number) => `2026-0${Math.floor(i / 28) + 1}-${String((i % 28) + 1).padStart(2, "0")}`;
 
@@ -82,6 +83,86 @@ function book(entryRet: number, otherRet: number, sessions = MIN_SESSIONS + 5, p
   }
   return out;
 }
+
+/**
+ * A book whose entry excess is IDENTICAL for every name on a session but varies
+ * between sessions — i.e. the names move together, which is how a real session
+ * behaves. BUY returns +x, NEUTRAL returns -x, so the universe mean is 0 and the
+ * entry excess is exactly x for that session.
+ */
+function correlatedBook(perSessionExcess: number[], namesPerSide = 25): Observation[] {
+  const out: Observation[] = [];
+  perSessionExcess.forEach((x, s) => {
+    for (let i = 0; i < namesPerSide; i++) {
+      out.push({ session: session(s), stockId: `b${i}`, scores: { SENTIMENT: null, QUANT: 0.4, COMBINED: null }, forwardReturn: x });
+      out.push({ session: session(s), stockId: `n${i}`, scores: { SENTIMENT: null, QUANT: 0.0, COMBINED: null }, forwardReturn: -x });
+    }
+  });
+  return out;
+}
+
+/** Five-session blocks: persistent, like a regime, rather than alternating. */
+const BLOCKY_EXCESS = [
+  ...Array(5).fill(-0.03), ...Array(5).fill(0.02),
+  ...Array(5).fill(-0.03), ...Array(5).fill(0.02),
+  ...Array(5).fill(-0.015),
+];
+
+describe("entry significance is judged per session, not per observation", () => {
+  // The defect this pins: pooling every name into one t-test multiplies the apparent
+  // sample by the number of names scored that day, and SIGNAL_INVERTED gates on that
+  // number. Measured on live data 2026-08-22, COMBINED read t=-3.96 pooled and
+  // t=-0.85 per session — the alert fired on a result indistinguishable from zero.
+  const obs = correlatedBook(BLOCKY_EXCESS);
+  const q = () => signalHealth(obs).find((h) => h.source === "QUANT")!;
+
+  it("does not call a noisy negative mean significant", () => {
+    const h = q();
+    expect(h.entry.meanExcess).toBeLessThan(0); // the mean really is negative...
+    expect(h.entry.tStat!).toBeGreaterThan(-2); // ...but it is not distinguishable from 0
+  });
+
+  it("the same rows pooled WOULD have cleared the gate — so the fixture is a real repro", () => {
+    // The universe mean is 0 by construction (+x against -x), so a BUY name's excess
+    // IS its return — the pooled sample the old implementation tested.
+    const pooled = obs.filter((o) => o.scores.QUANT === 0.4).map((o) => o.forwardReturn);
+    expect(tStatOneSample(pooled)!).toBeLessThan(-2);
+  });
+
+  it("raises no SIGNAL_INVERTED on it", () => {
+    expect(auditSignalHealth(signalHealth(obs)).map((f) => f.code)).toEqual(["SIGNAL_HEALTH"]);
+  });
+
+  it("counts ENTRY sessions, not every session the source was scored on", () => {
+    // Scored on 30 sessions, but only reaches BUY on 6 of them. The t-stat can only be
+    // computed over those 6, so the 20-session bar must be judged on them too.
+    const scoredEverywhere: Observation[] = [];
+    for (let s = 0; s < 30; s++) {
+      const entering = s < 6;
+      for (let i = 0; i < 40; i++) {
+        scoredEverywhere.push({
+          session: session(s),
+          stockId: `x${i}`,
+          scores: { SENTIMENT: null, QUANT: entering ? 0.4 : 0.0, COMBINED: null },
+          forwardReturn: entering ? -0.02 : 0.01,
+        });
+      }
+    }
+    const h = signalHealth(scoredEverywhere).find((x) => x.source === "QUANT")!;
+    expect(h.sessions).toBe(30); // scored on all of them...
+    expect(h.entry.sessions).toBe(6); // ...but only 6 carry an entry
+    expect(h.entry.n).toBeGreaterThanOrEqual(MIN_ENTRY_OBSERVATIONS);
+    expect(auditSignalHealth(signalHealth(scoredEverywhere)).map((f) => f.code)).toEqual(["SIGNAL_HEALTH"]);
+  });
+
+  it("still fires when the excess is negative in nearly every session", () => {
+    // Same machinery, a signal that really is inverted: persistent, not noisy.
+    const persistent = correlatedBook(Array.from({ length: 25 }, (_, i) => -0.02 + (i % 5) * 0.001));
+    const h = signalHealth(persistent).find((x) => x.source === "QUANT")!;
+    expect(h.entry.tStat!).toBeLessThan(-2);
+    expect(auditSignalHealth(signalHealth(persistent)).map((f) => f.code)).toContain("SIGNAL_INVERTED");
+  });
+});
 
 describe("signalHealth()", () => {
   it("measures the entry bucket as EXCESS over the universe on the same session", () => {

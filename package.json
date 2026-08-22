@@ -16,7 +16,8 @@
     "backfill-price-bars": "tsx scripts/backfill-price-bars.ts",
     "explain-day": "tsx scripts/explain-day.ts",
     "signal-research": "tsx scripts/signal-research.ts",
-    "signal-research-fit": "tsx scripts/signal-research-fit.ts"
+    "signal-research-fit": "tsx scripts/signal-research-fit.ts",
+    "signal-split": "tsx scripts/signal-split.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.6.2",
@@ -70,6 +71,7 @@
     "sharp": "^0.35.3",
     "postcss": "^8.5.15",
     "find-my-way": "^9.7.0",
-    "valibot": "^1.4.2"
+    "valibot": "^1.4.2",
+    "deepmerge-ts": "^8.0.2"
   }
 }

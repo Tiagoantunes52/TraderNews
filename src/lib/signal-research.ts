@@ -499,11 +499,17 @@ export function evaluatePeriod(
 
 // ── Splits ───────────────────────────────────────────────────────────────────
 
-/** Everything strictly before `date` is train; the rest is holdout. */
-export function splitFixed(features: FeatureRow[], date: string): { train: FeatureRow[]; holdout: FeatureRow[] } {
+/**
+ * Everything strictly before `date` is train; the rest is holdout.
+ *
+ * Generic over anything session-stamped so the live-signal window (`Observation`s from
+ * `signal-health.ts`) splits by the same rule as the `PriceBar` feature corpus — one
+ * definition of "train", not two.
+ */
+export function splitFixed<T extends { session: string }>(rows: T[], date: string): { train: T[]; holdout: T[] } {
   return {
-    train: features.filter((f) => f.session < date),
-    holdout: features.filter((f) => f.session >= date),
+    train: rows.filter((f) => f.session < date),
+    holdout: rows.filter((f) => f.session >= date),
   };
 }
 
@@ -515,15 +521,15 @@ export function splitFixed(features: FeatureRow[], date: string): { train: Featu
  * longer than it is. Contiguous and ordered because these are time series: a shuffled
  * k-fold would train on the future to predict the past.
  */
-export function splitRolling(features: FeatureRow[], k: number): { label: string; rows: FeatureRow[] }[] {
-  const sessions = [...new Set(features.map((f) => f.session))].sort();
+export function splitRolling<T extends { session: string }>(rows: T[], k: number): { label: string; rows: T[] }[] {
+  const sessions = [...new Set(rows.map((f) => f.session))].sort();
   if (k < 1 || sessions.length < k) return [];
   const size = Math.floor(sessions.length / k);
-  const out: { label: string; rows: FeatureRow[] }[] = [];
+  const out: { label: string; rows: T[] }[] = [];
   for (let i = 0; i < k; i++) {
     const from = sessions[i * size];
     const to = i === k - 1 ? sessions[sessions.length - 1] : sessions[(i + 1) * size - 1];
-    out.push({ label: `${from}→${to}`, rows: features.filter((f) => f.session >= from && f.session <= to) });
+    out.push({ label: `${from}→${to}`, rows: rows.filter((f) => f.session >= from && f.session <= to) });
   }
   return out;
 }

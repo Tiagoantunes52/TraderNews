@@ -19,7 +19,6 @@ const asWritten: RegisterFacts = {
   rmEntriesInWindow: 34,
   entryWindowDays: 30,
   insufficientQtyErrors: 0,
-  quantEntryExcessBps: -38.0, // measured negative — see the 2026-07-30 finding
 };
 
 const staleIds = (f: Partial<RegisterFacts>) =>
@@ -78,19 +77,19 @@ describe("auditFindingsRegister()", () => {
     expect(f.detail).toContain("looks healthy from every other angle");
   });
 
-  it("notices the quant entry signal ceasing to be inverted", () => {
-    const [f] = auditFindingsRegister({ ...asWritten, quantEntryExcessBps: 12.5 });
-    expect(f.refs?.id).toBe("quant-signal-inverted");
-    expect(f.detail).toContain("has not persisted");
-  });
-
-  it("abstains on the inversion claim when there is no live sample yet", () => {
-    expect(staleIds({ quantEntryExcessBps: null })).toEqual([]);
-  });
-
   it("notices the cancel-first stop fix regressing", () => {
     const [f] = auditFindingsRegister({ ...asWritten, insufficientQtyErrors: 8 });
     expect(f.refs?.id).toBe("reanchor-cancels-first");
+  });
+
+  // The quant-entry-excess sign bounces with the market and was never a durable fact to
+  // assert (see OPEN-FINDINGS.md's "Confirmed 2026-07-30" correction, 2026-08-17): the
+  // bullet went stale the moment the live window turned positive, with no significance
+  // test to tell a real reversal from noise. `signal-health.ts`'s `SIGNAL_INVERTED`
+  // (gated on t <= -2) is the durable ongoing monitor; this register no longer
+  // duplicates it with a bare-sign assertion that cries wolf on every regime change.
+  it("has retired the flip-flopping quant-signal-inverted check", () => {
+    expect(REGISTER_ASSERTIONS.map((a) => a.id)).not.toContain("quant-signal-inverted");
   });
 
   it("lists every stale id in the summary, not just the first", () => {
