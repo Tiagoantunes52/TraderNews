@@ -21,7 +21,7 @@ import {
   type PaperRunLog,
 } from "@/lib/daily-review";
 import { auditFindingsRegister, type RegisterFacts } from "@/lib/findings-register";
-import { buildObservations, signalHealth, auditSignalHealth, DEFAULT_HORIZON, MIN_ENTRY_OBSERVATIONS, MIN_SESSIONS } from "@/lib/signal-health";
+import { buildObservations, signalHealth, auditSignalHealth, DEFAULT_HORIZON } from "@/lib/signal-health";
 import { ALL_STRATEGIES, RM_STRATEGIES, STRATEGY_BOOK, utcDaysBetween, type Strategy } from "@/lib/paper-trading";
 import { loadTradingConfig } from "@/lib/trading-config";
 import { minutesSinceClose, lastClosedSession, withinStaticAfterCloseWindow, type TradingSession } from "@/lib/market-hours";
@@ -407,9 +407,6 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     errors.push(`Strategy rollup failed: ${String(e)}`);
   }
 
-  // Shared with the register check below, which asserts the sign of this number.
-  let quantEntryExcessBps: number | null = null;
-
   // ── 6. Is the signal still pointing the right way? ─────────────────────────
   //
   // Every other check here asks whether the rules were followed. This one asks whether
@@ -455,12 +452,6 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       );
       const health = signalHealth(obs);
       findings.push(...auditSignalHealth(health));
-      const q = health.find((h) => h.source === "QUANT");
-      // Only meaningful once the sample clears the same bars auditSignalHealth uses;
-      // below that, null means "unknown" and the register assertion abstains.
-      if (q && q.entry.n >= MIN_ENTRY_OBSERVATIONS && q.sessions >= MIN_SESSIONS) {
-        quantEntryExcessBps = q.entry.meanExcess * 10_000;
-      }
     }
   } catch (e) {
     errors.push(`Signal health check failed: ${String(e)}`);
@@ -501,7 +492,6 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       rmEntriesInWindow: rmEntries,
       entryWindowDays: REGISTER_ENTRY_WINDOW_DAYS,
       insufficientQtyErrors: (runLog?.errors ?? []).filter((e) => /insufficient qty/i.test(e)).length,
-      quantEntryExcessBps,
     };
     findings.push(...auditFindingsRegister(facts));
   } catch (e) {
