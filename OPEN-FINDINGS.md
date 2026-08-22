@@ -168,17 +168,34 @@ it cannot establish is *executable* performance — and only the latter is evide
 
 ## Confirmed 2026-07-30: the quant entry signal inverted
 
-**Correction (2026-08-17): the inversion has not persisted.** QUANT entries are now
-beating the universe by +37.5 bps on the live window — the sign flipped back. This was
-checked here as `quant-signal-inverted` (`src/lib/findings-register.ts`), on a bare sign
-of the live excess with no significance test, and it fired `REGISTER_STALE` the moment
-the number crossed zero. That check is now removed rather than corrected: a sign that
-inverts twice is itself the argument against asserting either direction as a durable
-fact, which is exactly what this section already said below. Ongoing monitoring belongs
-to `signal-health.ts`'s `SIGNAL_INVERTED` finding (see "Now monitored" below), which
-requires t ≤ -2 before it fires and so does not flip on noise the way this bullet's
-register check did. The empirical study, its rejected fixes and the entry/exit split it
-led to are unaffected — none of that depended on today's excess staying negative.
+**Note (2026-08-22): the live QUANT entry excess oscillates around zero — do not read
+its sign.** Three readings of the same 90-day live statistic:
+
+| measured | QUANT entry excess | t | n |
+|---|---|---|---|
+| 2026-07-30 | −38.0 bps | — | — |
+| 2026-08-17 | +37.5 bps | — | — |
+| 2026-08-22 | −4.5 bps | −0.22 | 480 over 51 sessions |
+
+It has changed sign twice in three weeks and has never once been distinguishable from
+noise (|t| ≤ 0.22). This bullet used to be checked here as `quant-signal-inverted`
+(`src/lib/findings-register.ts`), asserting `excess < 0` — a bare sign with no
+significance test — so it flipped to `REGISTER_STALE` on 2026-08-17 the moment the
+number crossed zero, and would have flipped back by 2026-08-22. That check is now
+removed rather than re-pointed: re-pointing it at the new sign only rebuilds the same
+tripwire facing the other way. **The lesson is the oscillation itself, not any of the
+three readings** — which is why none of them is asserted here as fact.
+
+Ongoing monitoring belongs to `signal-health.ts`'s `SIGNAL_INVERTED` (see "Now
+monitored" below), which requires t ≤ -2 before firing and so cannot be moved by a
+statistic this noisy. That monitor is live and demonstrably works: as of 2026-08-22 it
+is firing on `COMBINED` (−61.3 bps, t = −3.96, n = 1989 over 51 sessions) while staying
+correctly silent on QUANT.
+
+The out-of-sample study below is a separate and much stronger measurement — 119,428
+stock-days with a train/holdout split, not one 90-day live window — and is unaffected
+by any of this, as are its rejected fixes and the entry/exit split it led to. None of
+that depended on the live excess holding a sign.
 
 **`calcQuantScore` is anti-predictive out of sample** (as measured 2026-07-30).
 Established over the whole `PriceBar` corpus — **119,428 stock-days, 104 names,
