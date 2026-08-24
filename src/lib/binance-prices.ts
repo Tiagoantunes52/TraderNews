@@ -1,4 +1,5 @@
 import type { DailyPrice } from "@/lib/tiingo-prices";
+import { fetchWithRetry } from "@/lib/http";
 
 // Binance public market data — free, keyless, full daily OHLCV with deep
 // history. Best crypto price source when reachable. Note: api.binance.com can
@@ -24,7 +25,7 @@ export async function getBinanceDailyPrices(ticker: string, startDate: Date): Pr
   url.searchParams.set("startTime", String(startDate.getTime()));
   url.searchParams.set("limit", "1000");
 
-  const res = await fetch(url.toString(), { cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { cache: "no-store" });
   if (res.status === 400) return []; // unknown trading pair
   if (!res.ok) throw new Error(`Binance prices error: ${res.status}`);
 

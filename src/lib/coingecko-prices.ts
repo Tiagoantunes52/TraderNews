@@ -1,4 +1,5 @@
 import type { DailyPrice } from "@/lib/tiingo-prices";
+import { fetchWithRetry } from "@/lib/http";
 
 // CoinGecko market data — free Demo tier (optional key via COINGECKO_API_KEY).
 // Broad coin coverage. The market_chart endpoint returns daily close + volume
@@ -44,7 +45,7 @@ export async function getCoinGeckoDailyPrices(ticker: string, startDate: Date): 
   const headers: Record<string, string> = {};
   if (process.env.COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
 
-  const res = await fetch(url.toString(), { headers, cache: "no-store" });
+  const res = await fetchWithRetry(url.toString(), { headers, cache: "no-store" });
   if (res.status === 404) return [];
   if (!res.ok) throw new Error(`CoinGecko prices error: ${res.status}`);
 

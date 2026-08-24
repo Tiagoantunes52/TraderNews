@@ -1,3 +1,4 @@
+import { fetchWithRetry } from "@/lib/http";
 const BASE_URL = "https://api.tiingo.com";
 
 export type DailyPrice = {
@@ -39,7 +40,7 @@ async function getStockPrices(
   const url = new URL(`${BASE_URL}/tiingo/daily/${encodeURIComponent(ticker)}/prices`);
   url.searchParams.set("startDate", startDate);
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithRetry(url.toString(), {
     headers: { Authorization: `Token ${apiKey}` },
     cache: "no-store",
   });
@@ -83,7 +84,7 @@ async function getCryptoPrices(
   url.searchParams.set("startDate", startDate);
   url.searchParams.set("resampleFreq", "1day");
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithRetry(url.toString(), {
     headers: { Authorization: `Token ${apiKey}` },
     cache: "no-store",
   });
