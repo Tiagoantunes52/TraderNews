@@ -2,11 +2,13 @@
 //
 // ── What this can and cannot support ────────────────────────────────────────────
 //
-// **Cannot:** say that a change makes money. There are no fills, no sizing, no exit
-// ladder, no position caps and no cash accounting here. A score that ranks well can
-// still lose after a limit order fails to fill on the names that ran (see
-// OPEN-FINDINGS.md — that is precisely how the sim books' apparent edge evaporated).
-// A `PASSES` verdict is grounds to PROPOSE a change with evidence, never to ship one.
+// **Cannot:** say that a change makes money. There is no sizing, no exit ladder, no
+// position caps and no cash accounting here. Since 2026-08-24 the ENTRY leg is
+// modelled — `ReturnFrame` scores against next-open entry ("exec") or a buffered-limit
+// fill with misses dropped ("fill") — because the sim books' apparent edge evaporated
+// precisely on unfillable entries (see OPEN-FINDINGS.md). The exit leg is still an
+// idealised close. A `PASSES` verdict is grounds to PROPOSE a change with evidence,
+// never to ship one.
 //
 // **Can:** compare two scores' ranking power over 119k stock-days with a real
 // train/test split, which is exactly the question `calcQuantScore` currently fails.
@@ -137,10 +139,59 @@ export type FeatureRow = {
   benchRsi14: number | null;
   benchAdx14: number | null;
   forward: Record<`h${Horizon}`, number>;
+  /**
+   * Executable frame: entry at the NEXT session's open — the first price a decision
+   * made after this close can act at — with the same close(i+h) endpoint as `forward`.
+   * The difference between the two is therefore exactly the overnight entry gap, which
+   * is the channel the execution audit found the sim's edge leaking through. Null when
+   * the next session's open is unusable.
+   */
+  forwardExec: Record<`h${Horizon}`, number> | null;
+  /**
+   * Buffered-limit fill simulation: a limit at close × (1 + ENTRY_BUFFER_PCT) resting
+   * through the next session. Filled at the open when it opens at/below the limit, at
+   * the limit when the low trades through it intraday, and null when the order never
+   * fills — the name gapped up and ran, which the fill frame counts as a miss instead
+   * of pretending the trade happened.
+   */
+  fillPrice: number | null;
 };
 
-/** What a candidate sees: features without the answer. */
-export type ScoreInput = Omit<FeatureRow, "forward">;
+/**
+ * What a candidate sees: features without the answers. `forwardExec` and `fillPrice`
+ * are both computed from the NEXT session's bar, so they are answers too.
+ */
+export type ScoreInput = Omit<FeatureRow, "forward" | "forwardExec" | "fillPrice">;
+
+/**
+ * The paper book's entry buffer (2%), flat rather than staleness-scaled: the research
+ * frame assumes a fresh reference close, which live pricing now delivers on the main
+ * path. See `stalenessScaledBuffer` for the paths where it does not.
+ */
+export const ENTRY_BUFFER_PCT = 0.02;
+
+/**
+ * Which return the harness scores against.
+ *
+ * - `close`: close(i) → close(i+h). The classic research frame, and a price nothing
+ *   can actually trade at — the decision is made after that close prints.
+ * - `exec`: open(i+1) → close(i+h). Everything assumed filled at the next open.
+ * - `fill`: buffered-limit fill → close(i+h), missed orders DROPPED. Conditioning on
+ *   the fill is the point: it prices the adverse selection where the misses are the
+ *   winners. Compare against `exec` to see what the limit costs.
+ */
+export type ReturnFrame = "close" | "exec" | "fill";
+export const RETURN_FRAMES: readonly ReturnFrame[] = ["close", "exec", "fill"];
+
+/** Frame-dependent forward return; null when this row has no return in that frame. */
+export function frameReturn(f: FeatureRow, horizon: Horizon, frame: ReturnFrame): number | null {
+  if (frame === "close") return f.forward[`h${horizon}`];
+  if (frame === "exec") return f.forwardExec?.[`h${horizon}`] ?? null;
+  if (f.fillPrice == null) return null;
+  // Endpoint from the stored close-frame return: close(i+h) = close × (1 + forward).
+  const endPrice = f.close * (1 + f.forward[`h${horizon}`]);
+  return (endPrice - f.fillPrice) / f.fillPrice;
+}
 
 export type Candidate = {
   id: string;
@@ -267,6 +318,18 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
       const forward = {} as Record<`h${Horizon}`, number>;
       for (const h of HORIZONS) forward[`h${h}`] = (series[i + h].close - bar.close) / bar.close;
 
+      // Executable frame + fill simulation, both off the NEXT session's bar
+      // (guaranteed to exist: i stops maxHorizon short of the series end).
+      const next = series[i + 1];
+      let forwardExec: Record<`h${Horizon}`, number> | null = null;
+      if (next.open > 0) {
+        forwardExec = {} as Record<`h${Horizon}`, number>;
+        for (const h of HORIZONS) forwardExec[`h${h}`] = (series[i + h].close - next.open) / next.open;
+      }
+      const limit = bar.close * (1 + ENTRY_BUFFER_PCT);
+      const fillPrice =
+        next.open > 0 && next.open <= limit ? next.open : next.low > 0 && next.low <= limit ? limit : null;
+
       out.push({
         stockId: bar.stockId,
         ticker: bar.ticker,
@@ -289,6 +352,8 @@ export function buildFeatures(bars: Bar[], benchmarkTicker = "SPY"): FeatureRow[
         benchRsi14: bs?.rsi14 ?? null,
         benchAdx14: bs?.adx14 ?? null,
         forward,
+        forwardExec,
+        fillPrice,
       });
     }
   }
@@ -365,6 +430,12 @@ export type PeriodStats = {
   buckets: BucketStat[];
   monotonic: boolean;
   byRegime: { regime: MarketRegime; sessions: number; ic: IcStat }[];
+  /**
+   * Fill frame only: share of scored BUY/STRONG_BUY rows whose buffered limit filled.
+   * Null in every other frame. The complement is the adverse-selection channel — the
+   * audit measured the unfilled entries to be disproportionately the winners.
+   */
+  entryFillRate: number | null;
 };
 
 export type FoldStat = { label: string; ic: IcStat };
@@ -375,6 +446,8 @@ export type CandidateReport = {
   id: string;
   hypothesis: string;
   horizon: Horizon;
+  /** Which return frame the whole report was scored against. */
+  frame: ReturnFrame;
   train: PeriodStats;
   holdout: PeriodStats;
   folds: FoldStat[];
@@ -426,23 +499,40 @@ export function evaluatePeriod(
   label: string,
   features: FeatureRow[],
   candidate: Candidate,
-  horizon: Horizon
+  horizon: Horizon,
+  frame: ReturnFrame = "close"
 ): PeriodStats {
-  const ret = (f: FeatureRow) => f.forward[`h${horizon}`];
+  const ret = (f: FeatureRow) => frameReturn(f, horizon, frame);
   const scoreOf = candidate.oracle ? ret : candidate.score;
-  const scored = features
+  // Score first, then drop rows with no return in this frame. In the fill frame that
+  // drop IS the fill filter — and `entryFillRate` below records how selective it was
+  // on the bucket that actually opens positions, because the audit's finding was that
+  // the misses are not random: they are the winners.
+  const scoredAll = features
     .map((f) => ({ f, score: scoreOf(f) }))
     .filter((r): r is { f: FeatureRow; score: number } => r.score != null && Number.isFinite(r.score));
+  const scored = scoredAll.filter((r) => ret(r.f) != null);
 
-  const excess = excessBySession(scored.map((r) => r.f), ret);
+  let entryFillRate: number | null = null;
+  if (frame === "fill") {
+    const entryScored = scoredAll.filter((r) => {
+      const l = scoreToSignal(r.score);
+      return l === "BUY" || l === "STRONG_BUY";
+    });
+    const entryFilled = entryScored.filter((r) => r.f.fillPrice != null);
+    entryFillRate = entryScored.length > 0 ? entryFilled.length / entryScored.length : null;
+  }
+
+  const retNonNull = (f: FeatureRow) => ret(f)!;
+  const excess = excessBySession(scored.map((r) => r.f), retNonNull);
   const rows = scored.map((r) => ({ ...r, excess: excess.get(r.f)! }));
 
   const crossSectional = icAcross(
-    rows.map((r) => ({ key: r.f.session, x: r.score, y: ret(r.f) })),
+    rows.map((r) => ({ key: r.f.session, x: r.score, y: retNonNull(r.f) })),
     MIN_NAMES_PER_SESSION
   );
   const timeSeries = icAcross(
-    rows.map((r) => ({ key: r.f.stockId, x: r.score, y: ret(r.f) })),
+    rows.map((r) => ({ key: r.f.stockId, x: r.score, y: retNonNull(r.f) })),
     MIN_SESSIONS_PER_NAME
   );
 
@@ -486,12 +576,13 @@ export function evaluatePeriod(
     },
     buckets,
     monotonic: isMonotonic(buckets),
+    entryFillRate,
     byRegime: REGIMES.map((regime) => {
       const sub = rows.filter((r) => r.f.marketRegime === regime);
       return {
         regime,
         sessions: new Set(sub.map((r) => r.f.session)).size,
-        ic: icAcross(sub.map((r) => ({ key: r.f.session, x: r.score, y: ret(r.f) })), MIN_NAMES_PER_SESSION),
+        ic: icAcross(sub.map((r) => ({ key: r.f.session, x: r.score, y: retNonNull(r.f) })), MIN_NAMES_PER_SESSION),
       };
     }),
   };
@@ -584,11 +675,14 @@ export function formatReport(reports: CandidateReport[], k = reports.length): st
   const ctl = controlsOk(reports);
   const first = reports[0];
 
-  L.push(`═══ signal research — horizon ${first?.horizon ?? "?"} sessions ═══`);
+  L.push(`═══ signal research — horizon ${first?.horizon ?? "?"} sessions, frame ${first?.frame ?? "close"} ═══`);
   L.push(
     `train ${first?.train.sessions ?? 0} sessions / ${(first?.train.observations ?? 0).toLocaleString()} obs   ` +
       `holdout ${first?.holdout.sessions ?? 0} sessions / ${(first?.holdout.observations ?? 0).toLocaleString()} obs`
   );
+  if (first?.frame === "fill") {
+    L.push("fill frame: missed limits are dropped, not imputed; per-candidate entry fill rates below.");
+  }
   L.push("");
 
   if (!ctl.ok) {
@@ -598,11 +692,18 @@ export function formatReport(reports: CandidateReport[], k = reports.length): st
   }
 
   L.push("VERDICT (cross-sectional IC, t across sessions)");
-  L.push("candidate              TRAIN           HOLDOUT         entry excess    verdict");
+  const fillCol = first?.frame === "fill";
+  L.push(
+    `candidate              TRAIN           HOLDOUT         entry excess    ${fillCol ? "fill%   " : ""}verdict`
+  );
   for (const r of reports) {
+    // The oracle scores FROM the frame return, so rows without a fill never enter its
+    // sample and its fill rate is 100% by construction — print it as "—".
+    const fr = r.holdout.entryFillRate;
+    const fill = !fillCol ? "" : r.id === "oracle" || fr == null ? "—       " : `${(fr * 100).toFixed(1)}%`.padEnd(8);
     L.push(
       `${r.id.padEnd(22)}${ic(r.train.crossSectional)}${ic(r.holdout.crossSectional)}` +
-        `${bps(r.holdout.entry.meanExcess).padEnd(16)}${r.verdict}`
+        `${bps(r.holdout.entry.meanExcess).padEnd(16)}${fill}${r.verdict}`
     );
   }
 
@@ -638,22 +739,26 @@ export type EvaluateOptions = {
   splitDate: string;
   folds?: number;
   horizon?: Horizon;
+  /** Return frame to score against (default "close" — the historical baseline). */
+  frame?: ReturnFrame;
 };
 
 /** Score one candidate: fixed split for the verdict, rolling folds for robustness. */
 export function evaluate(features: FeatureRow[], candidate: Candidate, opts: EvaluateOptions): CandidateReport {
   const horizon = opts.horizon ?? 5;
+  const frame = opts.frame ?? "close";
   const { train, holdout } = splitFixed(features, opts.splitDate);
-  const trainStats = evaluatePeriod("train", train, candidate, horizon);
-  const holdoutStats = evaluatePeriod("holdout", holdout, candidate, horizon);
+  const trainStats = evaluatePeriod("train", train, candidate, horizon, frame);
+  const holdoutStats = evaluatePeriod("holdout", holdout, candidate, horizon, frame);
   const folds = splitRolling(features, opts.folds ?? 0).map((f) => ({
     label: f.label,
-    ic: evaluatePeriod(f.label, f.rows, candidate, horizon).crossSectional,
+    ic: evaluatePeriod(f.label, f.rows, candidate, horizon, frame).crossSectional,
   }));
   return {
     id: candidate.id,
     hypothesis: candidate.hypothesis,
     horizon,
+    frame,
     train: trainStats,
     holdout: holdoutStats,
     folds,

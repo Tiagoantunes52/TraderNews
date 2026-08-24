@@ -290,6 +290,19 @@ the driver exits non-zero if they fail: `oracle` must return IC exactly 1.0000, 
 must detect the known momentum effect. A null result off an unverified instrument is
 worth nothing.
 
+**Executable frames added 2026-08-24** (`--frame=exec|fill`): entry at the next
+session's open, or at a buffered 2%-limit with misses *dropped* — the entry leg the
+sim was measured to fantasise about. First read, holdout, close → exec → fill:
+baseline IC -0.0277(-2.73) → -0.0243(-2.44) → -0.0238(-2.39); `f2` +0.0034 → +0.0068
+→ +0.0055 — **no verdict flips**, so the close-frame conclusions above survive
+executability. Entry-bucket fill rate under a resting 2% limit is ~97% (the intraday
+low usually crosses back through the limit even after a gap-up open — the close-only
+gap distribution quoted earlier was an upper bound on misses, as footnoted at the
+time). The instructive control: `mom30`'s holdout IC shrinks +0.0139 → +0.0083 from
+close to fill — a meaningful slice of the momentum edge lives in the overnight gap
+you cannot buy. The exit leg is still an idealised close; sizing/exits/cash remain
+unmodelled.
+
 **First run, 2026-07-31 — all three pre-registered hypotheses FAILED.** Split 2025-01-01,
 horizon 5, 801 train / 383 holdout sessions:
 

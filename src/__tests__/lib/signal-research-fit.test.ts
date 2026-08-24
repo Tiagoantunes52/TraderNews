@@ -221,6 +221,8 @@ function mkFeature(
     benchRsi14: opts.rsi ?? 50,
     benchAdx14: opts.adx,
     forward: { h1: opts.ret, h5: opts.ret, h10: opts.ret },
+    forwardExec: null,
+    fillPrice: null,
   };
 }
 
