@@ -548,7 +548,188 @@ Close-to-close IC with no fills and no costs; costs make this worse, not better.
 
 ---
 
-## Priority plan
+## Exit-ladder attribution, 2026-08-24 — the trail ratchet is the rung that cuts winners short
+
+The strategy thread's "cannot be attributed to a specific exit rung until `exitReason`
+accumulates" matured: **62 labelled `_RM` closes** (24 COMBINED_RM, 24 QUANT_RM,
+14 SENTIMENT_RM; 57 unique ticker × exit-day pairs, so pooled n overstates
+independence). Reproducible via `npx tsx scripts/exit-ladder-study.ts` (read-only):
+per-rung outcomes, MFE capture off the persisted `peakPrice`, post-exit drift vs SPY
+with t-stats across exit *sessions* (never pooled — same lesson as `entryTStat`), and
+the ratchet counterfactual. SPY left the tracked universe 2026-07-29, so the study's
+benchmark comes from `getDailyPrices("SPY")` — the app's own source chain — not
+`PriceBar`.
+
+| rung | n | mean ret | total $ | mean MFE | giveback | med capture | 5d drift vs SPY (t, sess) |
+|---|---|---|---|---|---|---|---|
+| STOP | 10 | -8.90% | -660 | 1.3% | -10.1% | — | +2.86% (2.40, 4) |
+| TRAIL | 9 | +9.65% | +589 | **20.4%** | -8.9% | **0.43** | +3.81% (1.02, 3) |
+| SIGNAL | 4 | +7.65% | +199 | 12.8% | -4.7% | 0.36 | n too small |
+| DECAY | 24 | +6.40% | +1,087 | 6.7% | **-0.3%** | **0.77** | +1.21% (2.15, 5) |
+| TIME | 15 | +1.39% | +154 | 6.3% | -4.4% | 0.23 | +3.82% (0.29, 6) |
+
+Reading, rung by rung:
+
+- **DECAY is the best rung in the system** — 24 exits, 77% median capture of the peak,
+  essentially zero giveback, and $1,087 of the sample's $1,369 total P&L. "Thesis
+  played out, take the profit" is doing exactly what it was designed to do.
+- **TIME works as designed** — 15 dead-money exits for ~breakeven ($154), freeing
+  slots. Its low capture (0.23) is definitional: it only fires on names that round-tripped
+  back to flat.
+- **STOP** is the entire loss side (all 10 losses, ≈ -8.9% each — beyond the 6-8%
+  designed distance because closes gap through the stop, which is the honest fill).
+  Stopped names then *beat* SPY over the next 5 sessions (+2.86%, t 2.40 across 4
+  sessions — suggestive, tiny n): stops tend to sell local lows, and
+  `brokerReentryRuns: 10` then locks the book out of the recovery for two weeks. Watch,
+  don't widen — capital protection is the rung's job.
+- **TRAIL is where winners are cut short.** Mean peak +20.4%, mean banked +9.65% —
+  median capture 0.43 — and **8 of the 9 exits had the ratchet active** (peak ≥ +15%,
+  trail halved). The names it sold kept running: 10-day post-exit drift +14.85%
+  (t 2.10, but only 3 sessions / 3 unique names).
+
+**Ratchet counterfactual** (from each exit's *recorded* state — entry and peak are
+ground truth on the closed row — walking only post-exit bars under the full-width
+trail; replaying whole trades from entry is not possible because the book's price
+stream lags the bar sessions and runs can skip names):
+
+| name | actual | full-width trail | delta |
+|---|---|---|---|
+| PLTR (×2 books) | +6.7% @07-23 | still open, +47.9% @08-17 | +41.1pp |
+| TOST (×2 books) | +15.9% @07-24 | still open, +40.0% @08-17 | +24.2pp |
+| DDOG | +11.4% @07-23 | still open, +19.8% @07-29 (bars end) | +8.4pp |
+| SLB | +2.0% @07-30 | wide trail fires same day | 0 |
+| AAPL / KLAC / RKLB | — | no post-exit bars — excluded | — |
+
+Mean +23.2pp over 6 trades (4 unique names). "Still open" deltas are marks at the
+name's last stored bar, not realised exits — but the wide trail bounds any later exit
+at `peak × (1 - trail)`, so the direction is not an artifact of truncation.
+
+**The cut-winners-short signature did NOT reproduce at the aggregate level in this
+window** — labelled sample: 75.8% win, payoff 1.00, +3.27%/trade vs the historical
+55-62% / 0.54-0.66. Two reasons to distrust the improvement: composition (DECAY and
+TRAIL can only fire in profit, and they dominate the labelled mix) and regime (the
+label window 07-21 → 08-21 was a rally; the pre-label sample carried the June-July
+chop). What survives composition and regime is the *structural* finding: the one
+mechanism measurably truncating winners is the ratchet — the feature added so big
+winners "give back less" is what sells the book's best names into routine pullbacks.
+
+**What this settles / does not.** One five-week rally window; every drift t is on 2-6
+sessions; the counterfactual is 4 unique names. Nothing here ships a knob change by
+itself. It nominates exactly one pre-registered candidate: **`trailRatchetFrac` 0.5 →
+1.0 (disable the ratchet), or equivalently a much higher `trailRatchetActivatePct`**,
+to be evaluated the way this codebase evaluates things — as a measurable change with
+the pure `COMBINED` book untouched as baseline, judged after it accumulates its own
+labelled exits. The DECAY/TIME/STOP rungs earn no change candidate at all, and
+"leave the exits alone" stands for them.
+
+### ACTED ON 2026-08-24: the ratchet is disabled
+
+The pre-registered candidate above shipped as the first `tradingConfig` DB override:
+`{ "trailRatchetFrac": 1 }` — the ratchet branch still executes but multiplies the
+trail by 1, so a big winner keeps the full-width trail. Chosen over
+`trailRatchetActivatePct: 0` because it is the exact counterfactual the study
+measured. Takes effect on the next stage run (the knob is read from the DB each
+run; no deploy involved) and reaches both places the ratchet lives: the sim ladder
+(`reconcileRiskManaged`) and the live book's broker trailing stop
+(`planBrokerAction` — the tighten-resting-trail repair also goes inert, since the
+recomputed width now equals the resting one). The pure books have no ladder and are
+untouched, as is every other rung.
+
+**Evaluation, written down before the data arrives:** judge on TRAIL exits from
+positions whose trail *armed* after 2026-08-24, against the pre-change TRAIL
+sample (capture ratio, giveback, post-exit drift) and the untouched `COMBINED`
+baseline. TRAIL exits arrive ~2/week, so the earliest honest read is ~6 weeks out
+(**revisit ≈ 2026-10-05**). The expected cost is known and accepted: without the
+ratchet a big winner can give back the full trail distance from its peak — the
+study says that trade-off paid +23pp on the measured sample, and if the live books
+disagree the knob reverses it (delete the row or set 0.5). The register asserts
+the row's exact content — see the Strategy-thread bullet — so a drift in either
+direction surfaces as `REGISTER_STALE`.
+
+**Found while measuring — investigated 2026-08-24, and the first read was wrong.**
+This paragraph originally said "the pipeline has been starving since 2026-08-18: only
+4 of ~70 names have rows past session 2026-08-17, most positions unmanaged." That was
+`max(sessionDate)` silently skipping NULLs — absence read as a default, the exact
+failure mode in the method note above, committed again. The pipeline runs at full
+volume and estimates flow daily; positions are managed. The real defect is narrower
+and older — see "The Tiingo date defect" below.
+
+---
+
+## The Tiingo date defect, 2026-08-24 — `sessionDate` and the PriceBar append have been broken for US names since the day they shipped
+
+**Root cause, confirmed in the production run logs.** Tiingo serves US equities in
+prod (the key has been set since ~June; Yahoo is only the fallback), and
+`tiingo-prices.ts` passes Tiingo's raw `date` — a full ISO datetime,
+`2026-08-22T00:00:00.000Z` — straight through. `barDate()` (`price-bars.ts`) builds
+`new Date(\`${date}T00:00:00.000Z\`)`, which on an already-suffixed string yields
+`Invalid Date`. Two consequences from the one line, every day, for every
+Tiingo-served name:
+
+1. every bar in the window is rejected `INVALID_DATE` → **zero `PriceBar` rows**;
+2. `sessionDate = barDate(lastPrice.date)` → **null**.
+
+The quant stage's own errors have named it daily — the GH workflow log prints
+`"Price bars rejected for AAPL (Tiingo): INVALID_DATE=41"` for every US name in
+every run — but stage errors keep the run green and nothing alerts on them.
+
+**Since when: the features' first live day.** `sessionDate` recording (9601cf7) and
+the in-stage PriceBar append (01c0976) both shipped 2026-07-30; the first scheduled
+run after the deploy was 07-31, and the populated/null split flipped 105/5 → 4/106
+overnight. Populated `sessionDate` before 07-31 is the feature's own backfill.
+Since then, US-name data heals only on days Tiingo happens to fail and Yahoo (whose
+adapter formats dates correctly) serves instead: 08-10 partially (21 names), 08-18
+fully (70 names, 737 bars backfilled in one run via `skipDuplicates`). The 4
+always-healthy names are the dot-suffixed European listings Tiingo's plan can't
+serve. The *prices* are fine throughout — `QuantAnalysis.price` moves daily —
+only the date string handling is broken.
+
+**Blast radius:**
+
+- **`PriceBar`**: no US bars written on Tiingo days since 07-30; sessions
+  2026-08-18 → 08-22 are currently missing for ~66 US names (until the next
+  Yahoo-fallback day or a backfill run heals them). This is what truncated the
+  exit-ladder study's drift windows.
+- **`sessionsStale()`** treats null as maximally stale (5), so
+  `stalenessScaledBuffer` has been widening the entry buffer 2% → ~4.5% on every
+  path the live-quote overlay doesn't cover (the convergence sweep, closed-market
+  runs, feed misses) since 07-31 — the "no-op the moment the real fix lands"
+  fallback has in fact been the *only* regime on those paths.
+- **`signal-health.ts`** keys its sessions off `sessionDate`, so null rows drop out:
+  the August "live entry excess" readings quoted in the quant section (08-17, 08-22)
+  were computed on a sample that mostly ends 07-30 plus the two Yahoo-fallback days.
+  Those readings are weaker than they already looked.
+- **`explain-day`** and any sessionDate-joined audit degrade the same way.
+- Separate but adjacent: **Binance returns 451** (geo-block) from GH runners, so
+  BTC-USD rides Tiingo and hits the same date defect.
+
+**FIXED 2026-08-24, same day.** Four parts, in dependency order:
+
+1. **Adapter** — `tiingo-prices.ts` now normalizes both paths to the plain session
+   date (`d.date.split("T")[0]`), with a regression test
+   (`tiingo-prices.test.ts`) that runs the result through `barDate()`. `barDate`
+   itself stays strict: the INVALID_DATE counter is the tripwire for the next
+   adapter that drifts.
+2. **Monitoring** — `auditBarFreshness` (`daily-review.ts`, pure, tested) fires
+   `PRICE_BARS_STALE` when ≥20% of the universe lacks a bar within 3 sessions.
+   Deliberately watches the DATA, not the error strings, because the stage writes
+   a full day of QuantAnalysis rows while rejecting every bar — row counts can't
+   see this failure mode, only the bars can.
+3. **PriceBar backfill** — `backfill-price-bars.ts --from=2026-08-01 --source=Yahoo`
+   inserted 851 bars; every universe name's bars now run through 2026-08-21.
+   Yahoo deliberately, to keep the corpus on one adjustment basis — post-deploy
+   appends will come from Tiingo, and `source` records the seam.
+4. **sessionDate repair** — `repair-session-dates.ts`, the original migration's
+   two-tier close-match consensus restricted to the nulled rows (write day ≥
+   07-31) with an explicit US-calendar guard. All 25 run days resolved
+   unanimously (37–105 votes each); 2,542 rows repaired, 25 left NULL (BTC-USD —
+   different calendar, by design).
+
+**Still true until the fix deploys:** prod's scheduled runs keep writing null
+`sessionDate` and no bars (the repair scripts are re-runnable to catch up). The
+August signal-health caveat above also stands for any analysis already recorded —
+the underlying rows are repaired now, but conclusions drawn from the thin sample
+before the repair were drawn from the thin sample.
 
 ### 1. Rotation policy — the last open item, and deliberately still open
 
@@ -566,6 +747,102 @@ the sim booked trades the broker never made. That is now fixed, so the right seq
 to let the corrected pipeline accumulate a few weeks of fill-based history, then decide
 rotation against evidence instead of intuition. Deciding it now would be the same
 mistake this register was written to stop.
+
+---
+
+## Post-repair measurement notes, 2026-08-24
+
+Three read-only studies run the same day as the sessionDate repair, on the healed
+data. Reproducible: `scripts/signal-health-rerun.ts`, `scripts/earnings-study.ts`.
+
+### 1. Signal health re-read on the repaired 90-day window
+
+The August live readings quoted in the quant section above were computed while
+most rows since 07-31 had NULL `sessionDate` and silently dropped out of the
+join. On the repaired window (52 scored sessions, 6,235 observations with a full
+5-session forward window):
+
+| source | entry excess | t (NW, across sessions) | note |
+|---|---|---|---|
+| COMBINED | **-53.5 bps** | **-2.42** (52 sess) | crosses the SIGNAL_INVERTED line; NEUTRAL bucket +50.0 bps (t 4.25) |
+| SENTIMENT | -15.1 bps | -0.37 | but **STRONG_BUY -80.9 bps (t -3.56, n=1017)** vs BUY +8.6 — conviction is non-monotonic |
+| QUANT | -58.9 bps | -0.77 (44 sess) | noise; consistent with "do not read its sign" |
+
+QUANT's SELL bucket sits at +182 bps (t 6.22) — the same inversion shape the
+holdout study found. The 08-22 note above recorded COMBINED at t = -0.85 and
+called the alert a false positive; that number was itself computed on the
+sessionDate-holed sample, so the honest live reading was never actually taken
+until now. **Still one 90-day rally window — a prompt to investigate, not to
+act** — and the next daily review will raise SIGNAL_INVERTED on COMBINED by
+itself. The most specific new lead is SENTIMENT's STRONG_BUY bucket: since
+07-31 the `_RM` entry gate reads the sentiment score, so "highest-conviction
+sentiment underperforms its own BUY bucket" is now an entry-path question, not
+a diagnostic curiosity.
+
+### 2. Earnings study — no blackout ships
+
+`daysToEarnings` has been recorded since June but only dampens confidence at
+estimate time; before proposing a blackout or pre-earnings exit, the closed
+trades were measured (1,277 unique (ticker, entry, exit) events with earnings
+coverage, since 2026-06-01):
+
+| group | n | win | mean | mean loss |
+|---|---|---|---|---|
+| held through an earnings date | 201 | 58% | **+1.15%** | -4.68% |
+| no earnings in hold | 1,076 | 46% | -0.20% | -3.55% |
+| entered ≤3d before earnings | 108 | 47% | -0.69% | -4.11% |
+
+Holding through earnings was *profitable* in this window, so a pre-earnings
+exit is contraindicated. The tail does hold a specific pattern — RDDT, APP and
+DDOG were entered 0-1 days before a scheduled print and lost 17-21% on the gap
+(all then exited by the SIGNAL rung doing its job) — and the ≤3d entry bucket
+nets weakly negative, so a narrow (~2-3 day) **entry** blackout has weak
+in-sample support. Parked, not shipped: the mean effect is small, the ≤5d
+bucket flips positive (+0.22%, n=167), and one summer of rally tape cannot
+price the variance. Recorded so the idea is not re-proposed from scratch.
+
+### 3. STRONG_BUY dissection — real shape, episodic, no action
+
+Follow-up on #1's lead (`scripts/strong-buy-study.ts`). The excess-by-score
+gradient is monotone-inverted above ~0.4: +24 / +20 / -4 / **-90 / -57 / -105**
+bps across the six bins from non-entry to (0.8, 1.0]. It is broad, not a
+few-names artifact — 1,017 STRONG_BUY observations over 106 names, top-5 share
+11% (though ARM at -883 bps and AMAT at -702 show where the hype names live).
+The paired same-session STRONG_BUY-minus-BUY difference is -81.9 bps (t -1.69,
+52 sessions) — suggestive, short of significant.
+
+**The disqualifier is the month split: July -173 bps (t -3.43), August +2 bps
+(t -0.30).** The effect was one episode — July's chop punishing high-sentiment
+names — and is not currently active. Touching the entry gate off one adverse
+month of one summer would be fitting an episode, and unlike the quant score
+there is no multi-year corpus to holdout-test sentiment against: the scores
+only exist since June. Verdict: **measured, recorded, no action.** The durable
+observation worth keeping is that the top of the sentiment scale has carried no
+positive information in its whole recorded life — if that is still true after
+another quarter of sessions, a score cap (treating >0.6 as 0.6 at entry)
+becomes a testable candidate with an actual sample behind it.
+
+### 4. CRWD's 4:1 split corrupts four closed positions (and every aggregate over them)
+
+Surfaced by the earnings study's worst-trades list: two "-71/-72%" CRWD events.
+Entry was recorded at the raw pre-split price (678.65 = 4 × the adjusted 169.66
+close of 2026-06-25) and the exit at the post-split price (193.98), across
+SENTIMENT, COMBINED, SENTIMENT_RM and COMBINED_RM — **~$1,757 of fictitious
+realized loss on holds where CRWD actually gained ~14% adjusted**. Every
+closed-trade aggregate in this register carries it: pure COMBINED's "-$2,494
+over 439 closes" is about one-sixth this single artifact, and the loss side of
+the "payoff 0.54-0.66" figure is inflated by it.
+
+**Status 2026-08-24:** a full-book scan found exactly the four known rows and no
+open positions affected. The guard shipped — `auditCorporateActions`
+(`daily-review.ts`, pure, tested) watches each OPEN position's price stream for
+one-step moves outside 0.6-1.67x and warns `CORPORATE_ACTION_SUSPECT`, so the
+next basis break surfaces while the position is still open and repairable. The
+repair itself is `scripts/repair-crwd-split.ts` (qty ×4, entryPrice ÷4,
+peakPrice ÷4, realizedPnl recomputed — dry-run verified: +$86/+$69 instead of
+-$428/-$470); the write needs to be run by a human, and `PaperEquitySnapshot`
+history deliberately keeps the artifact (the daily equity series records what
+the books believed at the time).
 
 ---
 
@@ -621,12 +898,14 @@ listed so they are not silently forgotten.
 
 ## Strategy thread (predates the execution review)
 
-<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few -->
-- **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
-  are at code defaults, and that is currently correct. `exitReason` only began
-  persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
-  13 labelled exits. Tuning the exit ladder against that is fitting noise. Revisit after
-  ~4–6 weeks of labelled exits.
+<!-- check: knobs-single-ratchet-override -->
+- **One deliberate DB override; every other knob at its code default.** The
+  `tradingConfig` row holds exactly `{ "trailRatchetFrac": 1 }` — the 2026-08-24
+  ratchet disable (see "ACTED ON 2026-08-24" under the exit-ladder attribution).
+  Until that date there was no row at all; the old `exit-labels-too-few` revisit
+  trigger fired at 62 labelled exits, produced the attribution study it existed to
+  prompt, and both retired here. The assertion now checks the row's *content*, so a
+  second knob drifting in — or the override silently vanishing — is what trips it.
 - **Entry score buckets: RESOLVED 2026-07-31, and they do not slope the right way.** The
   sample passed its threshold (178 closes, was 59), so the claim was re-run instead of
   requoted. Quintiles of `entryScore` against trade return:
@@ -648,8 +927,9 @@ listed so they are not silently forgotten.
   not because it is significant on its own.
 - **The real signal is payoff, not hit rate.** Across 176 `_RM` trades: hit rate
   55–62% (good), payoff 0.54–0.66, losses ~1.6× winners. Classic cut-winners-short
-  signature, consistent across three independent books. Cannot be attributed to a
-  specific exit rung until `exitReason` accumulates.
+  signature, consistent across three independent books. **Attributed 2026-08-24** —
+  see "Exit-ladder attribution" above: the truncation mechanism is the trail ratchet;
+  DECAY/TIME/STOP earn no change.
 <!-- check: entry-freeze-drained -->
 - **The 15-session entry freeze — drained, now watched.** `SENTIMENT_RM` and
   `COMBINED_RM` took zero entries 2026-07-01 → 07-24; 100% of intended entries vetoed.

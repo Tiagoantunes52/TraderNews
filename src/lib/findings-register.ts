@@ -24,10 +24,12 @@
 import type { Finding } from "@/lib/daily-review";
 
 export type RegisterFacts = {
-  /** `_RM` closes carrying a real `exitReason` — the sample the exit ladder can be tuned on. */
-  labelledRmExits: number;
-  /** An `AppSetting` row keyed `tradingConfig` exists (knobs no longer at code defaults). */
-  tradingConfigRowExists: boolean;
+  /**
+   * Raw `value` of the `tradingConfig` AppSetting row, null when absent. Raw rather
+   * than a boolean so the assertion can check the row's CONTENT: since 2026-08-24 a
+   * row is supposed to exist, holding exactly the deliberate ratchet override.
+   */
+  tradingConfigRaw: string | null;
   /** OPEN positions whose last mark is older than `staleMarkDays` — unmanaged in practice. */
   staleMarkedPositions: number;
   staleMarkDays: number;
@@ -56,40 +58,46 @@ export type RegisterAssertion = {
 };
 
 /**
- * Labelled `_RM` exits needed before the register's "revisit the exit ladder" trigger
- * fires. The register's own wording is "revisit after ~4-6 weeks of labelled exits";
- * 60 is that in trades, at the ~2/day the books closed over the period it was written.
- * A round number chosen once and written down beats one re-argued each time it is read —
- * and being early costs a prompt, while being late costs weeks of untuned exits.
+ * The "revisit the exit ladder" trigger (`exit-labels-too-few`, threshold 60 labelled
+ * exits) lived here until 2026-08-24, when it fired at 62 and produced the attribution
+ * study it existed to prompt — see OPEN-FINDINGS.md, "Exit-ladder attribution".
  */
-export const EXIT_LADDER_SAMPLE = 60;
 
 /** The `.slice(0, 10)` in `sentiment.ts` that caps `articleCount`. */
 export const ARTICLE_COUNT_SLICE = 10;
 
 export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
   {
-    id: "knobs-at-defaults",
+    // Replaced `knobs-at-defaults` on 2026-08-24 when the ratchet disable created the
+    // first deliberate override; `exit-labels-too-few` retired the same day — it fired
+    // at 62 labelled exits and produced the attribution study it existed to trigger.
+    id: "knobs-single-ratchet-override",
     section: "Strategy thread",
-    claim: "There is no `tradingConfig` row; all knobs are at code defaults, and that is currently correct.",
-    check: (f) => ({
-      holds: !f.tradingConfigRowExists,
-      detail: f.tradingConfigRowExists
-        ? "A `tradingConfig` AppSetting row now exists, so the knobs are no longer at code defaults. Every claim in the register derived from default behaviour needs re-reading against the live config."
-        : "no row; defaults still in force.",
-    }),
-  },
-  {
-    id: "exit-labels-too-few",
-    section: "Strategy thread",
-    claim: `Only 13 labelled exits exist; tuning the exit ladder against that is fitting noise. Revisit after ~4-6 weeks.`,
-    check: (f) => ({
-      holds: f.labelledRmExits < EXIT_LADDER_SAMPLE,
-      detail:
-        f.labelledRmExits >= EXIT_LADDER_SAMPLE
-          ? `${f.labelledRmExits} labelled \`_RM\` exits have now accumulated (threshold ${EXIT_LADDER_SAMPLE}). The exit ladder can be attributed to a rung — this is the register's own revisit trigger firing.`
-          : `${f.labelledRmExits}/${EXIT_LADDER_SAMPLE} labelled exits.`,
-    }),
+    claim: "The only DB override is `trailRatchetFrac: 1` (the 2026-08-24 ratchet disable); every other knob is at code defaults.",
+    check: (f) => {
+      let parsed: unknown = null;
+      if (f.tradingConfigRaw != null) {
+        try {
+          parsed = JSON.parse(f.tradingConfigRaw);
+        } catch {
+          /* unparseable is just "not the expected row" */
+        }
+      }
+      const holds =
+        parsed != null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        Object.keys(parsed).length === 1 &&
+        (parsed as Record<string, unknown>).trailRatchetFrac === 1;
+      return {
+        holds,
+        detail: holds
+          ? "row holds exactly { trailRatchetFrac: 1 }."
+          : f.tradingConfigRaw == null
+            ? "The tradingConfig row is GONE — the ratchet disable was reverted (or never applied), and the 2026-08-24 change plus its evaluation window no longer describe the live books."
+            : `The tradingConfig row is no longer exactly { trailRatchetFrac: 1 } (found: ${f.tradingConfigRaw.slice(0, 120)}). A second knob moved — every claim derived from "only the ratchet changed" needs re-reading.`,
+      };
+    },
   },
   {
     id: "article-count-capped",

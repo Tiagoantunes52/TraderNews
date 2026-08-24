@@ -5,6 +5,8 @@ import {
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
+  auditBarFreshness,
+  auditCorporateActions,
   auditRiskBlocks,
   auditRunProvenance,
   auditTrackingError,
@@ -256,6 +258,34 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     findings.push(...auditClosedPositions(closedToday, closedPositionAuditConfig(runLog, cfg), cfgRow?.updatedAt ?? null));
     findings.push(...auditOpenPositions(openPositions, cfg, todayUTC));
     findings.push(...auditEntries(openedToday, cfg));
+
+    // Basis-break watch: the sim has no split handling, and CRWD's 4:1 crossed a
+    // held position and closed into the statistics as a -71% "loss". Compare each
+    // held name's last two price-stream reads so the next one surfaces while the
+    // position is still open and repairable.
+    if (openPositions.length > 0) {
+      const tickers = [...new Set(openPositions.map((p) => p.ticker))];
+      const recent = await db.quantAnalysis.findMany({
+        where: { date: { gte: new Date(todayUTC.getTime() - 7 * 86_400_000) }, stock: { ticker: { in: tickers } } },
+        orderBy: { date: "asc" },
+        select: { price: true, stock: { select: { ticker: true } } },
+      });
+      const lastTwo = new Map<string, number[]>();
+      for (const q of recent) {
+        if (q.price == null) continue;
+        const arr = lastTwo.get(q.stock.ticker) ?? [];
+        arr.push(q.price);
+        if (arr.length > 2) arr.shift();
+        lastTwo.set(q.stock.ticker, arr);
+      }
+      findings.push(
+        ...auditCorporateActions(
+          [...lastTwo.entries()]
+            .filter(([, prices]) => prices.length === 2)
+            .map(([ticker, [prevPrice, curPrice]]) => ({ ticker, prevPrice, curPrice }))
+        )
+      );
+    }
   } catch (e) {
     errors.push(`Position audit failed: ${String(e)}`);
   }
@@ -372,6 +402,28 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     errors.push(`Health audit failed: ${String(e)}`);
   }
 
+  // Bar freshness is separate from auditHealth's row counts on purpose: the quant
+  // stage can write a full day of QuantAnalysis rows while every PriceBar is
+  // rejected in validation (the Tiingo date defect did exactly that for 3.5
+  // weeks), so counting rows cannot see it — only the bars themselves can.
+  try {
+    const universe = await db.stock.findMany({ where: universeWhere(), select: { id: true, ticker: true } });
+    const latestBars = await db.priceBar.groupBy({
+      by: ["stockId"],
+      _max: { date: true },
+      where: { stockId: { in: universe.map((s) => s.id) } },
+    });
+    const lastByStock = new Map(latestBars.map((b) => [b.stockId, b._max.date]));
+    findings.push(
+      ...auditBarFreshness(
+        universe.map((s) => ({ ticker: s.ticker, lastBar: lastByStock.get(s.id) ?? null })),
+        todayUTC
+      )
+    );
+  } catch (e) {
+    errors.push(`Bar freshness audit failed: ${String(e)}`);
+  }
+
   // ── 5. Strategy rollups + tuning signals ───────────────────────────────────
   let strategies: DailyReviewReport["strategies"] = [];
   try {
@@ -464,11 +516,8 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
   // there being trusted.
   try {
-    const [labelledRmExits, cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
-      db.simPosition.count({
-        where: { strategy: { in: RM_STRATEGIES }, status: "CLOSED", exitReason: { not: null } },
-      }),
-      db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { key: true } }),
+    const [cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
+      db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { value: true } }),
       db.simPosition.count({
         where: { status: "OPEN", lastMarkDate: { lt: new Date(todayUTC.getTime() - REGISTER_STALE_MARK_DAYS * 86_400_000) } },
       }),
@@ -484,9 +533,8 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     ]);
 
     const facts: RegisterFacts = {
-      labelledRmExits,
       maxArticleCount: maxArticles._max.articleCount ?? 0,
-      tradingConfigRowExists: cfgRow != null,
+      tradingConfigRaw: cfgRow?.value ?? null,
       staleMarkedPositions: staleMarked,
       staleMarkDays: REGISTER_STALE_MARK_DAYS,
       rmEntriesInWindow: rmEntries,

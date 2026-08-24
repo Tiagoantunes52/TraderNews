@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   replayDecisions,
+  auditBarFreshness,
   auditClosedPositions,
+  auditCorporateActions,
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
@@ -952,5 +954,94 @@ describe("overallStatus / rankFindings", () => {
   it("ranks failures first and is stable by code", () => {
     const ranked = rankFindings([f("info", "Z"), f("fail", "B"), f("warn", "M"), f("fail", "A")]);
     expect(ranked.map((r) => r.code)).toEqual(["A", "B", "M", "Z"]);
+  });
+});
+
+describe("auditBarFreshness", () => {
+  // A Monday, so Friday's bar is 1 session back and Wednesday's is 3.
+  const monday = new Date("2026-08-24T00:00:00.000Z");
+  const stock = (ticker: string, lastBar: string | null) => ({
+    ticker,
+    lastBar: lastBar ? new Date(`${lastBar}T00:00:00.000Z`) : null,
+  });
+
+  it("stays silent when the universe is fresh", () => {
+    const stocks = Array.from({ length: 10 }, (_, i) => stock(`S${i}`, "2026-08-21"));
+    expect(auditBarFreshness(stocks, monday)).toEqual([]);
+  });
+
+  it("tolerates a long weekend plus one holiday", () => {
+    // Thursday's bar on Monday = 2 sessions (Fri, Mon) — under the threshold.
+    const stocks = Array.from({ length: 10 }, (_, i) => stock(`S${i}`, "2026-08-20"));
+    expect(auditBarFreshness(stocks, monday)).toEqual([]);
+  });
+
+  it("stays silent when staleness is isolated to a few names", () => {
+    const stocks = [
+      stock("DEAD", null),
+      ...Array.from({ length: 9 }, (_, i) => stock(`S${i}`, "2026-08-21")),
+    ];
+    expect(auditBarFreshness(stocks, monday)).toEqual([]);
+  });
+
+  it("fires when a fifth of the universe has stale or missing bars", () => {
+    // The Tiingo-defect shape: fetches succeed, every bar rejected, last bar a week old.
+    const stocks = [
+      ...Array.from({ length: 4 }, (_, i) => stock(`STALE${i}`, "2026-08-17")),
+      ...Array.from({ length: 6 }, (_, i) => stock(`OK${i}`, "2026-08-21")),
+    ];
+    const out = auditBarFreshness(stocks, monday);
+    expect(out).toHaveLength(1);
+    expect(out[0].code).toBe("PRICE_BARS_STALE");
+    expect(out[0].severity).toBe("warn");
+    expect(out[0].refs).toMatchObject({ stale: 4, total: 10 });
+  });
+
+  it("counts a name with no bars at all as stale", () => {
+    const stocks = [
+      ...Array.from({ length: 3 }, (_, i) => stock(`NONE${i}`, null)),
+      ...Array.from({ length: 7 }, (_, i) => stock(`OK${i}`, "2026-08-21")),
+    ];
+    const out = auditBarFreshness(stocks, monday);
+    expect(out).toHaveLength(1);
+    expect(out[0].refs).toMatchObject({ stale: 3 });
+  });
+
+  it("returns nothing for an empty universe", () => {
+    expect(auditBarFreshness([], monday)).toEqual([]);
+  });
+});
+
+describe("auditCorporateActions", () => {
+  it("fires on a split-shaped drop (the CRWD 4:1 shape)", () => {
+    const out = auditCorporateActions([{ ticker: "CRWD", prevPrice: 775.92, curPrice: 193.98 }]);
+    expect(out).toHaveLength(1);
+    expect(out[0].code).toBe("CORPORATE_ACTION_SUSPECT");
+    expect(out[0].severity).toBe("warn");
+    expect(out[0].refs).toMatchObject({ ticker: "CRWD", ratio: 0.25 });
+  });
+
+  it("fires on a reverse-split-shaped jump", () => {
+    const out = auditCorporateActions([{ ticker: "RS", prevPrice: 10, curPrice: 50 }]);
+    expect(out).toHaveLength(1);
+  });
+
+  it("stays quiet on large but plausible market moves", () => {
+    expect(auditCorporateActions([{ ticker: "BIO", prevPrice: 100, curPrice: 65 }])).toEqual([]);
+    expect(auditCorporateActions([{ ticker: "MEME", prevPrice: 100, curPrice: 160 }])).toEqual([]);
+  });
+
+  it("stays quiet at the boundary itself", () => {
+    expect(auditCorporateActions([{ ticker: "EDGE", prevPrice: 100, curPrice: 60 }])).toEqual([]);
+  });
+
+  it("skips unusable prices instead of dividing by them", () => {
+    expect(
+      auditCorporateActions([
+        { ticker: "ZERO", prevPrice: 0, curPrice: 100 },
+        { ticker: "NEG", prevPrice: -5, curPrice: 100 },
+        { ticker: "NAN", prevPrice: NaN, curPrice: 100 },
+      ])
+    ).toEqual([]);
   });
 });

@@ -4,16 +4,14 @@ import { join } from "node:path";
 import {
   auditFindingsRegister,
   REGISTER_ASSERTIONS,
-  EXIT_LADDER_SAMPLE,
   ARTICLE_COUNT_SLICE,
   type RegisterFacts,
 } from "@/lib/findings-register";
 
-/** Production as of 2026-07-30, when every claim in the register holds. */
+/** Production as of 2026-08-24 (ratchet disabled), when every claim in the register holds. */
 const asWritten: RegisterFacts = {
-  labelledRmExits: 27,
   maxArticleCount: 10,
-  tradingConfigRowExists: false,
+  tradingConfigRaw: '{"trailRatchetFrac":1}',
   staleMarkedPositions: 0,
   staleMarkDays: 4,
   rmEntriesInWindow: 34,
@@ -35,17 +33,24 @@ describe("auditFindingsRegister()", () => {
   });
 
   it("never fails the review — a stale document is an edit, not an outage", () => {
-    const findings = auditFindingsRegister({ ...asWritten, tradingConfigRowExists: true });
+    const findings = auditFindingsRegister({ ...asWritten, tradingConfigRaw: null });
     expect(findings.every((f) => f.severity !== "fail")).toBe(true);
   });
 
-  it("notices knobs leaving their defaults", () => {
-    expect(staleIds({ tradingConfigRowExists: true })).toEqual(["knobs-at-defaults"]);
+  it("notices the ratchet disable being reverted (row gone)", () => {
+    const stale = staleIds({ tradingConfigRaw: null });
+    expect(stale).toEqual(["knobs-single-ratchet-override"]);
   });
 
-  it("fires the register's own revisit trigger once labelled exits accumulate", () => {
-    expect(staleIds({ labelledRmExits: EXIT_LADDER_SAMPLE - 1 })).toEqual([]);
-    expect(staleIds({ labelledRmExits: EXIT_LADDER_SAMPLE })).toEqual(["exit-labels-too-few"]);
+  it("notices a second knob joining the override row", () => {
+    expect(staleIds({ tradingConfigRaw: '{"trailRatchetFrac":1,"stopLossPct":0.1}' })).toEqual([
+      "knobs-single-ratchet-override",
+    ]);
+  });
+
+  it("notices the override changing value, and survives junk in the row", () => {
+    expect(staleIds({ tradingConfigRaw: '{"trailRatchetFrac":0.5}' })).toEqual(["knobs-single-ratchet-override"]);
+    expect(staleIds({ tradingConfigRaw: "not json" })).toEqual(["knobs-single-ratchet-override"]);
   });
 
   // Inverted relative to the sample-size assertions: this one HOLDS while the defect is
@@ -95,12 +100,12 @@ describe("auditFindingsRegister()", () => {
   it("lists every stale id in the summary, not just the first", () => {
     const findings = auditFindingsRegister({
       ...asWritten,
-      tradingConfigRowExists: true,
+      tradingConfigRaw: null,
       rmEntriesInWindow: 0,
     });
     const summary = findings.find((f) => f.code === "REGISTER_CHECKED")!;
     expect(summary.title).toBe(`${REGISTER_ASSERTIONS.length - 2}/${REGISTER_ASSERTIONS.length} register claims still hold`);
-    expect(summary.detail).toContain("knobs-at-defaults");
+    expect(summary.detail).toContain("knobs-single-ratchet-override");
     expect(summary.detail).toContain("entry-freeze-drained");
   });
 });

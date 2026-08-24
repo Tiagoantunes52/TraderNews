@@ -54,7 +54,11 @@ async function getStockPrices(
   return data.map((d) => {
     const close = d.adjClose ?? d.close;
     return {
-      date: d.date,
+      // Tiingo dates arrive as full ISO datetimes ("2026-08-22T00:00:00.000Z");
+      // the DailyPrice contract carries the plain session date, like every other
+      // adapter. Passing the datetime through made barDate() reject every bar
+      // (INVALID_DATE) and nulled QuantAnalysis.sessionDate whenever Tiingo served.
+      date: d.date.split("T")[0],
       close,
       volume: d.adjVolume ?? d.volume ?? 0,
       high: d.adjHigh ?? d.high ?? 0,
@@ -94,7 +98,8 @@ async function getCryptoPrices(
     priceData: Array<{ date: string; close: number; volume?: number; high?: number; low?: number; open?: number }>;
   }>;
   return (data[0]?.priceData ?? []).map((d) => ({
-    date: d.date,
+    // Same ISO-datetime → session-date normalization as the stock path.
+    date: d.date.split("T")[0],
     close: d.close,
     volume: d.volume ?? 0,
     high: d.high ?? d.close,
