@@ -6,6 +6,7 @@ import {
   auditOpenPositions,
   auditEntries,
   auditBarFreshness,
+  auditCorporateActions,
   auditRiskBlocks,
   auditRunProvenance,
   auditTrackingError,
@@ -257,6 +258,34 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     findings.push(...auditClosedPositions(closedToday, closedPositionAuditConfig(runLog, cfg), cfgRow?.updatedAt ?? null));
     findings.push(...auditOpenPositions(openPositions, cfg, todayUTC));
     findings.push(...auditEntries(openedToday, cfg));
+
+    // Basis-break watch: the sim has no split handling, and CRWD's 4:1 crossed a
+    // held position and closed into the statistics as a -71% "loss". Compare each
+    // held name's last two price-stream reads so the next one surfaces while the
+    // position is still open and repairable.
+    if (openPositions.length > 0) {
+      const tickers = [...new Set(openPositions.map((p) => p.ticker))];
+      const recent = await db.quantAnalysis.findMany({
+        where: { date: { gte: new Date(todayUTC.getTime() - 7 * 86_400_000) }, stock: { ticker: { in: tickers } } },
+        orderBy: { date: "asc" },
+        select: { price: true, stock: { select: { ticker: true } } },
+      });
+      const lastTwo = new Map<string, number[]>();
+      for (const q of recent) {
+        if (q.price == null) continue;
+        const arr = lastTwo.get(q.stock.ticker) ?? [];
+        arr.push(q.price);
+        if (arr.length > 2) arr.shift();
+        lastTwo.set(q.stock.ticker, arr);
+      }
+      findings.push(
+        ...auditCorporateActions(
+          [...lastTwo.entries()]
+            .filter(([, prices]) => prices.length === 2)
+            .map(([ticker, [prevPrice, curPrice]]) => ({ ticker, prevPrice, curPrice }))
+        )
+      );
+    }
   } catch (e) {
     errors.push(`Position audit failed: ${String(e)}`);
   }

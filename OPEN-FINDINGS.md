@@ -810,11 +810,18 @@ SENTIMENT, COMBINED, SENTIMENT_RM and COMBINED_RM — **~$1,757 of fictitious
 realized loss on holds where CRWD actually gained ~14% adjusted**. Every
 closed-trade aggregate in this register carries it: pure COMBINED's "-$2,494
 over 439 closes" is about one-sixth this single artifact, and the loss side of
-the "payoff 0.54-0.66" figure is inflated by it. The honest repair — qty ×4,
-entryPrice ÷4, realizedPnl recomputed (≈ +$86 per book instead of ≈ -$430) —
-edits measurement history and should ship as its own reviewed change. The sim
-has no split handling at all, so any future split in a held name does this
-again; the repair and the guard belong together. Not repaired yet.
+the "payoff 0.54-0.66" figure is inflated by it.
+
+**Status 2026-08-24:** a full-book scan found exactly the four known rows and no
+open positions affected. The guard shipped — `auditCorporateActions`
+(`daily-review.ts`, pure, tested) watches each OPEN position's price stream for
+one-step moves outside 0.6-1.67x and warns `CORPORATE_ACTION_SUSPECT`, so the
+next basis break surfaces while the position is still open and repairable. The
+repair itself is `scripts/repair-crwd-split.ts` (qty ×4, entryPrice ÷4,
+peakPrice ÷4, realizedPnl recomputed — dry-run verified: +$86/+$69 instead of
+-$428/-$470); the write needs to be run by a human, and `PaperEquitySnapshot`
+history deliberately keeps the artifact (the daily equity series records what
+the books believed at the time).
 
 ---
 

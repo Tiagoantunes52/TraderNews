@@ -3,6 +3,7 @@ import {
   replayDecisions,
   auditBarFreshness,
   auditClosedPositions,
+  auditCorporateActions,
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
@@ -1008,5 +1009,39 @@ describe("auditBarFreshness", () => {
 
   it("returns nothing for an empty universe", () => {
     expect(auditBarFreshness([], monday)).toEqual([]);
+  });
+});
+
+describe("auditCorporateActions", () => {
+  it("fires on a split-shaped drop (the CRWD 4:1 shape)", () => {
+    const out = auditCorporateActions([{ ticker: "CRWD", prevPrice: 775.92, curPrice: 193.98 }]);
+    expect(out).toHaveLength(1);
+    expect(out[0].code).toBe("CORPORATE_ACTION_SUSPECT");
+    expect(out[0].severity).toBe("warn");
+    expect(out[0].refs).toMatchObject({ ticker: "CRWD", ratio: 0.25 });
+  });
+
+  it("fires on a reverse-split-shaped jump", () => {
+    const out = auditCorporateActions([{ ticker: "RS", prevPrice: 10, curPrice: 50 }]);
+    expect(out).toHaveLength(1);
+  });
+
+  it("stays quiet on large but plausible market moves", () => {
+    expect(auditCorporateActions([{ ticker: "BIO", prevPrice: 100, curPrice: 65 }])).toEqual([]);
+    expect(auditCorporateActions([{ ticker: "MEME", prevPrice: 100, curPrice: 160 }])).toEqual([]);
+  });
+
+  it("stays quiet at the boundary itself", () => {
+    expect(auditCorporateActions([{ ticker: "EDGE", prevPrice: 100, curPrice: 60 }])).toEqual([]);
+  });
+
+  it("skips unusable prices instead of dividing by them", () => {
+    expect(
+      auditCorporateActions([
+        { ticker: "ZERO", prevPrice: 0, curPrice: 100 },
+        { ticker: "NEG", prevPrice: -5, curPrice: 100 },
+        { ticker: "NAN", prevPrice: NaN, curPrice: 100 },
+      ])
+    ).toEqual([]);
   });
 });

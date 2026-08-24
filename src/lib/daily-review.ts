@@ -657,6 +657,47 @@ export function auditRunProvenance(log: PaperRunLog): Finding[] {
 }
 
 /**
+ * One-step move in a held name's price stream beyond which the move is treated as
+ * a suspected corporate action rather than a market move. 0.6 (and its inverse,
+ * ~1.67x) is far outside any one-day move the books have actually seen except the
+ * CRWD 4:1 split — a real crash that size deserves a manual look anyway, so a rare
+ * false fire costs a glance while a miss costs corrupted P&L history.
+ */
+const CORPORATE_ACTION_RATIO = 0.6;
+
+/**
+ * The sim has no split/corporate-action handling: a held name crossing one books
+ * the entire basis change as P&L. CRWD's 4:1 split turned a +14% hold into four
+ * "-71%" closes (~$1,757 of fictitious loss) and sat unnoticed for seven weeks
+ * because nothing watched for it — every aggregate over closed trades inherited
+ * the artifact (OPEN-FINDINGS.md, "CRWD's 4:1 split"). This check watches each
+ * OPEN position's price stream day-over-day, so the next basis break surfaces on
+ * the day it happens, while the position is still open and the row still repairable
+ * before it closes into the statistics.
+ */
+export function auditCorporateActions(rows: { ticker: string; prevPrice: number; curPrice: number }[]): Finding[] {
+  const out: Finding[] = [];
+  for (const r of rows) {
+    if (!(r.prevPrice > 0) || !(r.curPrice > 0)) continue;
+    const ratio = r.curPrice / r.prevPrice;
+    if (ratio >= CORPORATE_ACTION_RATIO && ratio <= 1 / CORPORATE_ACTION_RATIO) continue;
+    out.push(
+      finding(
+        "warn",
+        "CORPORATE_ACTION_SUSPECT",
+        `${r.ticker}: held position's price moved ${((ratio - 1) * 100).toFixed(0)}% in one step`,
+        `A one-step move this size in a held name is more often a split or other basis change than a market move, ` +
+          `and the sim books a basis change as real P&L (CRWD's 4:1 split booked ~$1,757 of fictitious loss). ` +
+          `Verify against the adjusted bars; if it is a corporate action, repair the position rows on the new basis ` +
+          `(scripts/repair-crwd-split.ts is the pattern) before the position closes into the statistics.`,
+        { ticker: r.ticker, prevPrice: r.prevPrice, curPrice: r.curPrice, ratio: Number(ratio.toFixed(4)) }
+      )
+    );
+  }
+  return out;
+}
+
+/**
  * A stock whose latest stored bar is this many sessions old (or older) counts as
  * stale. Three leaves one session of slack for a market holiday plus the current
  * session (whose bar is only written by the next quant run), so a long weekend
