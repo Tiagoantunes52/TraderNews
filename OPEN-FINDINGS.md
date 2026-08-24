@@ -857,6 +857,37 @@ peakPrice ÷4, realizedPnl recomputed — dry-run verified: +$86/+$69 instead of
 history deliberately keeps the artifact (the daily equity series records what
 the books believed at the time).
 
+### 5. Insider cluster-buy event study — the thesis has no support in this universe
+
+First use of the backfilled Form 4 corpus (`scripts/insider-event-study.ts`,
+2026-08-24 evening). Reconstructs the exact live event — ≥3 distinct open-market
+buyers inside a filed-by-then 14-day window, 56-day cooldown, executable
+next-open entry — and measures abnormal returns vs an equal-weight index of the
+bar corpus:
+
+- **The signal barely exists here: 15 events in five years.** 998 open-market
+  buys against 42,089 sells — insiders at watchlist-scale companies almost never
+  cluster-buy. The event book's trigger fires ~3 times a year.
+- **Where it fires, the drift is negative, not positive**: h=40 mean AR -6.2%
+  (43% hit), h=60 -10.8% (36% hit), t(events) -1.9 — underpowered, but pointing
+  the wrong way for a long thesis.
+- **The tails explain the sample**: the worst events are RIVN 2021-11 and TOST
+  2021-09 (IPO-window "open-market buys" followed by post-IPO collapse) and SCHW
+  2023-03 (buying the regional-bank-crisis knife). The placebo (same names,
+  -180d) is also negative (-7.7% at h=60, t -2.05, n=9), so the measured "drift"
+  is substantially the era-drift of these names rather than the event — the
+  placebo doing exactly its job at n=15.
+- **Sell clusters (n=855, the honest-sized sample) show ~nothing** at 20-60
+  sessions — consistent with the literature that insider sales are
+  uninformative, and evidence the instrument reads flat when there is nothing.
+
+**Verdict: the research-backed 20-60-day cluster-buy drift is a small-cap
+phenomenon, and this watchlist is exactly where it should not and does not
+appear.** The insider event book stays ship-dark, and no effort should go into
+arming it on this signal in this universe. What remains untested is the C-suite
+variant (Finnhub carries no roles; EDGAR does) and any future small/mid-cap
+universe expansion — the corpus is ready if either happens.
+
 ---
 
 ## Confirmed but deliberately deferred
