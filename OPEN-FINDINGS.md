@@ -801,7 +801,28 @@ in-sample support. Parked, not shipped: the mean effect is small, the ≤5d
 bucket flips positive (+0.22%, n=167), and one summer of rally tape cannot
 price the variance. Recorded so the idea is not re-proposed from scratch.
 
-### 3. CRWD's 4:1 split corrupts four closed positions (and every aggregate over them)
+### 3. STRONG_BUY dissection — real shape, episodic, no action
+
+Follow-up on #1's lead (`scripts/strong-buy-study.ts`). The excess-by-score
+gradient is monotone-inverted above ~0.4: +24 / +20 / -4 / **-90 / -57 / -105**
+bps across the six bins from non-entry to (0.8, 1.0]. It is broad, not a
+few-names artifact — 1,017 STRONG_BUY observations over 106 names, top-5 share
+11% (though ARM at -883 bps and AMAT at -702 show where the hype names live).
+The paired same-session STRONG_BUY-minus-BUY difference is -81.9 bps (t -1.69,
+52 sessions) — suggestive, short of significant.
+
+**The disqualifier is the month split: July -173 bps (t -3.43), August +2 bps
+(t -0.30).** The effect was one episode — July's chop punishing high-sentiment
+names — and is not currently active. Touching the entry gate off one adverse
+month of one summer would be fitting an episode, and unlike the quant score
+there is no multi-year corpus to holdout-test sentiment against: the scores
+only exist since June. Verdict: **measured, recorded, no action.** The durable
+observation worth keeping is that the top of the sentiment scale has carried no
+positive information in its whole recorded life — if that is still true after
+another quarter of sessions, a score cap (treating >0.6 as 0.6 at entry)
+becomes a testable candidate with an actual sample behind it.
+
+### 4. CRWD's 4:1 split corrupts four closed positions (and every aggregate over them)
 
 Surfaced by the earnings study's worst-trades list: two "-71/-72%" CRWD events.
 Entry was recorded at the raw pre-split price (678.65 = 4 × the adjusted 169.66
