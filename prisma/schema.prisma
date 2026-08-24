@@ -66,6 +66,7 @@ model Stock {
   paperOrders         PaperOrder[]
   simPositions        SimPosition[]
   priceBars           PriceBar[]
+  universeSnapshots   UniverseSnapshot[]
   userStocks          UserStock[]
 
   @@index([marketId])
@@ -185,6 +186,23 @@ model QuantAnalysis {
 // every corporate action, which a fill model reads as a stop-out on every affected bar
 // (that was a live defect in the Yahoo adapter). `source` records which adapter served
 // the bar so a series written on a mixed basis can be found and rewritten later.
+// Point-in-time universe membership: which stocks the pipeline intended to analyse
+// on each UTC day. Written by the quant stage before any per-stock work, so a name
+// whose fetch fails is still recorded as a member — this table records INTENT, not
+// success (QuantAnalysis presence records success). Exists because every research
+// study to date carries a survivorship caveat: the PriceBar backfill projected
+// TODAY'S watchlist onto five years of history, and nothing recorded who was
+// actually in the universe when. From 2026-08-24 forward, this does.
+model UniverseSnapshot {
+  date    DateTime // UTC midnight of the run day
+  stock   Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  stockId String
+
+  // (date, stockId) IS the identity — same reasoning as PriceBar's composite PK,
+  // date-leading because "who was in the universe on day D" is the only query.
+  @@id([date, stockId])
+}
+
 model PriceBar {
   stock   Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
   stockId String

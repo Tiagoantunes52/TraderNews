@@ -34,6 +34,20 @@ export async function runQuantStage(opts: StageOptions = {}): Promise<BatchStage
   const stocks = await db.stock.findMany({ where: universeWhere(), select: { id: true, ticker: true } });
   const usStocks = stocks.filter((s) => !s.ticker.includes(".") && !s.ticker.endsWith("-USD"));
 
+  // Point-in-time membership, recorded BEFORE any per-stock work so a name whose
+  // fetch fails today still counts as a member — intent, not success. Idempotent
+  // across the stage's several daily invocations (composite PK + skipDuplicates),
+  // and never allowed to block the stage: the snapshot serves future research,
+  // the analyses serve today's trading.
+  try {
+    await db.universeSnapshot.createMany({
+      data: stocks.map((s) => ({ date: todayUTC, stockId: s.id })),
+      skipDuplicates: true,
+    });
+  } catch (e) {
+    errors.push(`Universe snapshot failed: ${String(e)}`);
+  }
+
   // SPY benchmark for relative strength
   let spyChange7d: number | null = null;
   try {
