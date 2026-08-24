@@ -290,6 +290,19 @@ the driver exits non-zero if they fail: `oracle` must return IC exactly 1.0000, 
 must detect the known momentum effect. A null result off an unverified instrument is
 worth nothing.
 
+**Executable frames added 2026-08-24** (`--frame=exec|fill`): entry at the next
+session's open, or at a buffered 2%-limit with misses *dropped* — the entry leg the
+sim was measured to fantasise about. First read, holdout, close → exec → fill:
+baseline IC -0.0277(-2.73) → -0.0243(-2.44) → -0.0238(-2.39); `f2` +0.0034 → +0.0068
+→ +0.0055 — **no verdict flips**, so the close-frame conclusions above survive
+executability. Entry-bucket fill rate under a resting 2% limit is ~97% (the intraday
+low usually crosses back through the limit even after a gap-up open — the close-only
+gap distribution quoted earlier was an upper bound on misses, as footnoted at the
+time). The instructive control: `mom30`'s holdout IC shrinks +0.0139 → +0.0083 from
+close to fill — a meaningful slice of the momentum edge lives in the overnight gap
+you cannot buy. The exit leg is still an idealised close; sizing/exits/cash remain
+unmodelled.
+
 **First run, 2026-07-31 — all three pre-registered hypotheses FAILED.** Split 2025-01-01,
 horizon 5, 801 train / 383 holdout sessions:
 
@@ -843,6 +856,37 @@ peakPrice ÷4, realizedPnl recomputed — dry-run verified: +$86/+$69 instead of
 -$428/-$470); the write needs to be run by a human, and `PaperEquitySnapshot`
 history deliberately keeps the artifact (the daily equity series records what
 the books believed at the time).
+
+### 5. Insider cluster-buy event study — the thesis has no support in this universe
+
+First use of the backfilled Form 4 corpus (`scripts/insider-event-study.ts`,
+2026-08-24 evening). Reconstructs the exact live event — ≥3 distinct open-market
+buyers inside a filed-by-then 14-day window, 56-day cooldown, executable
+next-open entry — and measures abnormal returns vs an equal-weight index of the
+bar corpus:
+
+- **The signal barely exists here: 15 events in five years.** 998 open-market
+  buys against 42,089 sells — insiders at watchlist-scale companies almost never
+  cluster-buy. The event book's trigger fires ~3 times a year.
+- **Where it fires, the drift is negative, not positive**: h=40 mean AR -6.2%
+  (43% hit), h=60 -10.8% (36% hit), t(events) -1.9 — underpowered, but pointing
+  the wrong way for a long thesis.
+- **The tails explain the sample**: the worst events are RIVN 2021-11 and TOST
+  2021-09 (IPO-window "open-market buys" followed by post-IPO collapse) and SCHW
+  2023-03 (buying the regional-bank-crisis knife). The placebo (same names,
+  -180d) is also negative (-7.7% at h=60, t -2.05, n=9), so the measured "drift"
+  is substantially the era-drift of these names rather than the event — the
+  placebo doing exactly its job at n=15.
+- **Sell clusters (n=855, the honest-sized sample) show ~nothing** at 20-60
+  sessions — consistent with the literature that insider sales are
+  uninformative, and evidence the instrument reads flat when there is nothing.
+
+**Verdict: the research-backed 20-60-day cluster-buy drift is a small-cap
+phenomenon, and this watchlist is exactly where it should not and does not
+appear.** The insider event book stays ship-dark, and no effort should go into
+arming it on this signal in this universe. What remains untested is the C-suite
+variant (Finnhub carries no roles; EDGAR does) and any future small/mid-cap
+universe expansion — the corpus is ready if either happens.
 
 ---
 

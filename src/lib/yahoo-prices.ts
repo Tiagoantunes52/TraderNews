@@ -1,4 +1,5 @@
 import type { DailyPrice } from "@/lib/tiingo-prices";
+import { fetchWithRetry } from "@/lib/http";
 
 // Yahoo Finance chart API — free, keyless, covers US equities, crypto, and
 // international exchanges (the dot-suffixed tickers Tiingo's plan can't serve).
@@ -36,7 +37,7 @@ export async function getYahooDailyPrices(ticker: string, startDate: Date): Prom
   url.searchParams.set("interval", "1d");
 
   // Yahoo rejects requests without a browser-like User-Agent.
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithRetry(url.toString(), {
     headers: { "User-Agent": "Mozilla/5.0" },
     cache: "no-store",
   });

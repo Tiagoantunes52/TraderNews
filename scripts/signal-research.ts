@@ -9,10 +9,12 @@ import {
   formatReport,
   controlsOk,
   HORIZONS,
+  RETURN_FRAMES,
   type Bar,
   type FeatureRow,
   type Horizon,
   type CandidateReport,
+  type ReturnFrame,
 } from "../src/lib/signal-research";
 import { ALL_CANDIDATES } from "../src/lib/signal-research-variants";
 
@@ -27,6 +29,7 @@ import { ALL_CANDIDATES } from "../src/lib/signal-research-variants";
 //   npx tsx scripts/signal-research.ts
 //   npx tsx scripts/signal-research.ts --split=2025-01-01 --folds=4 --horizon=5
 //   npx tsx scripts/signal-research.ts --candidates=baseline,h1-momentum-horizon
+//   npx tsx scripts/signal-research.ts --frame=exec   (next-open entry; --frame=fill adds the buffered-limit filter)
 //   npx tsx scripts/signal-research.ts --rebuild-cache
 //   npx tsx scripts/signal-research.ts --json
 
@@ -45,6 +48,7 @@ function parseArgs(argv: string[]) {
   let folds = DEFAULT_FOLDS;
   let horizon: Horizon = 5;
   let only: string[] | null = null;
+  let frame: ReturnFrame = "close";
   let rebuild = false;
   let json = false;
   for (const a of argv) {
@@ -60,7 +64,14 @@ function parseArgs(argv: string[]) {
       }
       horizon = h as Horizon;
     } else if (a.startsWith("--candidates=")) only = a.slice(13).split(",").filter(Boolean);
-    else {
+    else if (a.startsWith("--frame=")) {
+      const f = a.slice(8) as ReturnFrame;
+      if (!RETURN_FRAMES.includes(f)) {
+        console.error(`--frame must be one of ${RETURN_FRAMES.join(", ")}`);
+        process.exit(2);
+      }
+      frame = f;
+    } else {
       console.error(`Unknown flag: ${a}`);
       process.exit(2);
     }
@@ -69,14 +80,20 @@ function parseArgs(argv: string[]) {
     console.error(`--split must be YYYY-MM-DD, got: ${split}`);
     process.exit(2);
   }
-  return { split, folds, horizon, only, rebuild, json };
+  return { split, folds, horizon, only, frame, rebuild, json };
 }
 
 async function loadFeatures(rebuild: boolean): Promise<FeatureRow[]> {
   if (!rebuild && existsSync(CACHE_PATH)) {
     const cached = JSON.parse(readFileSync(CACHE_PATH, "utf8")) as FeatureRow[];
-    console.error(`features: ${cached.length.toLocaleString()} rows from cache (--rebuild-cache to refresh)`);
-    return cached;
+    // A cache written before the executable frame existed lacks its fields; scoring
+    // frame=exec against it would silently evaluate nothing. Rebuild instead.
+    if (cached.length > 0 && cached[0].forwardExec === undefined) {
+      console.error("features: cache predates the executable frame — rebuilding");
+    } else {
+      console.error(`features: ${cached.length.toLocaleString()} rows from cache (--rebuild-cache to refresh)`);
+      return cached;
+    }
   }
   console.error("features: building from PriceBar…");
   const rows = await prisma.priceBar.findMany({
@@ -101,7 +118,7 @@ async function loadFeatures(rebuild: boolean): Promise<FeatureRow[]> {
 }
 
 async function main() {
-  const { split, folds, horizon, only, rebuild, json } = parseArgs(process.argv.slice(2));
+  const { split, folds, horizon, only, frame, rebuild, json } = parseArgs(process.argv.slice(2));
   const features = await loadFeatures(rebuild);
   if (features.length === 0) {
     console.error("No feature rows — is PriceBar populated? (npm run backfill-price-bars)");
@@ -119,7 +136,7 @@ async function main() {
     process.exit(2);
   }
 
-  const reports: CandidateReport[] = selected.map((c) => evaluate(features, c, { splitDate: split, folds, horizon }));
+  const reports: CandidateReport[] = selected.map((c) => evaluate(features, c, { splitDate: split, folds, horizon, frame }));
 
   if (json) {
     console.log(JSON.stringify(reports, null, 2));

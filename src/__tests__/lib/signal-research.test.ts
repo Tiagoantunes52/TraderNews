@@ -11,6 +11,7 @@ import {
   splitRolling,
   verdictFor,
   controlsOk,
+  frameReturn,
   WARMUP_BARS,
   HORIZONS,
   type Bar,
@@ -57,6 +58,7 @@ function mkRow(sess: string, stockId: string, close: number, h5: number): Featur
     marketRegime: "UNCLASSIFIED",
     benchClose: null, benchSma20: null, benchRsi14: null, benchAdx14: null,
     forward: { h1: h5, h5, h10: h5 },
+    forwardExec: { h1: h5, h5, h10: h5 }, fillPrice: close,
   };
 }
 
@@ -369,7 +371,7 @@ describe("verdictFor()", () => {
       crossSectional: { mean, tStat, groups },
       timeSeries: { mean: null, tStat: null, groups: 0 },
       entry: { n: 0, meanExcess: 0, tStat: null },
-      buckets: [], monotonic: false, byRegime: [],
+      buckets: [], monotonic: false, entryFillRate: null, byRegime: [],
     }) as PeriodStats;
   const fold = (mean: number): FoldStat => ({ label: "f", ic: { mean, tStat: 1, groups: 10 } });
 
@@ -464,5 +466,69 @@ describe("noiseThreshold()", () => {
 
   it("puts a best-of-six |t| of 2.0 barely above noise", () => {
     expect(noiseThreshold(6)).toBeCloseTo(1.8930, 3);
+  });
+});
+
+describe("executable frame", () => {
+  const flat = () => Array(75).fill(100);
+
+  it("computes frameReturn per frame, with the fill endpoint on the close frame's answer", () => {
+    const row = mkRow(session(0), "A", 100, 0.1); // close 100, forward 10%, fillPrice 100
+    row.forwardExec = { h1: 0.05, h5: 0.05, h10: 0.05 };
+    row.fillPrice = 102;
+    expect(frameReturn(row, 5, "close")).toBeCloseTo(0.1, 10);
+    expect(frameReturn(row, 5, "exec")).toBeCloseTo(0.05, 10);
+    // endpoint = 100 × 1.1 = 110; fill at 102 → (110-102)/102
+    expect(frameReturn(row, 5, "fill")).toBeCloseTo((110 - 102) / 102, 10);
+    row.fillPrice = null;
+    expect(frameReturn(row, 5, "fill")).toBeNull();
+    row.forwardExec = null;
+    expect(frameReturn(row, 5, "exec")).toBeNull();
+  });
+
+  it("buildFeatures fills at the open when it opens inside the buffer", () => {
+    const bars = makeBars("A", "A", flat(), { range: 0.5 });
+    bars[WARMUP_BARS + 1].open = 101; // limit = 102
+    const rows = buildFeatures(bars);
+    const first = rows.find((r) => r.session === session(WARMUP_BARS))!;
+    expect(first.fillPrice).toBe(101);
+    expect(first.forwardExec!.h5).toBeCloseTo((100 - 101) / 101, 10);
+  });
+
+  it("fills at the limit when the low trades through it intraday", () => {
+    const bars = makeBars("B", "B", flat(), { range: 0.5 });
+    bars[WARMUP_BARS + 1].open = 105;
+    bars[WARMUP_BARS + 1].low = 101.5;
+    const rows = buildFeatures(bars);
+    const first = rows.find((r) => r.session === session(WARMUP_BARS))!;
+    expect(first.fillPrice).toBeCloseTo(102, 10);
+  });
+
+  it("records a miss when the name gaps past the buffer and never comes back", () => {
+    const bars = makeBars("C", "C", flat(), { range: 0.5 });
+    bars[WARMUP_BARS + 1].open = 106;
+    bars[WARMUP_BARS + 1].low = 103;
+    const rows = buildFeatures(bars);
+    const first = rows.find((r) => r.session === session(WARMUP_BARS))!;
+    expect(first.fillPrice).toBeNull();
+    // The executable frame still exists — a market order at the open always fills.
+    expect(first.forwardExec!.h5).toBeCloseTo((100 - 106) / 106, 10);
+  });
+
+  it("evaluatePeriod's fill frame drops misses and reports the entry fill rate", () => {
+    const rows = [
+      mkRow(session(0), "A", 100, 0.02),
+      mkRow(session(0), "B", 100, 0.02),
+      mkRow(session(0), "C", 100, 0.02),
+      mkRow(session(0), "D", 100, 0.02),
+    ];
+    rows[0].fillPrice = null; // one miss among four BUY-scored names
+    const candidate: Candidate = { id: "c", hypothesis: "t", score: () => 0.5 };
+    const stats = evaluatePeriod("x", rows, candidate, 5, "fill");
+    expect(stats.observations).toBe(3);
+    expect(stats.entryFillRate).toBeCloseTo(0.75, 10);
+    const close = evaluatePeriod("x", rows, candidate, 5, "close");
+    expect(close.observations).toBe(4);
+    expect(close.entryFillRate).toBeNull();
   });
 });
