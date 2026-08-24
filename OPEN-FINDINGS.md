@@ -726,6 +726,74 @@ mistake this register was written to stop.
 
 ---
 
+## Post-repair measurement notes, 2026-08-24
+
+Three read-only studies run the same day as the sessionDate repair, on the healed
+data. Reproducible: `scripts/signal-health-rerun.ts`, `scripts/earnings-study.ts`.
+
+### 1. Signal health re-read on the repaired 90-day window
+
+The August live readings quoted in the quant section above were computed while
+most rows since 07-31 had NULL `sessionDate` and silently dropped out of the
+join. On the repaired window (52 scored sessions, 6,235 observations with a full
+5-session forward window):
+
+| source | entry excess | t (NW, across sessions) | note |
+|---|---|---|---|
+| COMBINED | **-53.5 bps** | **-2.42** (52 sess) | crosses the SIGNAL_INVERTED line; NEUTRAL bucket +50.0 bps (t 4.25) |
+| SENTIMENT | -15.1 bps | -0.37 | but **STRONG_BUY -80.9 bps (t -3.56, n=1017)** vs BUY +8.6 — conviction is non-monotonic |
+| QUANT | -58.9 bps | -0.77 (44 sess) | noise; consistent with "do not read its sign" |
+
+QUANT's SELL bucket sits at +182 bps (t 6.22) — the same inversion shape the
+holdout study found. The 08-22 note above recorded COMBINED at t = -0.85 and
+called the alert a false positive; that number was itself computed on the
+sessionDate-holed sample, so the honest live reading was never actually taken
+until now. **Still one 90-day rally window — a prompt to investigate, not to
+act** — and the next daily review will raise SIGNAL_INVERTED on COMBINED by
+itself. The most specific new lead is SENTIMENT's STRONG_BUY bucket: since
+07-31 the `_RM` entry gate reads the sentiment score, so "highest-conviction
+sentiment underperforms its own BUY bucket" is now an entry-path question, not
+a diagnostic curiosity.
+
+### 2. Earnings study — no blackout ships
+
+`daysToEarnings` has been recorded since June but only dampens confidence at
+estimate time; before proposing a blackout or pre-earnings exit, the closed
+trades were measured (1,277 unique (ticker, entry, exit) events with earnings
+coverage, since 2026-06-01):
+
+| group | n | win | mean | mean loss |
+|---|---|---|---|---|
+| held through an earnings date | 201 | 58% | **+1.15%** | -4.68% |
+| no earnings in hold | 1,076 | 46% | -0.20% | -3.55% |
+| entered ≤3d before earnings | 108 | 47% | -0.69% | -4.11% |
+
+Holding through earnings was *profitable* in this window, so a pre-earnings
+exit is contraindicated. The tail does hold a specific pattern — RDDT, APP and
+DDOG were entered 0-1 days before a scheduled print and lost 17-21% on the gap
+(all then exited by the SIGNAL rung doing its job) — and the ≤3d entry bucket
+nets weakly negative, so a narrow (~2-3 day) **entry** blackout has weak
+in-sample support. Parked, not shipped: the mean effect is small, the ≤5d
+bucket flips positive (+0.22%, n=167), and one summer of rally tape cannot
+price the variance. Recorded so the idea is not re-proposed from scratch.
+
+### 3. CRWD's 4:1 split corrupts four closed positions (and every aggregate over them)
+
+Surfaced by the earnings study's worst-trades list: two "-71/-72%" CRWD events.
+Entry was recorded at the raw pre-split price (678.65 = 4 × the adjusted 169.66
+close of 2026-06-25) and the exit at the post-split price (193.98), across
+SENTIMENT, COMBINED, SENTIMENT_RM and COMBINED_RM — **~$1,757 of fictitious
+realized loss on holds where CRWD actually gained ~14% adjusted**. Every
+closed-trade aggregate in this register carries it: pure COMBINED's "-$2,494
+over 439 closes" is about one-sixth this single artifact, and the loss side of
+the "payoff 0.54-0.66" figure is inflated by it. The honest repair — qty ×4,
+entryPrice ÷4, realizedPnl recomputed (≈ +$86 per book instead of ≈ -$430) —
+edits measurement history and should ship as its own reviewed change. The sim
+has no split handling at all, so any future split in a held name does this
+again; the repair and the guard belong together. Not repaired yet.
+
+---
+
 ## Confirmed but deliberately deferred
 
 These are verified defects that lost the prioritisation, not open questions. They are
