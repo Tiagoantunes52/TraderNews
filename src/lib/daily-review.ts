@@ -16,6 +16,7 @@ import {
   reconcileEventPosition,
   riskDistancePct,
   utcDaysBetween,
+  sessionsStale,
   STRATEGY_IS_RM,
   type RiskConfig,
   type Strategy,
@@ -653,6 +654,44 @@ export function auditRunProvenance(log: PaperRunLog): Finding[] {
     );
   }
   return out;
+}
+
+/**
+ * A stock whose latest stored bar is this many sessions old (or older) counts as
+ * stale. Three leaves one session of slack for a market holiday plus the current
+ * session (whose bar is only written by the next quant run), so a long weekend
+ * alone cannot trip it.
+ */
+const BAR_STALE_SESSION_MIN = 3;
+/**
+ * Share of the universe that must be stale before the finding fires. One delisted
+ * or renamed ticker is noise; a fifth of the universe is an outage.
+ */
+const BAR_STALE_SHARE_WARN = 0.2;
+
+/**
+ * Widespread missing PriceBars while the quant stage runs green means bars are
+ * being DROPPED, not skipped: the stage fetches prices for every universe name
+ * daily and reports rejections only as error strings that keep the run green.
+ * That is exactly how the Tiingo ISO-datetime defect ran for three and a half
+ * weeks — fresh prices, green workflows, zero bars, null sessionDate — with its
+ * own diagnosis printed daily into a log nobody read (OPEN-FINDINGS.md,
+ * "The Tiingo date defect, 2026-08-24"). This check watches the DATA, so it fires
+ * whatever the cause: validation rejections, a source outage, or a worklist bug.
+ */
+export function auditBarFreshness(stocks: { ticker: string; lastBar: Date | null }[], today: Date): Finding[] {
+  if (stocks.length === 0) return [];
+  const stale = stocks.filter((s) => sessionsStale(s.lastBar, today) >= BAR_STALE_SESSION_MIN);
+  if (stale.length / stocks.length < BAR_STALE_SHARE_WARN) return [];
+  return [
+    finding(
+      "warn",
+      "PRICE_BARS_STALE",
+      `${stale.length}/${stocks.length} universe names have no PriceBar for recent sessions`,
+      "The quant stage fetches prices for every universe name daily, so missing bars at this scale mean the bars are being dropped between fetch and write — check the stage's errors in the pipeline workflow log for `Price bars rejected` (validation) or a price-source outage. Downstream this also nulls QuantAnalysis.sessionDate, which maxes the staleness-scaled entry buffer and shrinks signal-health's sample.",
+      { stale: stale.length, total: stocks.length, sample: stale.slice(0, 8).map((s) => s.ticker).join(", ") }
+    ),
+  ];
 }
 
 /**

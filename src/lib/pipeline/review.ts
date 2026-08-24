@@ -5,6 +5,7 @@ import {
   closedPositionAuditConfig,
   auditOpenPositions,
   auditEntries,
+  auditBarFreshness,
   auditRiskBlocks,
   auditRunProvenance,
   auditTrackingError,
@@ -370,6 +371,28 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     );
   } catch (e) {
     errors.push(`Health audit failed: ${String(e)}`);
+  }
+
+  // Bar freshness is separate from auditHealth's row counts on purpose: the quant
+  // stage can write a full day of QuantAnalysis rows while every PriceBar is
+  // rejected in validation (the Tiingo date defect did exactly that for 3.5
+  // weeks), so counting rows cannot see it — only the bars themselves can.
+  try {
+    const universe = await db.stock.findMany({ where: universeWhere(), select: { id: true, ticker: true } });
+    const latestBars = await db.priceBar.groupBy({
+      by: ["stockId"],
+      _max: { date: true },
+      where: { stockId: { in: universe.map((s) => s.id) } },
+    });
+    const lastByStock = new Map(latestBars.map((b) => [b.stockId, b._max.date]));
+    findings.push(
+      ...auditBarFreshness(
+        universe.map((s) => ({ ticker: s.ticker, lastBar: lastByStock.get(s.id) ?? null })),
+        todayUTC
+      )
+    );
+  } catch (e) {
+    errors.push(`Bar freshness audit failed: ${String(e)}`);
   }
 
   // ── 5. Strategy rollups + tuning signals ───────────────────────────────────
