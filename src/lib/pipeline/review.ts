@@ -487,11 +487,8 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
   // there being trusted.
   try {
-    const [labelledRmExits, cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
-      db.simPosition.count({
-        where: { strategy: { in: RM_STRATEGIES }, status: "CLOSED", exitReason: { not: null } },
-      }),
-      db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { key: true } }),
+    const [cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
+      db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { value: true } }),
       db.simPosition.count({
         where: { status: "OPEN", lastMarkDate: { lt: new Date(todayUTC.getTime() - REGISTER_STALE_MARK_DAYS * 86_400_000) } },
       }),
@@ -507,9 +504,8 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
     ]);
 
     const facts: RegisterFacts = {
-      labelledRmExits,
       maxArticleCount: maxArticles._max.articleCount ?? 0,
-      tradingConfigRowExists: cfgRow != null,
+      tradingConfigRaw: cfgRow?.value ?? null,
       staleMarkedPositions: staleMarked,
       staleMarkDays: REGISTER_STALE_MARK_DAYS,
       rmEntriesInWindow: rmEntries,

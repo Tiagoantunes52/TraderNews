@@ -622,6 +622,30 @@ the pure `COMBINED` book untouched as baseline, judged after it accumulates its 
 labelled exits. The DECAY/TIME/STOP rungs earn no change candidate at all, and
 "leave the exits alone" stands for them.
 
+### ACTED ON 2026-08-24: the ratchet is disabled
+
+The pre-registered candidate above shipped as the first `tradingConfig` DB override:
+`{ "trailRatchetFrac": 1 }` — the ratchet branch still executes but multiplies the
+trail by 1, so a big winner keeps the full-width trail. Chosen over
+`trailRatchetActivatePct: 0` because it is the exact counterfactual the study
+measured. Takes effect on the next stage run (the knob is read from the DB each
+run; no deploy involved) and reaches both places the ratchet lives: the sim ladder
+(`reconcileRiskManaged`) and the live book's broker trailing stop
+(`planBrokerAction` — the tighten-resting-trail repair also goes inert, since the
+recomputed width now equals the resting one). The pure books have no ladder and are
+untouched, as is every other rung.
+
+**Evaluation, written down before the data arrives:** judge on TRAIL exits from
+positions whose trail *armed* after 2026-08-24, against the pre-change TRAIL
+sample (capture ratio, giveback, post-exit drift) and the untouched `COMBINED`
+baseline. TRAIL exits arrive ~2/week, so the earliest honest read is ~6 weeks out
+(**revisit ≈ 2026-10-05**). The expected cost is known and accepted: without the
+ratchet a big winner can give back the full trail distance from its peak — the
+study says that trade-off paid +23pp on the measured sample, and if the live books
+disagree the knob reverses it (delete the row or set 0.5). The register asserts
+the row's exact content — see the Strategy-thread bullet — so a drift in either
+direction surfaces as `REGISTER_STALE`.
+
 **Found while measuring — investigated 2026-08-24, and the first read was wrong.**
 This paragraph originally said "the pipeline has been starving since 2026-08-18: only
 4 of ~70 names have rows past session 2026-08-17, most positions unmanaged." That was
@@ -846,12 +870,14 @@ listed so they are not silently forgotten.
 
 ## Strategy thread (predates the execution review)
 
-<!-- check: knobs-at-defaults --> <!-- check: exit-labels-too-few -->
-- **Hold every tuning knob at its default.** There is no `tradingConfig` row; all knobs
-  are at code defaults, and that is currently correct. `exitReason` only began
-  persisting **2026-07-21**: 163 of 176 closed `_RM` positions are `UNRECORDED`, leaving
-  13 labelled exits. Tuning the exit ladder against that is fitting noise. Revisit after
-  ~4–6 weeks of labelled exits.
+<!-- check: knobs-single-ratchet-override -->
+- **One deliberate DB override; every other knob at its code default.** The
+  `tradingConfig` row holds exactly `{ "trailRatchetFrac": 1 }` — the 2026-08-24
+  ratchet disable (see "ACTED ON 2026-08-24" under the exit-ladder attribution).
+  Until that date there was no row at all; the old `exit-labels-too-few` revisit
+  trigger fired at 62 labelled exits, produced the attribution study it existed to
+  prompt, and both retired here. The assertion now checks the row's *content*, so a
+  second knob drifting in — or the override silently vanishing — is what trips it.
 - **Entry score buckets: RESOLVED 2026-07-31, and they do not slope the right way.** The
   sample passed its threshold (178 closes, was 59), so the claim was re-run instead of
   requoted. Quintiles of `entryScore` against trade return:
