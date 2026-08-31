@@ -1,0 +1,214 @@
+name: Research Agent
+
+# The signal-research lane: propose a hypothesis, try to kill it, and only then spend a
+# `k` running it. Sibling of improve.yml (which fixes daily-review findings); this one
+# never touches code the app trades on — it writes candidate SCORES, which are pure
+# functions the harness judges. A human merges.
+#
+# Why the crew is two agents and not six: only the creative steps need a model. The
+# proposer writes a hypothesis, the adversary tries to kill it, and everything after that
+# is deterministic — `npm run signal-research` judges it and the ledger records it. Making
+# the runner or the registrar an agent would add cost and nondeterminism to the two steps
+# that most need neither.
+#
+# WEEKLY, not daily, and that is a design decision rather than a cost saving. Every
+# specification the harness judges is recorded permanently and raises the |t| a future
+# result must clear (see src/lib/research-ledger.ts). A crew proposing five candidates a
+# week would push the noise floor past anything this corpus has ever produced within a
+# couple of months — the throughput would destroy the thing it was meant to accelerate.
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Monday, well clear of any trading-day pipeline
+  workflow_dispatch:
+
+concurrency:
+  group: research-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write        # OIDC exchange for the Claude GitHub App token
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    environment: Production
+    # Same kill-switch shape as the improvement agent: the schedule only fires when the
+    # repo variable is explicitly on, while manual dispatch always runs so the loop can be
+    # exercised during rollout with the schedule still off.
+    if: github.event_name == 'workflow_dispatch' || vars.RESEARCH_AGENT_ENABLED == 'true'
+    env:
+      # Deliberately NO database credential. The harness rebuilds its feature table from
+      # `GET /api/reports/price-bars`, so this runner holds only the pipeline secret the
+      # other workflows already use — never `DIRECT_URL`, which is full-privilege Postgres
+      # and would be the broadest secret any scheduled job here has ever carried.
+      APP_URL: ${{ secrets.APP_URL }}
+      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check secrets are set
+        run: |
+          if [ -z "$APP_URL" ]; then echo "ERROR: APP_URL secret is empty" && exit 1; fi
+          if [ -z "$PIPELINE_SECRET" ]; then echo "ERROR: PIPELINE_SECRET secret is empty" && exit 1; fi
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      # Walks the bar corpus a year at a time over HTTP and writes the feature cache, so
+      # every later step runs against a local file. Done BEFORE the agents so a fetch
+      # failure costs nothing but a skipped week.
+      - name: Fetch corpus
+        run: npx tsx scripts/fetch-corpus.ts
+
+      # What has been tried and what one more attempt costs. Deterministic, so the agent
+      # spends its judgement on the hypothesis rather than on re-deriving the ledger.
+      - name: Build research brief
+        run: |
+          npx tsx scripts/research-brief.ts --out=brief.md
+          cat brief.md
+
+      - name: Build proposer prompt
+        id: propose_prompt
+        run: |
+          {
+            echo "prompt<<PROMPT_EOF"
+            cat .github/agent/research-propose-prompt.md
+            echo ""
+            echo "BRIEF:"
+            cat brief.md
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Propose
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.propose_prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --allowedTools Edit,Read,Write,Bash
+            --max-turns 60
+
+      # Abstaining is a successful run, so it exits the job quietly rather than failing.
+      - name: Check for abstention
+        id: proposal
+        run: |
+          if [ ! -f proposal.md ]; then
+            echo "proposed=false" >> "$GITHUB_OUTPUT"
+            echo "No proposal.md — treating as abstention."
+          elif head -1 proposal.md | grep -q '^ABSTAIN'; then
+            echo "proposed=false" >> "$GITHUB_OUTPUT"
+            echo "Abstained: $(head -1 proposal.md)"
+          elif git diff --quiet -- src/lib/signal-research-variants.ts; then
+            echo "proposed=false" >> "$GITHUB_OUTPUT"
+            echo "proposal.md written but no candidate added — treating as abstention."
+          else
+            echo "proposed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The independent critic. A fresh action invocation, so it reviews the diff on its
+      # own terms rather than defending a proposal it just wrote.
+      - name: Build adversary prompt
+        id: adversary_prompt
+        if: steps.proposal.outputs.proposed == 'true'
+        run: |
+          {
+            echo "prompt<<PROMPT_EOF"
+            cat .github/agent/research-adversary-prompt.md
+            echo ""
+            echo "BRIEF:"
+            cat brief.md
+            echo "PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Adversary review
+        if: steps.proposal.outputs.proposed == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: ${{ steps.adversary_prompt.outputs.prompt }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --allowedTools Edit,Read,Write,Bash
+            --max-turns 40
+
+      # A missing or unreadable review is a REJECT. The `k` is permanent, so the default
+      # on any ambiguity has to be the one that does not spend it.
+      - name: Check the verdict
+        id: verdict
+        if: steps.proposal.outputs.proposed == 'true'
+        run: |
+          if [ ! -f review.md ] || ! head -1 review.md | grep -q '^APPROVE'; then
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "Rejected (or no review written): $(head -1 review.md 2>/dev/null || echo '<none>')"
+          elif git diff --quiet -- src/lib/signal-research-variants.ts; then
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "APPROVE written but the candidate is no longer in the tree — nothing to run."
+          else
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only now is the specification spent. The harness writes the ledger itself, so the
+      # PR carries both the candidate and the row it created.
+      - name: Judge the candidate
+        id: run
+        if: steps.verdict.outputs.approved == 'true'
+        run: |
+          set +e
+          npx tsx scripts/signal-research.ts > verdict.txt 2>run.log
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          tail -40 run.log || true
+          cat verdict.txt
+
+      - name: Open pull request
+        if: steps.verdict.outputs.approved == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(git diff --unified=0 src/lib/signal-research-variants.ts | grep -oP '^\+\s*id: "\K[^"]+' | head -1)
+          branch="auto-research/${id:-candidate}-${{ github.run_id }}"
+          git config user.name "research-agent"
+          git config user.email "noreply@anthropic.com"
+          git checkout -b "$branch"
+          git add -A src/lib/signal-research-variants.ts research-ledger.json
+          git commit -m "research: pre-register candidate ${id:-<unnamed>}"
+          git push origin "$branch"
+          {
+            echo "Pre-registered by the research agent, judged by the harness, reviewed by the adversary."
+            echo ""
+            echo "## Proposal"; echo; cat proposal.md
+            echo ""; echo "## Adversary review"; echo; cat review.md
+            echo ""; echo "## Harness verdict"; echo; echo '```'; cat verdict.txt; echo '```'
+            echo ""
+            echo "The ledger row is part of this diff: merging records the specification, and \`k\` rises whether or not the candidate worked."
+          } > pr-body.md
+          gh pr create --base dev --head "$branch" \
+            --title "auto-research: ${id:-candidate}" \
+            --label auto-research --body-file pr-body.md
+
+      - name: Upload agent execution log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: research-agent-output
+          path: |
+            ${{ runner.temp }}/claude-execution-output.json
+            brief.md
+            proposal.md
+            review.md
+            verdict.txt
+          if-no-files-found: warn
+          retention-days: 30
