@@ -22,6 +22,7 @@ import {
   reconcileRiskManaged,
   reconcileEventPosition,
   planBrokerAction,
+  planWholeShareTrim,
   sessionsStale,
   entryAttemptHistory,
   isRiskBooksEnabled,
@@ -1159,6 +1160,40 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         // a protective order on a name we just handled.
         const managedSymbols = new Set<string>();
 
+        // Make a position whole-share so the protective order that follows covers ALL
+        // of it. See planWholeShareTrim for why the fractional excess is otherwise
+        // unprotectable rather than merely unprotected. Returns the whole-share
+        // quantity still held — 0 when the position was under a share and is now
+        // closed, in which case the caller has nothing left to protect.
+        //
+        // Throws on a broker failure like every other order path here; the callers
+        // already sit inside a try/catch that records it and moves to the next name.
+        const trimToWholeShares = async (
+          stockId: string | undefined,
+          symbol: string,
+          posQty: number,
+          markPrice: number | null
+        ): Promise<number> => {
+          const { trimQty, wholeQty } = planWholeShareTrim(posQty);
+          if (trimQty === 0) return wholeQty;
+          if (stockId) {
+            await submitTracked({ stockId, side: "SELL", signal: "SUBSHARE_TRIM", qty: trimQty }, (clientOrderId) =>
+              submitMarketOrder({ symbol, side: "sell", qty: trimQty, clientOrderId })
+            );
+          } else {
+            // No Stock row → no intent row is possible (stockId is required), so this
+            // submission stays unrecorded, exactly as on the orphan-exit path below.
+            await submitMarketOrder({ symbol, side: "sell", qty: trimQty });
+            errors.push(`Sub-share trim sold ${trimQty} ${symbol} but found no Stock row to record it`);
+          }
+          ordersSubmitted++;
+          // Only a position trimmed away to nothing frees a slot. releasePosition
+          // splices a whole entry out of the book's exposure, so calling it for a
+          // partial trim would hand back a slot that is still occupied.
+          if (wholeQty === 0) releaseAlpacaBuy(symbol, Math.abs(posQty) * (markPrice ?? 0));
+          return wholeQty;
+        };
+
         // Has the broker already placed an entry for each COMBINED_RM episode? A BUY
         // order dated at/after the sim's entry that filled — or is still working —
         // means yes, so if the broker is now flat in it, it was exited/stopped out and
@@ -1268,29 +1303,32 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               ordersSubmitted++;
             } else if (action.type === "ARM_TRAILING" && held && protective) {
               // Protective (stop/trailing) orders must be whole-share — Alpaca rejects
-              // them on fractional qty. Floor; skip if under one share (a legacy
-              // fractional position keeps its market-sell exit, just no broker stop).
-              const qty = Math.floor(Math.abs(held.qty));
+              // them on fractional qty — so sell the fractional excess first and arm
+              // the trail over the whole position rather than over part of it. Cancel
+              // before trimming: Alpaca holds the shares against the resting sell, so
+              // the excess isn't free to sell while the old stop is still working.
+              await cancelOrder(protective.id);
+              const qty = await trimToWholeShares(est.stockId, ticker, held.qty, held.currentPrice ?? price);
+              managedSymbols.add(ticker);
               if (qty >= 1) {
-                await cancelOrder(protective.id);
                 await submitTracked({ stockId: est.stockId, side: "SELL", signal: "TRAIL", qty }, (clientOrderId) =>
                   submitTrailingStop({ symbol: ticker, qty, trailPercent: action.trailPercent, clientOrderId })
                 );
-                managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             } else if (action.type === "REPAIR_STOP" && held) {
-              const qty = Math.floor(Math.abs(held.qty));
+              // A re-anchor REPLACES a working stop, so cancel it first — Alpaca holds
+              // the shares against the resting sell order and rejects the replacement
+              // (403 `available: "0"`) while it's still live. Without this the repair
+              // never lands and the stop keeps its wrong anchor, run after run. The
+              // same hold is why the trim below has to come after the cancel.
+              if (action.replacesResting && protective) await cancelOrder(protective.id);
+              const qty = await trimToWholeShares(est.stockId, ticker, held.qty, held.currentPrice ?? price);
+              managedSymbols.add(ticker);
               if (qty >= 1) {
-                // A re-anchor REPLACES a working stop, so cancel it first — Alpaca holds
-                // the shares against the resting sell order and rejects the replacement
-                // (403 `available: "0"`) while it's still live. Without this the repair
-                // never lands and the stop keeps its wrong anchor, run after run.
-                if (action.replacesResting && protective) await cancelOrder(protective.id);
                 await submitTracked({ stockId: est.stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
                   submitStopSell({ symbol: ticker, qty, stopPrice: action.stopPrice, clientOrderId })
                 );
-                managedSymbols.add(ticker);
                 ordersSubmitted++;
               }
             }
@@ -1357,8 +1395,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
                 ordersSubmitted++;
               } else if (!protective) {
                 // Sim still wants it, but nothing is protecting it → repair the stop.
-                const qty = Math.floor(Math.abs(pos.qty));
-                if (qty < 1) continue; // whole-share only (Alpaca rejects fractional stops)
+                // Trim to whole shares first: a stop can only cover floor(qty), and a
+                // position under one share trims away completely, which is the only
+                // available answer for a stub no protective order can ever cover.
+                const qty = await trimToWholeShares(stockId, symbol, pos.qty, pos.currentPrice ?? pos.avgEntryPrice);
+                if (qty < 1) continue;
                 const anchor = pos.avgEntryPrice ?? pos.currentPrice;
                 if (anchor == null || anchor <= 0) continue;
                 const stopPrice = cents(anchor * (1 - fallbackStopPct));

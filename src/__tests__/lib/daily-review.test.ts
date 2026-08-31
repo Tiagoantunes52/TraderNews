@@ -644,6 +644,39 @@ describe("reconcileBroker", () => {
     expect(missing?.severity).toBe("fail");
   });
 
+  it("reports an unprotected sub-one-share stub as a warning, not a failure", () => {
+    // No protective order can rest on it — Alpaca rejects a fractional stop — so this
+    // must not sit in the same FAIL as a naked whole-share position, which a run CAN fix.
+    const found = reconcileBroker({
+      ...base,
+      brokerPositions: [{ symbol: "JNJ", qty: 0.94, avgEntryPrice: 250, currentPrice: 273 }],
+      simLong: [{ ticker: "JNJ", qty: 2.7 }],
+    });
+    const sub = found.find((f) => f.code === "BROKER_STOPS_SUBSHARE");
+    expect(sub?.severity).toBe("warn");
+    expect(sub?.detail).toContain("JNJ");
+    expect(codes(found)).not.toContain("BROKER_STOPS_MISSING");
+  });
+
+  it("still fails a whole-share position when a sub-share stub is present too", () => {
+    const found = reconcileBroker({
+      ...base,
+      brokerPositions: [
+        { symbol: "JNJ", qty: 0.94, avgEntryPrice: 250, currentPrice: 273 },
+        { symbol: "AAPL", qty: 10, avgEntryPrice: 100, currentPrice: 105 },
+      ],
+      simLong: [
+        { ticker: "JNJ", qty: 2.7 },
+        { ticker: "AAPL", qty: 10 },
+      ],
+    });
+    const missing = found.find((f) => f.code === "BROKER_STOPS_MISSING");
+    expect(missing?.severity).toBe("fail");
+    expect(missing?.detail).toContain("AAPL");
+    expect(missing?.detail).not.toContain("JNJ");
+    expect(codes(found)).toContain("BROKER_STOPS_SUBSHARE");
+  });
+
   it("does not demand a stop when broker stops are off", () => {
     const found = reconcileBroker({
       ...base,
