@@ -927,7 +927,16 @@ export function reconcileBroker(args: {
   }
 
   if (brokerStopsEnabled) {
-    const unprotected = brokerPositions.filter((p) => !protectiveBySymbol.has(p.symbol)).map((p) => p.symbol);
+    // Split by what a protective order could actually cover. Alpaca rejects a
+    // fractional stop, so a position under one whole share cannot carry one at all —
+    // reporting it as the same `fail` as a naked whole-share position demands of the
+    // operator something no run can deliver, and that is exactly what happened: every
+    // review from 2026-07-22 on was red for the same 0.94 shares of one name, until
+    // FAIL meant nothing. The paper stage now trims such stubs at market (see
+    // planWholeShareTrim), so one surviving here is a stub the trim could not clear.
+    const unprotectedAll = brokerPositions.filter((p) => !protectiveBySymbol.has(p.symbol));
+    const unprotected = unprotectedAll.filter((p) => Math.abs(p.qty) >= 1).map((p) => p.symbol);
+    const subShareUnprotected = unprotectedAll.filter((p) => Math.abs(p.qty) < 1).map((p) => p.symbol);
     if (unprotected.length > 0) {
       out.push(
         finding(
@@ -936,6 +945,17 @@ export function reconcileBroker(args: {
           `${unprotected.length} open position(s) with no protective order`,
           `Broker stops are enabled, but no resting stop or trailing stop covers ${list(unprotected)}. These are unprotected against a gap until a later run repairs them — the single most expensive failure mode this review exists to catch.`,
           { count: unprotected.length, tickers: unprotected.join(",") }
+        )
+      );
+    }
+    if (subShareUnprotected.length > 0) {
+      out.push(
+        finding(
+          "warn",
+          "BROKER_STOPS_SUBSHARE",
+          `${subShareUnprotected.length} sub-one-share position(s) no stop can cover`,
+          `The paper account holds less than a whole share of ${list(subShareUnprotected)}, and Alpaca rejects a fractional stop or trailing order, so nothing protective can rest on them. The stage trims stubs like these at market on its next run; one that survives needs selling or topping up to a whole share by hand. Exposure is under a share a name, which is why this is not a failure — but nothing is stopping it either.`,
+          { count: subShareUnprotected.length, tickers: subShareUnprotected.join(",") }
         )
       );
     }

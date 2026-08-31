@@ -16,6 +16,7 @@ import {
   sessionsStale,
   stalenessScaledBuffer,
   planBrokerAction,
+  planWholeShareTrim,
   entryAttemptHistory,
   isBrokerStopsEnabled,
   realizedFromFills,
@@ -1228,5 +1229,36 @@ describe("planBrokerAction() — entry limit vs reference staleness", () => {
     const fresh = enter({ referenceSessions: 1 }) as { qty: number };
     const stale = enter({ referenceSessions: 4 }) as { qty: number };
     expect(stale.qty).toBe(fresh.qty);
+  });
+});
+
+describe("planWholeShareTrim() — the live book holds whole shares only", () => {
+  it("leaves a whole-share position untouched", () => {
+    expect(planWholeShareTrim(3)).toEqual({ trimQty: 0, wholeQty: 3 });
+  });
+
+  it("trims the fractional excess a stop could never cover", () => {
+    // The JNJ position that armed a 3-share trail and left 0.94 shares naked when it
+    // fired: trim first and the trail covers all 3 shares that remain.
+    expect(planWholeShareTrim(3.939479925)).toEqual({ trimQty: 0.939479, wholeQty: 3 });
+  });
+
+  it("trims a sub-one-share position away entirely — it has no protectable core", () => {
+    expect(planWholeShareTrim(0.939479925)).toEqual({ trimQty: 0.939479, wholeQty: 0 });
+  });
+
+  it("never asks to sell more than is held", () => {
+    for (const qty of [1.1, 2.000001, 7.9999999, 0.5, 12.345678912]) {
+      const { trimQty, wholeQty } = planWholeShareTrim(qty);
+      expect(trimQty + wholeQty).toBeLessThanOrEqual(qty);
+    }
+  });
+
+  it("ignores dust rather than churning an order for it every run", () => {
+    expect(planWholeShareTrim(4.0000005)).toEqual({ trimQty: 0, wholeQty: 4 });
+  });
+
+  it("reads a short the same way the callers do, via absolute size", () => {
+    expect(planWholeShareTrim(-3.5)).toEqual({ trimQty: 0.5, wholeQty: 3 });
   });
 });

@@ -875,6 +875,45 @@ export function planBrokerAction(input: {
   return { type: "NONE" };
 }
 
+/**
+ * Smallest fractional quantity worth sending as an order. Alpaca's fractional sizing
+ * bottoms out in the thousandths of a share; below that the stub is dust, and retrying
+ * an order for it every run would churn the account forever to no purpose.
+ */
+export const MIN_FRACTIONAL_QTY = 0.001;
+
+export type WholeShareTrim = {
+  trimQty: number; // fractional excess to market-sell (0 when there is none worth selling)
+  wholeQty: number; // whole shares left afterwards — what a protective order can cover
+};
+
+/**
+ * Split a live position into the whole-share core a protective order can cover and the
+ * fractional excess it cannot.
+ *
+ * Alpaca rejects a fractional stop or trailing order, so every protective path here
+ * floors to whole shares — and what that leaves over is not merely unprotected but
+ * UNPROTECTABLE: the next run floors identically and skips what it cannot cover. A
+ * 3.94-share position arms a 3-share trailing stop, and when that trail fires the
+ * remaining 0.94 shares are naked with no run able to repair them. That state held for
+ * 28 consecutive sessions before anyone read the review that reported it.
+ *
+ * So under broker stops the live book holds WHOLE SHARES ONLY. The caller market-sells
+ * `trimQty` — a market sell, unlike a stop, is happily fractional — and then protects
+ * `wholeQty`, which by construction covers everything still held. A position under one
+ * share trims away entirely and leaves `wholeQty: 0`: correct, since it has no
+ * protectable core to keep.
+ *
+ * `trimQty` is rounded DOWN to the broker's fractional precision, so it can never ask
+ * to sell more than the account actually holds.
+ */
+export function planWholeShareTrim(posQty: number): WholeShareTrim {
+  const held = Math.abs(posQty);
+  const wholeQty = Math.floor(held);
+  const excess = Math.floor((held - wholeQty) * 1e6) / 1e6;
+  return { trimQty: excess >= MIN_FRACTIONAL_QTY ? excess : 0, wholeQty };
+}
+
 export type BookSummary = {
   equity: number;
   realizedPnl: number;
