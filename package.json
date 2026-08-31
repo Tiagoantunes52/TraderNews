@@ -17,7 +17,9 @@
     "explain-day": "tsx scripts/explain-day.ts",
     "signal-research": "tsx scripts/signal-research.ts",
     "signal-research-fit": "tsx scripts/signal-research-fit.ts",
-    "signal-split": "tsx scripts/signal-split.ts"
+    "signal-split": "tsx scripts/signal-split.ts",
+    "policy-compare": "tsx scripts/policy-compare.ts",
+    "research-brief": "tsx scripts/research-brief.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.7.8",

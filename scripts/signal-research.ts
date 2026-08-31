@@ -17,6 +17,8 @@ import {
   type ReturnFrame,
 } from "../src/lib/signal-research";
 import { ALL_CANDIDATES } from "../src/lib/signal-research-variants";
+import { recordRuns, reportK, formatLedgerNote } from "../src/lib/research-ledger";
+import { readLedger, writeLedger } from "../src/lib/research-ledger-io";
 
 // Does a candidate score rank names correctly, out of sample?
 //
@@ -33,8 +35,23 @@ import { ALL_CANDIDATES } from "../src/lib/signal-research-variants";
 //   npx tsx scripts/signal-research.ts --rebuild-cache
 //   npx tsx scripts/signal-research.ts --json
 
-const adapter = new PrismaPg({ connectionString: process.env.DIRECT_URL! });
-const prisma = new PrismaClient({ adapter }) as unknown as PC<never, undefined>;
+// Lazily constructed, and only when the feature cache misses: with the cache present
+// this script needs no database at all, which is what lets it run on a runner holding
+// nothing but the pipeline secret (see scripts/fetch-corpus.ts).
+let prisma: PC<never, undefined> | null = null;
+function client(): PC<never, undefined> {
+  if (!prisma) {
+    if (!process.env.DIRECT_URL) {
+      throw new Error(
+        "DIRECT_URL is required to build features from the database. " +
+          "To run without one, build the cache over HTTP first: npx tsx scripts/fetch-corpus.ts"
+      );
+    }
+    const adapter = new PrismaPg({ connectionString: process.env.DIRECT_URL });
+    prisma = new PrismaClient({ adapter }) as unknown as PC<never, undefined>;
+  }
+  return prisma;
+}
 
 // Building features over ~120k stock-days takes minutes; scoring a candidate against a
 // built table takes seconds. Cache the table so iterating on hypotheses is instant —
@@ -96,7 +113,7 @@ async function loadFeatures(rebuild: boolean): Promise<FeatureRow[]> {
     }
   }
   console.error("features: building from PriceBar…");
-  const rows = await prisma.priceBar.findMany({
+  const rows = await client().priceBar.findMany({
     select: {
       stockId: true, date: true, open: true, high: true, low: true, close: true, volume: true,
       stock: { select: { ticker: true } },
@@ -138,10 +155,31 @@ async function main() {
 
   const reports: CandidateReport[] = selected.map((c) => evaluate(features, c, { splitDate: split, folds, horizon, frame }));
 
+  // Fold this run's specs into the lifetime ledger BEFORE reporting, so the printed
+  // noise threshold prices the search including what just happened. `k` used to be the
+  // candidate count of this invocation, which meant it never moved however many times
+  // the harness had been asked — see research-ledger.ts.
+  const ledger = recordRuns(
+    readLedger(),
+    reports.map((r) => ({
+      kind: "candidate" as const,
+      id: r.id,
+      control: r.verdict === "CONTROL",
+      horizon: r.horizon,
+      frame: r.frame,
+      split,
+      verdict: r.verdict,
+    })),
+    new Date().toISOString().slice(0, 10)
+  );
+  writeLedger(ledger);
+  const k = reportK(ledger, "candidate", reports.filter((r) => r.verdict !== "CONTROL").length);
+
   if (json) {
-    console.log(JSON.stringify(reports, null, 2));
+    console.log(JSON.stringify({ k, ledger: formatLedgerNote(ledger, "candidate", k), reports }, null, 2));
   } else {
-    console.log(formatReport(reports, reports.filter((r) => r.verdict !== "CONTROL").length));
+    console.log(formatReport(reports, k));
+    console.log(formatLedgerNote(ledger, "candidate", k).join("\n"));
   }
 
   // Non-zero when the harness itself failed its controls — so this is usable in a
@@ -154,4 +192,4 @@ main()
     console.error(e);
     process.exit(1);
   })
-  .finally(() => prisma.$disconnect());
+  .finally(() => prisma?.$disconnect());

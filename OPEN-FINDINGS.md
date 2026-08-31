@@ -890,6 +890,70 @@ universe expansion — the corpus is ready if either happens.
 
 ---
 
+## Slot-constrained selection, 2026-08-31 — replacement does not beat the incumbent on this score
+
+The live book holds 12 names and vetoes 46–59 candidates a session on `MAX_POSITIONS`.
+Once it is full, a holding is only ever released by the exit ladder — never because a
+better name is available. Does reconsidering holdings against the ranking beat that?
+
+**New instrument.** `src/lib/portfolio-sim.ts` (pure) + `scripts/policy-compare.ts`
+(`npm run policy-compare -- --frame=fill`). The score harness cannot answer this:
+cross-sectional IC is invariant to selection policy, so threshold-and-hold and
+rank-with-replacement consume the identical ranking and produce the identical number.
+The sim's unit of observation is a portfolio-session, and the headline is the paired
+per-session difference against the incumbent (Newey-West, lag 5), split and folded the
+same way `signal-research` splits features.
+
+**Result** — `baseline` candidate (`calcQuantScore` as shipped), 121,179 rows over
+~1,190 sessions, split 2025-01-01, 4 folds:
+
+| policy | train | holdout | folds+ | turnover | verdict |
+|---|---|---|---|---|---|
+| `PA-arrival` (pre-`a3a720c`) | -0.8 bps (t -0.42) | +1.2 (t +0.45) | 3/4 | 0.81/sess | FAILS |
+| `P1-replace` | **-1.7 bps (t -1.00)** | **-1.0 (t -0.34)** | 1/4 | 1.02/sess | FAILS |
+| `P3-replace-slow` | +0.1 (t +0.05) | -1.4 (t -0.54) | 2/4 | 1.01/sess | FAILS |
+| `P2-topN` (ceiling) | +0.6 (t +0.20) | -1.7 (t -0.31) | 3/4 | 3.60/sess | FAILS |
+
+Fill frame. Control passes: the oracle scores **+301.4 bps/session** under `P2-topN`
+against the incumbent score's -0.0, so the simulator can detect a policy improvement
+that exists. Every policy also FAILS on `exec` and on `close`.
+
+**These are the numbers on the REPAIRED corpus.** The first run used the feature cache
+built 2026-08-24 18:36, which predates that day's Yahoo backfill and is missing the bars
+the Tiingo defect had been rejecting — AMAT, for one, had no 07-30 or 07-31 row. Inserting
+a missing session shifts the `i + h` index, so 1,017 rows carried wrong long-horizon
+forward returns and 589 rows were absent entirely. Conclusions did not move (the largest
+shift was `P2-topN`'s holdout, -2.1 → -1.7 bps), but **anything else read off that cache
+between 2026-08-24 and 2026-08-31 was computed on a corpus known to be wrong.** The cache
+is gitignored and rebuildable: `npm run signal-research -- --rebuild-cache`, or
+`npx tsx scripts/fetch-corpus.ts` for the credential-free path.
+
+**The `close` frame is the informative one.** There, turnover is free — the entry is
+priced at a close nothing can trade at — and replacement STILL loses (`P1` -1.6 train /
+-1.2 holdout). So this is not a story about swapping being expensive. Ranking harder on
+this score simply does not find better names, which is exactly what the quant section
+above already establishes: `calcQuantScore`'s holdout ranking IC is -0.0232 (t = -2.25).
+**A selection policy is a multiplier on signal quality, and this one is being applied to
+a signal with the wrong sign.**
+
+Measured incidentally: `PA-arrival` — the book as it stood before ranked entry
+allocation shipped — is indistinguishable from the ranked allocation that replaced it
+(|t| < 0.6 in both periods, and the sign flips between them). `a3a720c` was the right
+change on principle and bought nothing measurable, for the same reason.
+
+**What this does not say.** Nothing here tests replacement on a score that ranks. Re-run
+`npm run policy-compare -- --candidate=<id>` against any candidate that clears the score
+harness first — the instrument is score-agnostic and the run takes seconds off the
+cached features. Three modelling gaps all bias TOWARD the hypothesis (survivorship from
+projecting today's universe back to 2021, no price stops in the simulated ladder, no
+exit slippage) and it failed anyway, so the null is if anything understated.
+
+`k` is now kept in `research-ledger.json`, not in a constant: 12 policy specifications
+(four policies x three frames, all actually run) -> |t| floor 2.23. Every policy tried
+against this corpus counts toward it, including one tried and abandoned. Add to it, not
+around it.
+
+
 ## Confirmed but deliberately deferred
 
 These are verified defects that lost the prioritisation, not open questions. They are

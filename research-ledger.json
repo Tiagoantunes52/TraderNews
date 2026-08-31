@@ -1,0 +1,512 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "spec": "baseline@h5/close",
+      "kind": "candidate",
+      "id": "baseline",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "baseline@h5/exec",
+      "kind": "candidate",
+      "id": "baseline",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "baseline@h5/fill",
+      "kind": "candidate",
+      "id": "baseline",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f1-refit-global@h5/close",
+      "kind": "candidate",
+      "id": "f1-refit-global",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "f1-refit-global@h5/exec",
+      "kind": "candidate",
+      "id": "f1-refit-global",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f1-refit-global@h5/fill",
+      "kind": "candidate",
+      "id": "f1-refit-global",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f2-refit-by-regime@h5/close",
+      "kind": "candidate",
+      "id": "f2-refit-by-regime",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "WEAK"
+    },
+    {
+      "spec": "f2-refit-by-regime@h5/exec",
+      "kind": "candidate",
+      "id": "f2-refit-by-regime",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f2-refit-by-regime@h5/fill",
+      "kind": "candidate",
+      "id": "f2-refit-by-regime",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f3-fitted-regimes@h5/close",
+      "kind": "candidate",
+      "id": "f3-fitted-regimes",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "f3-fitted-regimes@h5/exec",
+      "kind": "candidate",
+      "id": "f3-fitted-regimes",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "f3-fitted-regimes@h5/fill",
+      "kind": "candidate",
+      "id": "f3-fitted-regimes",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h1-momentum-horizon@h5/close",
+      "kind": "candidate",
+      "id": "h1-momentum-horizon",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "h1-momentum-horizon@h5/exec",
+      "kind": "candidate",
+      "id": "h1-momentum-horizon",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h1-momentum-horizon@h5/fill",
+      "kind": "candidate",
+      "id": "h1-momentum-horizon",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h2-no-vol-damper@h5/close",
+      "kind": "candidate",
+      "id": "h2-no-vol-damper",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "h2-no-vol-damper@h5/exec",
+      "kind": "candidate",
+      "id": "h2-no-vol-damper",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h2-no-vol-damper@h5/fill",
+      "kind": "candidate",
+      "id": "h2-no-vol-damper",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h3-spread-normalised@h5/close",
+      "kind": "candidate",
+      "id": "h3-spread-normalised",
+      "control": false,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "h3-spread-normalised@h5/exec",
+      "kind": "candidate",
+      "id": "h3-spread-normalised",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "h3-spread-normalised@h5/fill",
+      "kind": "candidate",
+      "id": "h3-spread-normalised",
+      "control": false,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "mom30@h5/close",
+      "kind": "candidate",
+      "id": "mom30",
+      "control": true,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "CONTROL"
+    },
+    {
+      "spec": "mom30@h5/exec",
+      "kind": "candidate",
+      "id": "mom30",
+      "control": true,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "mom30@h5/fill",
+      "kind": "candidate",
+      "id": "mom30",
+      "control": true,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "oracle@h5/close",
+      "kind": "candidate",
+      "id": "oracle",
+      "control": true,
+      "firstRun": "2026-07-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "CONTROL"
+    },
+    {
+      "spec": "oracle@h5/exec",
+      "kind": "candidate",
+      "id": "oracle",
+      "control": true,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "oracle@h5/fill",
+      "kind": "candidate",
+      "id": "oracle",
+      "control": true,
+      "firstRun": "2026-08-24",
+      "lastRun": "2026-08-24",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "SEEDED"
+    },
+    {
+      "spec": "P1-replace@close",
+      "kind": "policy",
+      "id": "P1-replace",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P1-replace@exec",
+      "kind": "policy",
+      "id": "P1-replace",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P1-replace@fill",
+      "kind": "policy",
+      "id": "P1-replace",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P2-topN@close",
+      "kind": "policy",
+      "id": "P2-topN",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P2-topN@exec",
+      "kind": "policy",
+      "id": "P2-topN",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P2-topN@fill",
+      "kind": "policy",
+      "id": "P2-topN",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P3-replace-slow@close",
+      "kind": "policy",
+      "id": "P3-replace-slow",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P3-replace-slow@exec",
+      "kind": "policy",
+      "id": "P3-replace-slow",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "P3-replace-slow@fill",
+      "kind": "policy",
+      "id": "P3-replace-slow",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "PA-arrival@close",
+      "kind": "policy",
+      "id": "PA-arrival",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "PA-arrival@exec",
+      "kind": "policy",
+      "id": "PA-arrival",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    },
+    {
+      "spec": "PA-arrival@fill",
+      "kind": "policy",
+      "id": "PA-arrival",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 3,
+      "splits": [
+        "2025-01-01"
+      ],
+      "lastVerdict": "FAILS"
+    }
+  ]
+}
