@@ -6,8 +6,8 @@ import { db } from "@/lib/db";
 import { getOrCreateUser } from "@/lib/get-or-create-user";
 import { isAdmin } from "@/lib/auth";
 import { formatDistanceToNow } from "@/lib/format-date";
-import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, realizedFromFills, type Strategy, type ClosedTrade } from "@/lib/paper-trading";
-import { isPaperTradingConfigured, getAccountActivities } from "@/lib/alpaca-trading";
+import { SIM_STARTING_EQUITY, ALL_STRATEGIES, STRATEGY_BOOK, realizedFromFills, deployedCapital, averageDeployed, returnOnCapitalPct, type Strategy, type ClosedTrade } from "@/lib/paper-trading";
+import { isPaperTradingConfigured, getAccountActivities, getPositions } from "@/lib/alpaca-trading";
 import { PerformanceEquityChart } from "@/components/lazy-charts";
 import { RefreshCountdown } from "@/components/refresh-countdown";
 import { Hint, HINT_TEXT } from "@/components/hint";
@@ -29,8 +29,12 @@ const PERF_HINTS = {
     "Total profit/loss locked in from closed positions only; still-open positions aren't counted.",
   unrealized:
     "Paper profit/loss on still-open positions at the latest mark. This is the bridge to the cards: card equity = starting cash + realized + unrealized.",
+  returnOnCapital:
+    "Profit and loss as a share of the capital that actually earned it — the book's average deployed capital across its daily snapshots, not its notional starting cash. This is the figure that says something about the strategy. Averaged over the book's life because deployed capital moves a lot: a book that ran 80 names and now runs 12 has to be measured against both.",
   returnPct:
-    "Change in the book's equity since it started, as a %.",
+    "Change in the book's equity since it started, as a %. Kept for continuity, but the denominator is the full notional starting cash, which nothing in the sim ever constrains anything against — sizing reads confidence and stop distance, never the balance. A book deploying a tenth of its notional shows roughly a tenth of what its positions earned, which is why it is the secondary figure here.",
+  deployed:
+    "Average capital at work across the book's daily snapshots, with the latest reading alongside. The gap between this and the book's notional is cash that was never invested.",
 } as const;
 
 export const metadata = { title: "Signal Performance — TraderNews" };
@@ -153,6 +157,16 @@ export default async function PerformancePage() {
   const latestByBook = new Map<BookKey, (typeof snapshots)[number]>();
   for (const s of snapshots) latestByBook.set(s.book as BookKey, s); // ascending → last wins
 
+  // Every snapshot per book, for the average deployed capital the return is measured
+  // against. Bounded by the same one-year chart window as the query above — fine while
+  // the books are months old, and the figure would need its own query if that changes.
+  const snapshotsByBook = new Map<BookKey, (typeof snapshots)[number][]>();
+  for (const s of snapshots) {
+    const list = snapshotsByBook.get(s.book as BookKey);
+    if (list) list.push(s);
+    else snapshotsByBook.set(s.book as BookKey, [s]);
+  }
+
   // Hit-rate + realized P&L per strategy from the closed-position aggregates.
   const statsByStrategy = new Map<Strategy, { closed: number; wins: number; realized: number }>();
   for (const strat of ALL_STRATEGIES) statsByStrategy.set(strat, { closed: 0, wins: 0, realized: 0 });
@@ -178,6 +192,35 @@ export default async function PerformancePage() {
     const mark = p.lastMarkPrice ?? p.entryPrice;
     unrealizedByStrategy.set(strat, (unrealizedByStrategy.get(strat) ?? 0) + p.qty * (mark - p.entryPrice));
   }
+  // Capital actually at work per book — the companion to the cards' return %, which is
+  // measured against starting cash that never constrains anything. See deployedCapital.
+  const openByBook = new Map<BookKey, { qty: number; entryPrice: number }[]>();
+  for (const p of openPositions) {
+    const book = STRATEGY_BOOK[p.strategy as Strategy];
+    if (!book) continue;
+    const list = openByBook.get(book);
+    if (list) list.push(p);
+    else openByBook.set(book, [p]);
+  }
+  const deployedByBook = new Map<BookKey, number>(
+    [...openByBook].map(([book, open]) => [book, deployedCapital(open)])
+  );
+
+  // The live book's positions come from the broker, not SimPosition. Best-effort, like
+  // the fill history below: an unreachable account leaves the figure blank rather than
+  // failing the page.
+  if (isPaperTradingConfigured()) {
+    try {
+      const live = await getPositions();
+      deployedByBook.set(
+        "ALPACA",
+        deployedCapital(live.map((x) => ({ qty: x.qty, entryPrice: x.avgEntryPrice ?? x.currentPrice ?? 0 })))
+      );
+    } catch {
+      // leave it absent — the card renders without the line
+    }
+  }
+
   // Total realized P&L across every closed sim position (all books).
   const totalRealized = closedByStrategy.reduce((s, row) => s + (row._sum.realizedPnl ?? 0), 0);
   // Only rate strategies whose book has data — keeps the risk-managed rows hidden
@@ -190,7 +233,15 @@ export default async function PerformancePage() {
     const isSim = key !== "ALPACA";
     const baseline = isSim ? SIM_STARTING_EQUITY : (firstAlpacaSnap?.equity ?? null);
     const returnPct = baseline && baseline !== 0 ? (latest.equity / baseline - 1) * 100 : null;
-    return { key, meta, latest, returnPct };
+    const deployedNow = deployedByBook.get(key) ?? null;
+    // Return on the money that actually earned it. Averaged over this book's daily
+    // snapshots rather than measured against today's holdings, because capital employed
+    // swings by an order of magnitude and today says nothing about the P&L's origin.
+    // The ALPACA book keeps equity return as its headline: there the balance is real and
+    // cash genuinely constrains what can be bought, so it is already the right question.
+    const avgDeployed = isSim ? averageDeployed(snapshotsByBook.get(key) ?? []) : null;
+    const roce = isSim && baseline != null ? returnOnCapitalPct(latest.equity - baseline, avgDeployed) : null;
+    return { key, meta, latest, returnPct, deployedNow, avgDeployed, roce };
   });
 
   const alpacaConfigured = isPaperTradingConfigured();
@@ -251,7 +302,7 @@ export default async function PerformancePage() {
       <PageHeader />
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {cards.map(({ key, meta, latest, returnPct }) => (
+        {cards.map(({ key, meta, latest, returnPct, deployedNow, avgDeployed, roce }) => (
           <Card key={key} className="rounded-2xl">
             <CardContent className="p-4">
               <div className="flex items-center gap-2">
@@ -259,13 +310,35 @@ export default async function PerformancePage() {
                 <p className="text-sm font-medium">{meta.label}</p>
               </div>
               <p className="text-2xl font-bold tabular-nums mt-2">{fmtUsd(latest.equity)}</p>
-              <p
-                className={`text-sm font-medium tabular-nums ${
-                  returnPct == null ? "text-muted-foreground" : returnPct >= 0 ? "text-emerald-600" : "text-rose-600"
-                }`}
-              >
-                {fmtPct(returnPct)} <Hint text={PERF_HINTS.returnPct} className={HINT_TEXT}>return</Hint>
-              </p>
+              {roce != null ? (
+                <>
+                  <p
+                    className={`text-sm font-medium tabular-nums ${
+                      roce >= 0 ? "text-emerald-600" : "text-rose-600"
+                    }`}
+                  >
+                    {fmtPct(roce)}{" "}
+                    <Hint text={PERF_HINTS.returnOnCapital} className={HINT_TEXT}>on capital</Hint>
+                  </p>
+                  <p className="text-xs text-muted-foreground tabular-nums mt-1">
+                    <Hint text={PERF_HINTS.deployed} className={HINT_TEXT}>
+                      {fmtUsd(avgDeployed ?? 0)} avg deployed
+                    </Hint>
+                    {deployedNow != null && ` · ${fmtUsd(deployedNow)} now`}
+                  </p>
+                  <p className="text-xs text-muted-foreground tabular-nums">
+                    {fmtPct(returnPct)} <Hint text={PERF_HINTS.returnPct} className={HINT_TEXT}>on book</Hint>
+                  </p>
+                </>
+              ) : (
+                <p
+                  className={`text-sm font-medium tabular-nums ${
+                    returnPct == null ? "text-muted-foreground" : returnPct >= 0 ? "text-emerald-600" : "text-rose-600"
+                  }`}
+                >
+                  {fmtPct(returnPct)} <Hint text={PERF_HINTS.returnPct} className={HINT_TEXT}>return</Hint>
+                </p>
+              )}
               <p className="text-xs text-muted-foreground mt-1">
                 {latest.openPositions} open · updated {formatDistanceToNow(latest.date)}
               </p>

@@ -48,7 +48,15 @@ function ladderExit(h: Holding): boolean {
   return false;
 }
 
-/** Names that clear the live entry deadband, best-first, excluding what is already held. */
+/**
+ * Names that clear the live entry deadband, best-first, excluding what is already held.
+ *
+ * Deliberately does NOT apply `cfg.entryScoreMax` (the 2026-08-31 STRONG_BUY cap). That
+ * cap rests on evidence about the SENTIMENT score's top bucket, and this harness scores
+ * candidates derived from price bars — importing a finding about one signal into the
+ * ranking of another would be reasoning by name rather than by evidence. If a band ever
+ * needs testing here, it needs its own measurement on this corpus.
+ */
 const eligible = (ranked: RankedName[]) =>
   ranked.filter((r) => !r.held && r.enterable && r.score > cfg.entryScoreMin);
 

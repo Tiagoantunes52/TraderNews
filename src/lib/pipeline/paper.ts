@@ -32,6 +32,7 @@ import {
   unrealizedPnl,
   confidenceNotional,
   riskSizedNotional,
+  deployedCapital,
   riskDistancePct,
   cents,
   realizedFromFills,
@@ -851,6 +852,11 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         realizedPnl: realized,
         unrealizedPnl: unrealized,
         openPositions: open.length,
+        // Capital actually at work today. Recorded per day because it varies enormously
+        // over a book's life, so no single later reading can stand in for it — and
+        // without it the cards' return has to be divided by SIM_STARTING_EQUITY, which
+        // nothing in the sim ever constrains anything against.
+        deployed: deployedCapital(open),
       };
       await db.paperEquitySnapshot.upsert({
         where: { book_date: { book, date: todayUTC } },

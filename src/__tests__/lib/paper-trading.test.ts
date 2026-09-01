@@ -17,6 +17,10 @@ import {
   stalenessScaledBuffer,
   planBrokerAction,
   planWholeShareTrim,
+  deployedCapital,
+  averageDeployed,
+  returnOnCapitalPct,
+  SIM_STARTING_EQUITY,
   entryAttemptHistory,
   isBrokerStopsEnabled,
   realizedFromFills,
@@ -1260,5 +1264,116 @@ describe("planWholeShareTrim() — the live book holds whole shares only", () =>
 
   it("reads a short the same way the callers do, via absolute size", () => {
     expect(planWholeShareTrim(-3.5)).toEqual({ trimQty: 0.5, wholeQty: 3 });
+  });
+});
+
+describe("deployedCapital() — the number that makes the return % readable", () => {
+  it("is zero for an empty book", () => {
+    expect(deployedCapital([])).toBe(0);
+  });
+
+  it("sums cost basis, not market value", () => {
+    // Marks are deliberately absent: what was put to work does not move with the price.
+    expect(deployedCapital([{ qty: 10, entryPrice: 100 }, { qty: 2.5, entryPrice: 40 }])).toBeCloseTo(1100, 10);
+  });
+
+  it("counts a short as capital at work, like every other sizing path here", () => {
+    expect(deployedCapital([{ qty: -3, entryPrice: 50 }])).toBeCloseTo(150, 10);
+  });
+
+  it("shows the gap the cards exist to surface", () => {
+    // A book reporting its return against SIM_STARTING_EQUITY while holding this much is
+    // dividing by roughly ten times the capital its positions actually used.
+    const open = Array.from({ length: 12 }, () => ({ qty: 8, entryPrice: 100 }));
+    expect(deployedCapital(open)).toBeCloseTo(9600, 10);
+    expect(deployedCapital(open) / SIM_STARTING_EQUITY).toBeLessThan(0.1);
+  });
+});
+
+describe("averageDeployed() / returnOnCapitalPct() — measuring against the money that earned it", () => {
+  it("averages across the book's life, not today", () => {
+    // The regime change in miniature: a book that ran big, then small. Today's $10k says
+    // nothing about the capital that produced most of the P&L.
+    const snaps = [{ deployed: 40000 }, { deployed: 40000 }, { deployed: 10000 }, { deployed: 10000 }];
+    expect(averageDeployed(snaps)).toBe(25000);
+  });
+
+  it("ignores snapshots with no figure rather than counting them as zero", () => {
+    // Rows predating the column are unknown, not empty — averaging them in would halve
+    // the denominator and double the reported return.
+    expect(averageDeployed([{ deployed: null }, { deployed: 10000 }, {}])).toBe(10000);
+  });
+
+  it("is null when nothing is known", () => {
+    expect(averageDeployed([{ deployed: null }, {}])).toBeNull();
+    expect(averageDeployed([])).toBeNull();
+  });
+
+  it("reports the return the capital actually earned", () => {
+    // The live case: +$909.70 on an average $20,913 employed is 4.3%, not the 0.9% that
+    // dividing by $100k of notional implies.
+    expect(returnOnCapitalPct(909.7, 20913)).toBeCloseTo(4.35, 2);
+    expect(returnOnCapitalPct(909.7, SIM_STARTING_EQUITY)).toBeCloseTo(0.91, 2);
+  });
+
+  it("keeps the sign of a losing book", () => {
+    expect(returnOnCapitalPct(-500, 10000)).toBeCloseTo(-5, 10);
+  });
+
+  it("is null rather than infinite when no capital was ever deployed", () => {
+    expect(returnOnCapitalPct(100, 0)).toBeNull();
+    expect(returnOnCapitalPct(100, null)).toBeNull();
+  });
+});
+
+describe("reconcileRiskManaged() — the entry band cap (shipped 2026-08-31)", () => {
+  const bandCfg: RiskConfig = DEFAULT_RISK_CONFIG;
+  const base = {
+    price: 100,
+    confidence: 0.9,
+    atrPct: 2,
+    runsSinceEntry: 0,
+    isNewRun: true,
+    open: null,
+    cfg: bandCfg,
+  };
+
+  it("opens on a BUY-range score, as before", () => {
+    const a = reconcileRiskManaged({ ...base, score: 0.5, signal: "BUY" });
+    expect(a.type).toBe("OPEN");
+  });
+
+  it("refuses the strongest reads — the bucket the signal loses in", () => {
+    // 0.9 clears entryScoreMin comfortably and is exactly what used to be bought.
+    const a = reconcileRiskManaged({ ...base, score: 0.9, signal: "STRONG_BUY" });
+    expect(a.type).toBe("NONE");
+  });
+
+  it("includes the boundary, which scoreToSignal still calls BUY", () => {
+    // STRONG_BUY is score > 0.6, so 0.6 itself belongs in the band.
+    expect(reconcileRiskManaged({ ...base, score: 0.6, signal: "BUY" }).type).toBe("OPEN");
+    expect(reconcileRiskManaged({ ...base, score: 0.61, signal: "STRONG_BUY" }).type).toBe("NONE");
+  });
+
+  it("still refuses scores below the deadband", () => {
+    expect(reconcileRiskManaged({ ...base, score: 0.1, signal: "NEUTRAL" }).type).toBe("NONE");
+  });
+
+  it("is disabled by a cap of 1", () => {
+    const wide: RiskConfig = { ...bandCfg, entryScoreMax: 1 };
+    expect(reconcileRiskManaged({ ...base, score: 0.9, signal: "STRONG_BUY", cfg: wide }).type).toBe("OPEN");
+  });
+
+  it("does NOT exit a held position whose score climbs past the cap", () => {
+    // Entry-only, deliberately: the evidence is about buying the top of a move, not
+    // about holding through one. Same split as combinedEntryUsesQuant.
+    const held = reconcileRiskManaged({
+      ...base,
+      score: 0.95,
+      signal: "STRONG_BUY",
+      runsSinceEntry: 5,
+      open: { qty: 10, entryPrice: 100, peakPrice: 100, bearishStreak: 0, staleStreak: 0, entryAtrPct: 2 },
+    });
+    expect(held.type).toBe("MARK");
   });
 });

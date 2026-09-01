@@ -485,6 +485,12 @@ model PaperEquitySnapshot {
   realizedPnl    Float    @default(0)
   unrealizedPnl  Float    @default(0)
   openPositions  Int      @default(0)
+  // Cost basis of the positions open at this snapshot — the capital actually at work.
+  // Recorded per day so a book's return can be measured against the money that earned
+  // it rather than against SIM_STARTING_EQUITY, which never constrains anything. Null
+  // on the ALPACA book (its deployed capital lives at the broker, not in SimPosition)
+  // and on rows written before this column existed.
+  deployed       Float?
   createdAt      DateTime @default(now())
 
   @@unique([book, date])

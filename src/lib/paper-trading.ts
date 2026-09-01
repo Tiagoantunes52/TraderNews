@@ -117,6 +117,23 @@ export type RiskConfig = {
   timeStopRuns: number; // runs of dead money before a time stop (0 disables)
   timeStopBandPct: number; // ± band around entry that counts as "dead money"
   entryScoreMin: number; // raw score must exceed this to open (deadband above BUY)
+  /**
+   * Upper bound on the entry band: a score ABOVE this does not open. 1 disables the cap.
+   *
+   * Shipped at 0.6 on 2026-08-31 — the STRONG_BUY line — because the top bucket is where
+   * the sentiment signal loses. Measured over 58 entry sessions: trading only STRONG_BUY
+   * returns -79.5 bps against the universe and is negative in the full window, in train,
+   * in holdout and in 0 of 4 folds, while the band without it goes from -19.3 bps to
+   * +0.2 bps out of sample. The mechanism is that the most bullish reads follow news the
+   * price has already moved on, so the strongest signal buys the top of a reversion.
+   *
+   * ENTRY ONLY, deliberately. A held position whose score climbs past the cap is not
+   * exited — the evidence is about what buying at the top does, not about holding
+   * through it. Same split as `combinedEntryUsesQuant`, for the same reason.
+   *
+   * This reaches the universe, it does not beat it. See OPEN-FINDINGS "Entry bands".
+   */
+  entryScoreMax: number;
   minConfidence: number; // confidence floor for an entry (skips dust positions)
   riskPerTrade: number; // $ lost if the stop fires at confidence 1 — drives sizing
   insiderHoldDays: number; // event-book fixed holding period (UTC days ≈ 40 trading days)
@@ -153,6 +170,7 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   timeStopRuns: 20,
   timeStopBandPct: 0.03,
   entryScoreMin: 0.25,
+  entryScoreMax: 0.6,
   minConfidence: 0.3,
   // 80 = old BASE_NOTIONAL × fixed 8% stop, so a fixed-stop name sizes exactly as
   // the legacy $1000 × confidence did; ATR-stopped names now equalize $ risk instead.
@@ -190,6 +208,7 @@ export function riskConfig(): RiskConfig {
     timeStopRuns: numEnv("PAPER_TIME_STOP_RUNS", DEFAULT_RISK_CONFIG.timeStopRuns),
     timeStopBandPct: numEnv("PAPER_TIME_STOP_BAND_PCT", DEFAULT_RISK_CONFIG.timeStopBandPct),
     entryScoreMin: numEnv("PAPER_ENTRY_SCORE_MIN", DEFAULT_RISK_CONFIG.entryScoreMin),
+    entryScoreMax: numEnv("PAPER_ENTRY_SCORE_MAX", DEFAULT_RISK_CONFIG.entryScoreMax),
     minConfidence: numEnv("PAPER_MIN_CONFIDENCE", DEFAULT_RISK_CONFIG.minConfidence),
     riskPerTrade: numEnv("PAPER_RISK_PER_TRADE", DEFAULT_RISK_CONFIG.riskPerTrade),
     insiderHoldDays: numEnv("PAPER_INSIDER_HOLD_DAYS", DEFAULT_RISK_CONFIG.insiderHoldDays),
@@ -664,9 +683,15 @@ export function reconcileRiskManaged(args: {
     return { type: "MARK", price, peakPrice, bearishStreak, staleStreak };
   }
 
-  // Flat → enter only on real conviction (deadband) at a meaningful size, sized
-  // off the entry-day stop distance so every stop-out costs the same $.
-  if (entryScore > cfg.entryScoreMin && confidence >= cfg.minConfidence && price > 0) {
+  // Flat → enter on real conviction (deadband) but NOT on the strongest reads, which
+  // are where this signal loses (see `entryScoreMax`), at a meaningful size, sized off
+  // the entry-day stop distance so every stop-out costs the same $.
+  if (
+    entryScore > cfg.entryScoreMin &&
+    entryScore <= cfg.entryScoreMax &&
+    confidence >= cfg.minConfidence &&
+    price > 0
+  ) {
     const stopPct = riskDistancePct(cfg, atrPct, cfg.stopLossPct);
     const qty = riskSizedNotional(confidence, stopPct, cfg.riskPerTrade) / price;
     if (qty > 0) return { type: "OPEN", qty, price };
@@ -950,6 +975,57 @@ export function summarizeBook(
     wins,
     hitRate: closed.length > 0 ? wins / closed.length : null,
   };
+}
+
+/**
+ * Capital actually at work: the cost basis of everything still open.
+ *
+ * The companion to `summarizeBook`'s equity, and the number that makes its percentage
+ * readable. A sim book's "return" is measured against `SIM_STARTING_EQUITY`, but that
+ * constant never constrains anything — sizing goes through `riskSizedNotional`, which
+ * reads confidence and stop distance and never asks what the book holds. So a book can
+ * report 0.9% while its positions earned several times that on the fraction of the
+ * notional they actually used, and nothing on the page says so unless this is next to it.
+ *
+ * Cost basis rather than market value: this answers "how much was put to work", which is
+ * stable, rather than "what is it worth now", which moves with every mark.
+ */
+export function deployedCapital(open: { qty: number; entryPrice: number }[]): number {
+  return open.reduce((s, p) => s + Math.abs(p.qty) * p.entryPrice, 0);
+}
+
+/**
+ * Average capital at work across a book's life — the honest denominator for its return.
+ *
+ * Averaged over the daily snapshots rather than taken from today, because deployed
+ * capital moves by more than an order of magnitude over a book's life and today's
+ * reading says nothing about the money that earned the P&L. COMBINED_RM ran 36–82
+ * concurrent names at ~$40k until the 12-position cap landed on 2026-07-20, then ~$10k
+ * after: one number, two entirely different books.
+ *
+ * Null when no snapshot carries a figure — rows written before the column existed, and
+ * the live ALPACA book, whose deployed capital lives at the broker rather than in
+ * SimPosition. Null means "unknown" and must never be read as zero.
+ */
+export function averageDeployed(snapshots: { deployed?: number | null }[]): number | null {
+  const known = snapshots.map((s) => s.deployed).filter((v): v is number => v != null);
+  if (known.length === 0) return null;
+  return known.reduce((a, b) => a + b, 0) / known.length;
+}
+
+/**
+ * Return on the capital that actually earned it, as a percentage.
+ *
+ * The counterpart to dividing by `SIM_STARTING_EQUITY`, which measures a book against
+ * cash it never had the chance to use. A book that made $910 while employing an average
+ * of $21k returned 4.3% on the money at risk, not the 0.9% that $100k of notional
+ * implies — and only the first number says anything about the strategy.
+ *
+ * Null when the average is unknown or zero: a book that has never deployed anything has
+ * no return on capital, which is different from a return of zero.
+ */
+export function returnOnCapitalPct(pnl: number, avgDeployed: number | null): number | null {
+  return avgDeployed != null && avgDeployed > 0 ? (pnl / avgDeployed) * 100 : null;
 }
 
 // ── Realized P&L for the live Alpaca book ────────────────────────────────────

@@ -30,10 +30,16 @@ import { noiseThreshold } from "@/lib/signal-research";
 
 export const LEDGER_VERSION = 1;
 
-export type LedgerKind = "candidate" | "policy";
+/**
+ * Which search a specification belongs to. Kept separate because the families explore
+ * different spaces: a score candidate ranks names, a policy consumes a ranking, and a
+ * band decides which slice of a score should trade at all. A result in one is not made
+ * less believable by attempts in another.
+ */
+export type LedgerKind = "candidate" | "policy" | "band";
 
 export type LedgerEntry = {
-  /** `id@horizon/frame` for a candidate, `id@frame` for a policy. Unique per family. */
+  /** `id@horizon/frame` for a candidate, `id@frame` for a policy or band. Unique per family. */
   spec: string;
   kind: LedgerKind;
   id: string;
@@ -166,7 +172,7 @@ export function formatLedgerNote(ledger: Ledger, kind: LedgerKind, k: number): s
   const lifetime = effectiveK(ledger, kind);
   const drift = splitDrift(ledger, kind);
   const out = [
-    `k=${k} ${kind === "candidate" ? "candidate" : "policy"} specifications ever judged against this corpus ` +
+    `k=${k} ${kind} specifications ever judged against this corpus ` +
       `(${lifetime} in the ledger, ${ledger.entries.filter((e) => e.kind === kind).length} rows including controls).`,
   ];
   if (drift.length > 0) {

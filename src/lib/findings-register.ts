@@ -38,6 +38,10 @@ export type RegisterFacts = {
   entryWindowDays: number;
   /** Today's paper-stage errors naming the `insufficient qty available` rejection. */
   insufficientQtyErrors: number;
+  /** `_RM` entries opened above the band cap since it shipped — must stay 0. */
+  entriesAboveBand: number;
+  /** The cap in force, so the finding can name the number it is checking. */
+  entryScoreMax: number;
   /**
    * Largest `articleCount` ever written by the sentiment stage. The `.slice(0, 10)` at
    * `sentiment.ts:57` runs BEFORE the count, so while the defect is live this cannot
@@ -98,6 +102,20 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
             : `The tradingConfig row is no longer exactly { trailRatchetFrac: 1 } (found: ${f.tradingConfigRaw.slice(0, 120)}). A second knob moved — every claim derived from "only the ratchet changed" needs re-reading.`,
       };
     },
+  },
+  {
+    id: "entry-band-in-force",
+    section: "Entry bands",
+    claim:
+      "Since 2026-08-31 the _RM books do not open above `entryScoreMax` (0.6, the STRONG_BUY line) — the bucket measured at -79.5 bps against the universe.",
+    check: (f) => ({
+      holds: f.entriesAboveBand === 0,
+      detail:
+        f.entriesAboveBand === 0
+          ? `no _RM entry above ${f.entryScoreMax} since the cap shipped.`
+          : `${f.entriesAboveBand} _RM entr${f.entriesAboveBand === 1 ? "y" : "ies"} opened with a score above ${f.entryScoreMax} since the cap shipped. ` +
+            `Either the knob was reverted, or the gate is not reading the score it is supposed to — the change is not doing anything.`,
+    }),
   },
   {
     id: "article-count-capped",
