@@ -70,6 +70,12 @@ const REGISTER_STALE_MARK_DAYS = 4;
 // Trailing window for "did the _RM entry freeze drain?". 30 days is long enough that a
 // quiet fortnight doesn't re-assert a freeze that has ended.
 const REGISTER_ENTRY_WINDOW_DAYS = 30;
+/**
+ * When the entry band cap shipped. Entries are only judged against it from this date —
+ * every position opened before it was opened under the old, uncapped rule and counting
+ * them would make the assertion permanently red for history it cannot change.
+ */
+const ENTRY_BAND_SHIPPED = new Date("2026-08-31T00:00:00.000Z");
 // Trailing window for the entry-signal health check. 90 days is the shortest span that
 // accumulates enough scored entries to t-test while staying recent enough that a regime
 // change shows up rather than being averaged away by three good years.
@@ -516,7 +522,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
   // there being trusted.
   try {
-    const [cfgRow, staleMarked, rmEntries, maxArticles] = await Promise.all([
+    const [cfgRow, staleMarked, rmEntries, maxArticles, entriesAboveBand] = await Promise.all([
       db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { value: true } }),
       db.simPosition.count({
         where: { status: "OPEN", lastMarkDate: { lt: new Date(todayUTC.getTime() - REGISTER_STALE_MARK_DAYS * 86_400_000) } },
@@ -530,6 +536,16 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       // All-time, not windowed: while the slice/count ordering defect is live no row can
       // exceed the slice, so the first row that does is the signal that it was fixed.
       db.sentiment.aggregate({ _max: { articleCount: true } }),
+      // Entries above the band cap since it shipped. A silently-reverted knob looks
+      // exactly like a working one from the code, so the claim is checked against what
+      // the book actually did rather than against the config it was supposed to read.
+      db.simPosition.count({
+        where: {
+          strategy: { in: RM_STRATEGIES },
+          entryDate: { gte: ENTRY_BAND_SHIPPED },
+          entryScore: { gt: cfg.entryScoreMax },
+        },
+      }),
     ]);
 
     const facts: RegisterFacts = {
@@ -540,6 +556,8 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       rmEntriesInWindow: rmEntries,
       entryWindowDays: REGISTER_ENTRY_WINDOW_DAYS,
       insufficientQtyErrors: (runLog?.errors ?? []).filter((e) => /insufficient qty/i.test(e)).length,
+      entriesAboveBand,
+      entryScoreMax: cfg.entryScoreMax,
     };
     findings.push(...auditFindingsRegister(facts));
   } catch (e) {

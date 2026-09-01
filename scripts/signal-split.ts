@@ -9,9 +9,13 @@ import {
   MIN_SESSIONS,
   SIGNAL_SOURCES,
   type Observation,
+  type SignalSource,
   type SourceHealth,
 } from "../src/lib/signal-health";
 import { splitFixed, splitRolling } from "../src/lib/signal-research";
+import { ENTRY_BANDS, evaluateBand, formatBandReport, type BandReport } from "../src/lib/signal-band";
+import { recordRuns, reportK, formatLedgerNote } from "../src/lib/research-ledger";
+import { readLedger, writeLedger } from "../src/lib/research-ledger-io";
 
 // Does a LIVE entry signal still pay, out of sample?
 //
@@ -40,6 +44,8 @@ import { splitFixed, splitRolling } from "../src/lib/signal-research";
 //   npm run signal-split
 //   npm run signal-split -- --split=2026-07-09 --folds=4
 //   npm run signal-split -- --horizon=10
+//   npm run signal-split -- --bands            (which slice of the score should trade at all)
+//   npm run signal-split -- --bands --source=SENTIMENT
 //   npm run signal-split -- --json
 
 const adapter = new PrismaPg({ connectionString: process.env.DIRECT_URL! });
@@ -53,8 +59,19 @@ function parseArgs(argv: string[]) {
   let folds = DEFAULT_FOLDS;
   let horizon = DEFAULT_HORIZON;
   let json = false;
+  let bands = false;
+  let source: SignalSource | null = null;
   for (const a of argv) {
     if (a === "--json") json = true;
+    else if (a === "--bands") bands = true;
+    else if (a.startsWith("--source=")) {
+      const v = a.slice(9).toUpperCase() as SignalSource;
+      if (!SIGNAL_SOURCES.includes(v)) {
+        console.error(`--source must be one of ${SIGNAL_SOURCES.join(", ")}`);
+        process.exit(2);
+      }
+      source = v;
+    }
     else if (a.startsWith("--split=")) split = a.slice(8);
     else if (a.startsWith("--folds=")) folds = Math.max(0, Number(a.slice(8)) || 0);
     else if (a.startsWith("--horizon=")) horizon = Math.max(1, Number(a.slice(10)) || DEFAULT_HORIZON);
@@ -67,7 +84,7 @@ function parseArgs(argv: string[]) {
     console.error(`--split must be YYYY-MM-DD, got: ${split}`);
     process.exit(2);
   }
-  return { split, folds, horizon, json };
+  return { split, folds, horizon, json, bands, source };
 }
 
 /** Every scored estimate joined to the session it describes and its forward return. */
@@ -127,7 +144,7 @@ function healthOf(obs: Observation[], source: string): SourceHealth {
 }
 
 async function main() {
-  const { split, folds, horizon, json } = parseArgs(process.argv.slice(2));
+  const { split, folds, horizon, json, bands, source } = parseArgs(process.argv.slice(2));
   const obs = await loadObservations(horizon);
   if (obs.length === 0) {
     console.log("No observations: no estimate has both a sessionDate and a full forward window yet.");
@@ -192,6 +209,43 @@ async function main() {
       });
       console.log(`  ${f.label}  ${parts.join("  ")}`);
     }
+  }
+
+  if (bands) {
+    const rollingBands = splitRolling(obs, folds);
+    const sources = source ? [source] : [...SIGNAL_SOURCES];
+    // k BEFORE judging: the verdict rule consumes it, so project the ledger forward
+    // without writing, judge, then fold the real verdicts in once. Same shape as the
+    // policy harness — see scripts/policy-compare.ts.
+    const today = new Date().toISOString().slice(0, 10);
+    const prior = readLedger();
+    const specs = sources.flatMap((src) =>
+      ENTRY_BANDS.filter((b) => !b.incumbent).map((b) => ({
+        kind: "band" as const,
+        id: `${b.id}/${src}`,
+        control: false,
+        horizon,
+        frame: "live",
+        split: cut,
+      }))
+    );
+    const k = reportK(recordRuns(prior, specs.map((sp) => ({ ...sp, verdict: "PENDING" })), today), "band", specs.length);
+
+    const reports: BandReport[] = sources.flatMap((src) =>
+      ENTRY_BANDS.map((band) =>
+        evaluateBand({ band, source: src, all: obs, train, holdout, folds: rollingBands, horizon, k })
+      )
+    );
+    for (const src of sources) console.log(`\n${formatBandReport(reports, src, k)}`);
+
+    const verdictOf = new Map(reports.filter((r) => !r.incumbent).map((r) => [`${r.id}/${r.source}`, r.verdict]));
+    const ledger = recordRuns(prior, specs.map((sp) => ({ ...sp, verdict: verdictOf.get(sp.id) ?? "?" })), today);
+    writeLedger(ledger);
+    console.log(`\n${formatLedgerNote(ledger, "band", k).join("\n")}`);
+    console.log(
+      "MATCHES is not a pass: a 12-name book that merely matches the universe is worse than holding the\n" +
+        "universe — same return, far more variance. Only BEATS is a result."
+    );
   }
 
   console.log(

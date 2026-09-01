@@ -17,6 +17,8 @@ const asWritten: RegisterFacts = {
   rmEntriesInWindow: 34,
   entryWindowDays: 30,
   insufficientQtyErrors: 0,
+  entriesAboveBand: 0,
+  entryScoreMax: 0.6,
 };
 
 const staleIds = (f: Partial<RegisterFacts>) =>

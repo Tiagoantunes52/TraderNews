@@ -2,6 +2,45 @@
   "version": 1,
   "entries": [
     {
+      "spec": "band-neutral-up/SENTIMENT@h5/live",
+      "kind": "band",
+      "id": "band-neutral-up/SENTIMENT",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2026-07-15"
+      ],
+      "lastVerdict": "MATCHES"
+    },
+    {
+      "spec": "band-no-strong/SENTIMENT@h5/live",
+      "kind": "band",
+      "id": "band-no-strong/SENTIMENT",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2026-07-15"
+      ],
+      "lastVerdict": "MATCHES"
+    },
+    {
+      "spec": "band-strong-only/SENTIMENT@h5/live",
+      "kind": "band",
+      "id": "band-strong-only/SENTIMENT",
+      "control": false,
+      "firstRun": "2026-08-31",
+      "lastRun": "2026-08-31",
+      "runs": 1,
+      "splits": [
+        "2026-07-15"
+      ],
+      "lastVerdict": "LAGS"
+    },
+    {
       "spec": "baseline@h5/close",
       "kind": "candidate",
       "id": "baseline",

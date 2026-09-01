@@ -954,6 +954,86 @@ against this corpus counts toward it, including one tried and abandoned. Add to 
 around it.
 
 
+## Entry bands, 2026-08-31 — the top bucket is genuinely bad, and dropping it only reaches the universe
+
+`npm run signal-split -- --bands --source=SENTIMENT`. Which slice of the score should
+open a position at all? SENTIMENT because that is what COMBINED_RM enters on
+(`combinedEntryUsesQuant: 0`, and the live `tradingConfig` overrides only
+`trailRatchetFrac`). The other two sources were deliberately NOT run: 6 more band specs
+would raise the noise floor for everything without being able to change the decision.
+
+**First, a correction to how the buckets were being read.** `signalHealth`'s per-bucket
+`tStat` is `tStatOneSample` **pooled across observations**, which the module's own comment
+marks as descriptive and overstated — a hundred names on one good session count as a
+hundred pieces of evidence when they are one. Sentiment's STRONG_BUY bucket reads
+**t = -3.74** that way and **t = -1.37** computed across sessions with Newey-West, which is
+the statistic the entry number has always used. Roughly 2.7x inflation. Nothing had ever
+gated on the bucket t, but it was being quoted as though it were a test.
+
+**Result** (58 entry sessions, split at the median session, 4 rolling folds, k=3):
+
+| band | ALL | TRAIN | HOLDOUT | folds+ | verdict |
+|---|---|---|---|---|---|
+| `band-current` (incumbent: BUY+STRONG_BUY) | -14.6 (t -0.54) | -7.6 (t +0.33) | **-19.3 (t -2.23)** | 1/4 | — |
+| `band-no-strong` (BUY only) | +8.6 (t +0.93) | +19.6 (t +0.96) | **+0.2 (t +0.44)** | 3/4 | MATCHES |
+| `band-strong-only` (control) | -79.5 (t -1.37) | -114.8 (t -0.54) | -63.8 (t -1.64) | 0/4 | LAGS |
+| `band-neutral-up` (NEUTRAL+BUY) | +16.7 (t +1.31) | +23.7 (t +0.65) | +11.8 (t +1.18) | 4/4 | MATCHES |
+
+Three things it establishes:
+
+1. **The STRONG_BUY effect replicates.** `band-strong-only` is negative in the full
+   window, in train, in holdout, and in 0 of 4 folds. That is the control doing its job:
+   the bad bucket is bad everywhere, not in one period.
+2. **Dropping it reaches the universe and stops there.** Holdout goes from **-19.3 bps to
+   +0.2 bps** — statistically indistinguishable from simply holding the 104 names. It ends
+   the bleeding; it is not an edge. And a 12-name book that merely matches the universe is
+   worse than holding the universe: same return, far more variance.
+3. **Nothing BEATS the universe.** `band-neutral-up` is the only band positive in every
+   period with 4 of 4 folds agreeing, and its holdout t is 1.18 against a floor of 2.00.
+   It is the best lead on the table and it is not a result.
+
+The incumbent's own holdout number is the sharpest argument for changing something:
+**-19.3 bps at t = -2.23**, i.e. the band currently traded is significantly *worse* than
+the universe out of sample.
+
+**Sample caveat, and it is the binding one.** 58 entry sessions, ~29 per half. The
+sentiment scores only exist from 2026-06-01, and the 120k stock-day research corpus is
+`PriceBar`-only, so **this cannot be tested on the big corpus** — no amount of care makes
+29 sessions decisive. Read the consistent SIGN across ALL/train/holdout/folds, which is
+what `band-strong-only` and `band-neutral-up` both have, and not any single t.
+
+Bands are recorded in `research-ledger.json` under the `band` kind, so `k` rises for
+every band tried, per family. Code: `src/lib/signal-band.ts` (pure, tested) +
+`--bands` in `scripts/signal-split.ts`.
+
+
+**SHIPPED 2026-08-31 anyway, and the reasoning matters.** `band-no-strong` verdicts
+MATCHES, and the tool's own rule says MATCHES is not a pass — so shipping it is a
+deliberate departure from that rule, on this argument: the bar for *removing* a component
+measured to lose is not the bar for *adding* one claimed to win. The incumbent band is
+-19.3 bps at t = -2.23 out of sample; `band-strong-only` is negative in every period and
+0 of 4 folds. Staying put is a measured loss, and the change removes it rather than
+betting on a new effect. It reaches the universe and no further, which is the honest
+description of what was bought.
+
+`entryScoreMax` (`RiskConfig`, default **0.6**, `PAPER_ENTRY_SCORE_MAX`, and a
+`TRADING_KNOBS` entry so it is revertible without a deploy). Shipped as a CODE DEFAULT,
+not a `tradingConfig` override, so the `knobs-single-ratchet-override` assertion above
+stays true. **Entry only** — a held position whose score climbs past the cap is not
+exited, the same entry/exit split `combinedEntryUsesQuant` uses, and for the same reason:
+the evidence is about what buying at the top does, not about holding through it.
+
+<!-- check: entry-band-in-force -->
+- **No `_RM` entry has opened above the cap since it shipped.** Checked against what the
+  book actually did rather than the config it was supposed to read, because a reverted
+  knob and a working one look identical from the code.
+
+**What this does NOT change:** `signalHealth` still reports the BUY+STRONG_BUY band, and
+should — it monitors the SIGNAL, not the book, and "is this source healthy" is a question
+about the whole bullish range. Expect the review's SENTIMENT entry figure to keep
+describing a wider band than the book now trades; that is the monitor working, not drift.
+
+
 ## Confirmed but deliberately deferred
 
 These are verified defects that lost the prioritisation, not open questions. They are

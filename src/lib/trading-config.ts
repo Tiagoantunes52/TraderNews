@@ -39,6 +39,7 @@ export type TradingKnobSpec = {
 export const TRADING_KNOBS: Record<TradingKnobKey, TradingKnobSpec> = {
   // ── Entry gates ──────────────────────────────────────────────────────────────
   entryScoreMin: { env: "PAPER_ENTRY_SCORE_MIN", def: DEFAULT_RISK_CONFIG.entryScoreMin, min: 0, max: 1, group: "entry", label: "Score required to open (deadband above the BUY line)" },
+  entryScoreMax: { env: "PAPER_ENTRY_SCORE_MAX", def: DEFAULT_RISK_CONFIG.entryScoreMax, min: 0, max: 1, group: "entry", label: "Score above which NOT to open (1 disables; 0.6 excludes STRONG_BUY, where the signal loses)" },
   minConfidence: { env: "PAPER_MIN_CONFIDENCE", def: DEFAULT_RISK_CONFIG.minConfidence, min: 0, max: 1, group: "entry", label: "Confidence floor for an entry" },
   combinedEntryUsesQuant: { env: "PAPER_COMBINED_ENTRY_QUANT", def: DEFAULT_RISK_CONFIG.combinedEntryUsesQuant, min: 0, max: 1, int: true, group: "entry", label: "COMBINED_RM entry reads the quant leg (0 = sentiment only; exits keep quant either way)" },
   // ── Sizing ───────────────────────────────────────────────────────────────────
