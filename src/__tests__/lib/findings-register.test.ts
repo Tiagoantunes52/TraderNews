@@ -19,6 +19,10 @@ const asWritten: RegisterFacts = {
   insufficientQtyErrors: 0,
   entriesAboveBand: 0,
   entryScoreMax: 0.6,
+  // Measured 2026-09-07: the capped articleCount drives most of the alert stream.
+  velocitySpikeAlerts: 1791,
+  alertsInWindow: 2785,
+  velocityWindowDays: 30,
 };
 
 const staleIds = (f: Partial<RegisterFacts>) =>
@@ -63,13 +67,39 @@ describe("auditFindingsRegister()", () => {
   });
 
   it("fires once articleCount exceeds the slice — i.e. once someone fixes the ordering", () => {
-    expect(staleIds({ maxArticleCount: ARTICLE_COUNT_SLICE + 1 })).toEqual(["article-count-capped"]);
+    expect(staleIds({ maxArticleCount: ARTICLE_COUNT_SLICE + 1 })).toEqual(["sentweight-range-unreachable"]);
   });
 
   it("names what else moves when that fix lands", () => {
     const [f] = auditFindingsRegister({ ...asWritten, maxArticleCount: 45 });
     expect(f.detail).toContain("sentWeight");
-    expect(f.detail).toContain("articleVelocityRatio");
+    // combinedScore drives the exits — the reason this one is deferred at all.
+    expect(f.detail).toContain("combinedScore");
+  });
+
+  // The bullet asserted in prose that `articleVelocityRatio` had "no reader"; by
+  // 2026-09-07 it was raising 1,791 of 2,785 alerts. The claim itself never broke, so
+  // nothing prompted an edit — the cost grew underneath a true sentence. Restating the
+  // blast radius daily is what closes that gap.
+  it("reports the alert share on the run where the claim still holds", () => {
+    const checked = auditFindingsRegister(asWritten).find((f) => f.code === "REGISTER_CHECKED")!;
+    expect(checked.detail).toContain("1791 of 2785 alerts in 30d (64%) are VELOCITY_SPIKE");
+    // The claim holds, so it must NOT also be reported as stale.
+    expect(staleIds({})).toEqual([]);
+  });
+
+  it("does not divide by zero on a day with no alerts at all", () => {
+    const checked = auditFindingsRegister({ ...asWritten, velocitySpikeAlerts: 0, alertsInWindow: 0 }).find(
+      (f) => f.code === "REGISTER_CHECKED"
+    )!;
+    expect(checked.detail).toContain("no alerts at all in 30d");
+  });
+
+  it("drops the note once the defect is fixed — the bullet is going away anyway", () => {
+    const findings = auditFindingsRegister({ ...asWritten, maxArticleCount: 45 });
+    const checked = findings.find((f) => f.code === "REGISTER_CHECKED")!;
+    expect(checked.detail).not.toContain("VELOCITY_SPIKE");
+    expect(checked.detail).toContain("Stale: sentweight-range-unreachable");
   });
 
   it("escalates the deferred unmanaged-positions defect from latent to active", () => {

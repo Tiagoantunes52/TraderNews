@@ -70,6 +70,11 @@ const REGISTER_STALE_MARK_DAYS = 4;
 // Trailing window for "did the _RM entry freeze drain?". 30 days is long enough that a
 // quiet fortnight doesn't re-assert a freeze that has ended.
 const REGISTER_ENTRY_WINDOW_DAYS = 30;
+// Trailing window for "what is the capped articleCount actually costing?". The register
+// asserted in prose that `articleVelocityRatio` had no consumer; by 2026-09-07 it was
+// driving the majority of all alerts. Re-deriving the blast radius daily is what stops
+// that claim rotting again — same 30 days as the entry window, so the two read alike.
+const REGISTER_VELOCITY_WINDOW_DAYS = 30;
 /**
  * When the entry band cap shipped. Entries are only judged against it from this date —
  * every position opened before it was opened under the old, uncapped rule and counting
@@ -522,7 +527,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
   // by being FIXED — surfaces as a prompt to edit the document, instead of sitting
   // there being trusted.
   try {
-    const [cfgRow, staleMarked, rmEntries, maxArticles, entriesAboveBand] = await Promise.all([
+    const [cfgRow, staleMarked, rmEntries, maxArticles, entriesAboveBand, velocityAlerts, allAlerts] = await Promise.all([
       db.appSetting.findUnique({ where: { key: "tradingConfig" }, select: { value: true } }),
       db.simPosition.count({
         where: { status: "OPEN", lastMarkDate: { lt: new Date(todayUTC.getTime() - REGISTER_STALE_MARK_DAYS * 86_400_000) } },
@@ -546,6 +551,19 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
           entryScore: { gt: cfg.entryScoreMax },
         },
       }),
+      // What the capped `articleCount` costs downstream. `articleVelocityRatio` divides
+      // an uncapped 24h count by the capped one, and feeds `detectVelocitySpike` — so
+      // these alerts are the defect's visible output, counted against the total so the
+      // finding can state the share rather than a bare number.
+      db.alert.count({
+        where: {
+          type: "VELOCITY_SPIKE",
+          createdAt: { gte: new Date(todayUTC.getTime() - REGISTER_VELOCITY_WINDOW_DAYS * 86_400_000) },
+        },
+      }),
+      db.alert.count({
+        where: { createdAt: { gte: new Date(todayUTC.getTime() - REGISTER_VELOCITY_WINDOW_DAYS * 86_400_000) } },
+      }),
     ]);
 
     const facts: RegisterFacts = {
@@ -558,6 +576,9 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       insufficientQtyErrors: (runLog?.errors ?? []).filter((e) => /insufficient qty/i.test(e)).length,
       entriesAboveBand,
       entryScoreMax: cfg.entryScoreMax,
+      velocitySpikeAlerts: velocityAlerts,
+      alertsInWindow: allAlerts,
+      velocityWindowDays: REGISTER_VELOCITY_WINDOW_DAYS,
     };
     findings.push(...auditFindingsRegister(facts));
   } catch (e) {

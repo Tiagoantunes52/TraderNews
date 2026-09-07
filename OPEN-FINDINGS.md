@@ -1042,45 +1042,88 @@ listed so they are not silently forgotten.
 - **Exits fire on NEUTRAL.** `isExitSignal = !isEntrySignal` (`paper-trading.ts:218`),
   so the book exits on NEUTRAL as well as SELL. Causes churn without a demonstrated
   edge.
-- **Env break-glass bypasses bounds validation.** `envValue()`
+- **Env break-glass bypasses bounds validation.** ~~`envValue()`
   (`trading-config.ts:127`) accepts any finite number, while DB-sourced overrides get
   range-checked and dropped on violation. A typo in an env var silently installs a
-  nonsensical risk parameter.
+  nonsensical risk parameter.~~
+
+  **FIXED 2026-09-07.** Both sources now go through one gate, `checkKnobValue`, so a
+  bound cannot be enforced on one path and skipped on the other. An invalid env var is
+  DROPPED (falling through to the DB override, then the default) and reported into
+  `ResolvedTradingConfig.issues`, which `pipeline/paper.ts` already pushes onto its
+  stage errors — so a break-glass that did not take effect now says so in the daily
+  review instead of being indistinguishable from one that worked. `envPinnedKnobs()`
+  reads through the same gate, so an invalid var no longer greys out the admin field it
+  is not actually controlling. Regression tests pin the two values the old path
+  installed live: `PAPER_STOP_LOSS_PCT=-0.3` and `PAPER_MAX_POSITIONS=12.5`.
 <!-- check: unmanaged-positions-latent -->
 - **Missing-fresh-estimate positions go unmanaged.** The paper stage loads only
   estimates dated today and only open positions for those stock ids, so a name without
   a fresh estimate is neither marked nor exited. Verified **zero occurrences in prod**
   (all 151 open positions marked 2026-07-24), so this is latent, not active — but
   unguarded.
-<!-- check: article-count-capped -->
-- **`articleCount` counts the LLM prompt, not the news** (traced 2026-07-31, deferred
-  by decision). `sentiment.ts:42-59` fetches the 20 most recent articles in a 7-day
-  window, dedupes by normalised headline, **`.slice(0, 10)`** to bound the prompt — and
-  only *then* sets `articleCount = uniqueArticles.length`. The slice is a legitimate
-  cost control; measuring after it is the defect. Over the window the median stock has
-  **45.5** articles (mean 93, max 1,076) and **91% exceed 10**, so for nine names in ten
-  the field is the constant 10. Three consequences:
+<!-- check: sentweight-range-unreachable -->
+- **`articleCount` counts the LLM prompt, not the news** (traced 2026-07-31; velocity
+  half FIXED 2026-09-07, `sentWeight` half still open). `sentiment.ts:42-59` fetches the
+  20 most recent articles in a 7-day window, dedupes by normalised headline,
+  **`.slice(0, 10)`** to bound the prompt — and only *then* sets
+  `articleCount = uniqueArticles.length`. Over the window the median stock has **40**
+  articles (max 736) and **100 of 110 names exceed 10**, so for nine names in ten the
+  field is the constant 10.
 
-  1. `sentWeight = min(0.3 + articleCount/15 × 0.3, 0.6)` (`estimate.ts:139`) is built
-     to reach 0.6 at 15 articles. It **cannot exceed 0.5**, and 88% of rows sit there —
-     the top third of the designed range is dead code and the "dynamic" blend is nearly
-     a constant.
-  2. The `articleCount >= 10 → confidence +0.15` bump fires when the **slice hit its
-     cap**, not when a name is newsworthy. 1,076 articles and exactly 10 are
-     indistinguishable.
-  3. `articleVelocityRatio = last24hCount / (articleCount / 7)` divides an **uncapped**
-     count by a **capped** one, so for 91% of names the denominator is a fixed 1.43/day.
-     Observed median **3.50**, max 196, and **3,177 of 4,787 rows read above 2×** — two
-     thirds of all estimates permanently look like a news spike. Currently persisted but
-     **not consumed anywhere**, so it is a corrupted field awaiting its first reader
-     rather than something distorting trades today.
+  **What the 2026-09-07 consumer audit changed about this bullet.** The defect was
+  described as one bug with three consequences. It is not: `articleCount` conflates two
+  quantities — *headlines the LLM actually scored* and *how much news exists* — and of
+  the six consumers, **four already receive the one they want**:
 
-  **The fix is to count before the slice** — two lines. Deferred deliberately: it moves
-  `sentWeight` for essentially every name, which shifts `combinedScore`, which since
-  2026-07-31 drives `COMBINED_RM`'s **exits**. Entry weighting changed the same day, and
-  the exits are the one component measured to be working (-2.97% post-exit drift excess
-  over SPY). Changing both in one week makes neither measurable. Revisit once the entry
-  change has a few weeks of closes behind it.
+  | Consumer | Wants | Status |
+  |---|---|---|
+  | `sentiment-blend.ts:34` `llmWeight = llmConfidence × log1p(n)` | evidence behind the score | ✅ correct — the score WAS produced from those headlines |
+  | `insights` sentiment weighting | evidence behind the score | ✅ correct, same reading |
+  | `estimate.ts:151` `n < 3` confidence penalty | news volume | ✅ **equivalent** — the slice only binds from 10 up, so this fires exactly when volume < 3 |
+  | `estimate.ts:171` `n >= 10` confidence bump | newsworthiness | ✅ **equivalent** — `articleCount` reaches 10 exactly when the window held ≥10. The cap costs it DEGREE, not the threshold |
+  | `estimate.ts:136` velocity denominator | news volume | ❌ **was broken — FIXED 2026-09-07** |
+  | `estimate.ts:139` `sentWeight` | evidence behind the score | ⚠️ **input correct, curve miscalibrated — still open** |
+
+  Note what this corrects: the earlier framing said the `>= 10` bump "fires when the
+  slice hit its cap, not when a name is newsworthy". Those are the same event. The bump
+  is fine.
+
+  **FIXED — the velocity denominator.** `articleVelocityRatio = last24hCount / (n / 7)`
+  divided an **uncapped** numerator by a **capped** denominator — two different units as
+  well as a cap — pinning the divisor at a constant 1.43/day for ~90% of names.
+  Measured before the fix: **56.6% of estimate rows (5,079 / 8,967)** sat above the 2.5×
+  alert threshold, and `VELOCITY_SPIKE` accounted for **1,791 of the 2,785 alerts raised
+  in 30 days — 64% of the entire alert stream**, ~60/day. The denominator is now its own
+  7-day `ArticleStock` aggregate in `estimate.ts`, the same unit as the numerator.
+  De-duplication was measured and skipped: normalising the 7-day corpus removes **0 of
+  8,613 links across all 110 stocks**, so a plain count is exact and costs one aggregate
+  rather than shipping every headline. The ratio itself moved to a pure
+  `newsVelocityRatio()` in `lib/alerts` beside the detector it feeds — the unit-matching
+  rule is the reason it is a function rather than an expression at the call site.
+
+  **Replayed against the real corpus**, Friday 2026-09-04 near the close: the old
+  denominator would have alerted on **77 of 110 names (70%)** with a mean ratio of
+  **9.23**; the corrected one alerts on **5 (4.5%)** with a mean of **1.15**. A
+  "today vs an average day" ratio should centre on 1.0, and now does — while the top
+  reading, 3.0×, still clears the threshold, so genuine surges survive. `REGISTER_CHECKED`
+  reports the alert share daily, so the fix is verified in production rather than assumed.
+
+  **STILL OPEN — `sentWeight`.** `sentWeight = min(0.3 + n/15 × 0.3, 0.6)` is written to
+  reach 0.6 at 15 and its input cannot exceed 10, so it tops out at **0.5** and the last
+  third of its designed range is unreachable. The input is not the bug — this weights the
+  sentiment leg by the evidence that produced the sentiment score, which is exactly the
+  capped count. **The curve is calibrated for a domain it does not have.**
+
+  Feeding it true volume is NOT the fix: measured 2026-09-07 that saturates **93 of 110
+  names at the 0.6 cap** and lifts the mean from 0.494 to 0.580 — one near-constant
+  traded for another, at the opposite end of the range. Either way it moves
+  `combinedScore` for essentially every name, and `combinedScore` drives `COMBINED_RM`'s
+  **exits** — the one component measured to be working (-2.97% post-exit drift excess
+  over SPY). So the remaining half is a **rescaling question for the backtest track**,
+  not a plumbing fix, and it is deferred on that basis rather than on the original
+  "don't move two things in one week" timing argument, which has expired.
+
 
 ---
 

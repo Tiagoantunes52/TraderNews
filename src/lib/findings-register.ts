@@ -49,6 +49,19 @@ export type RegisterFacts = {
    * register's bullet is out of date.
    */
   maxArticleCount: number;
+  /**
+   * `VELOCITY_SPIKE` alerts raised in the trailing `velocityWindowDays`, against every
+   * alert raised in the same window. These measure what the capped `articleCount` COSTS:
+   * `articleVelocityRatio` divides an uncapped 24h count by the capped one, so its
+   * denominator is a near-constant and the ratio reads high for most names. The register
+   * once asserted in prose that the field had no consumer — it acquired one, and nothing
+   * noticed. Carried as facts so the blast radius is re-derived daily instead of stated,
+   * and — since the denominator was fixed on 2026-09-07 — so that the fix's effect on the
+   * alert stream is observed rather than assumed.
+   */
+  velocitySpikeAlerts: number;
+  alertsInWindow: number;
+  velocityWindowDays: number;
 };
 
 export type RegisterAssertion = {
@@ -58,7 +71,14 @@ export type RegisterAssertion = {
   section: string;
   /** The claim, close to verbatim — a finding is only actionable if it quotes what it broke. */
   claim: string;
-  check: (f: RegisterFacts) => { holds: boolean; detail: string };
+  /**
+   * `detail` explains a BROKEN claim. `note` is for a claim that still holds but whose
+   * consequences are worth restating every day — a deferred defect whose blast radius
+   * can grow while the claim itself stays true. Without it the only way a holding
+   * assertion says anything is by breaking, which is how "articleVelocityRatio is not
+   * consumed anywhere" stayed in the register long after it acquired a consumer.
+   */
+  check: (f: RegisterFacts) => { holds: boolean; detail: string; note?: string };
 };
 
 /**
@@ -69,6 +89,19 @@ export type RegisterAssertion = {
 
 /** The `.slice(0, 10)` in `sentiment.ts` that caps `articleCount`. */
 export const ARTICLE_COUNT_SLICE = 10;
+
+/**
+ * How much of the alert stream `VELOCITY_SPIKE` is driving, as a sentence.
+ *
+ * Was the blast radius of the capped denominator (64% of all alerts on 2026-09-07);
+ * since the fix it is the verification that the denominator really did change in prod.
+ * Separate from the assertion so the arithmetic (and its zero cases) is testable.
+ */
+function velocityShare(f: RegisterFacts): string {
+  if (f.alertsInWindow === 0) return `no alerts at all in ${f.velocityWindowDays}d.`;
+  const pct = Math.round((f.velocitySpikeAlerts / f.alertsInWindow) * 100);
+  return `${f.velocitySpikeAlerts} of ${f.alertsInWindow} alerts in ${f.velocityWindowDays}d (${pct}%) are VELOCITY_SPIKE, raised off the corrupted ratio.`;
+}
 
 export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
   {
@@ -118,19 +151,28 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
     }),
   },
   {
-    id: "article-count-capped",
+    // Was `article-count-capped`, retired 2026-09-07 when the velocity half was fixed.
+    // Its check — `maxArticleCount <= ARTICLE_COUNT_SLICE` — could no longer tell a
+    // defect from a design: `articleCount` is now DEFINED as the post-slice count and
+    // stays at 10 on purpose, so the old assertion would have held for ever while
+    // claiming something that was no longer true. Same fact, re-pointed at the half that
+    // is still open.
+    id: "sentweight-range-unreachable",
     section: "Confirmed but deliberately deferred",
-    claim: "`articleCount` counts the LLM prompt, not the news — capped at 10 by a slice that runs before the count.",
+    claim:
+      "`sentWeight` is written to reach 0.6 at 15 articles, but its input is capped at 10 — it tops out at 0.5 and the top third of its designed range is unreachable.",
     check: (f) => ({
-      // Deliberately inverted relative to the "too few samples" assertions: this one
-      // holds while the DEFECT is live, so it goes stale by being FIXED. That is the
-      // point — the prompt to delete the bullet should arrive when the code changes,
-      // not when someone happens to re-read the register.
+      // Holds while the DEFECT is live, so it goes stale by being FIXED — either by
+      // rescaling the curve to the domain it actually has, or by moving the cap.
       holds: f.maxArticleCount <= ARTICLE_COUNT_SLICE,
       detail:
         f.maxArticleCount > ARTICLE_COUNT_SLICE
-          ? `articleCount now reaches ${f.maxArticleCount}, above the slice of ${ARTICLE_COUNT_SLICE} — the count/slice ordering was fixed. Delete this bullet, and re-read anything derived from sentWeight, the confidence bump or articleVelocityRatio, all of which now move.`
-          : `max articleCount ${f.maxArticleCount} ≤ slice ${ARTICLE_COUNT_SLICE}; defect still live.`,
+          ? `articleCount now reaches ${f.maxArticleCount}, above the slice of ${ARTICLE_COUNT_SLICE}, so sentWeight can pass 0.5 — the curve or the cap moved. Delete this bullet and re-read combinedScore, which drives COMBINED_RM's exits.`
+          : `max articleCount ${f.maxArticleCount} ≤ slice ${ARTICLE_COUNT_SLICE}; sentWeight still tops out at ${(0.3 + (ARTICLE_COUNT_SLICE / 15) * 0.3).toFixed(2)}.`,
+      // The velocity denominator was fixed on 2026-09-07; this reports what the alert
+      // stream does afterwards. A share that has not fallen means the fix did not land
+      // in production — the one thing a green deploy cannot tell you on its own.
+      note: `Post-fix alert check: ${velocityShare(f)}`,
     }),
   },
   {
@@ -186,7 +228,11 @@ export const REGISTER_ASSERTIONS: RegisterAssertion[] = [
  */
 export function auditFindingsRegister(facts: RegisterFacts): Finding[] {
   const out: Finding[] = [];
-  const stale = REGISTER_ASSERTIONS.map((a) => ({ a, r: a.check(facts) })).filter(({ r }) => !r.holds);
+  const checked = REGISTER_ASSERTIONS.map((a) => ({ a, r: a.check(facts) }));
+  const stale = checked.filter(({ r }) => !r.holds);
+  // Notes ride on claims that HOLD — a stale one already has its own finding, and
+  // repeating the note there would bury the thing that actually needs editing.
+  const notes = checked.filter(({ r }) => r.holds && r.note).map(({ r }) => r.note!);
 
   for (const { a, r } of stale) {
     out.push({
@@ -202,9 +248,12 @@ export function auditFindingsRegister(facts: RegisterFacts): Finding[] {
     severity: "info",
     code: "REGISTER_CHECKED",
     title: `${REGISTER_ASSERTIONS.length - stale.length}/${REGISTER_ASSERTIONS.length} register claims still hold`,
-    detail: stale.length
-      ? `Stale: ${stale.map(({ a }) => a.id).join(", ")}. Each has its own finding above.`
-      : "Every mechanically checkable claim in OPEN-FINDINGS.md was re-verified against production today.",
+    detail: [
+      stale.length
+        ? `Stale: ${stale.map(({ a }) => a.id).join(", ")}. Each has its own finding above.`
+        : "Every mechanically checkable claim in OPEN-FINDINGS.md was re-verified against production today.",
+      ...notes,
+    ].join(" "),
     refs: { checked: REGISTER_ASSERTIONS.length, stale: stale.length },
   });
 

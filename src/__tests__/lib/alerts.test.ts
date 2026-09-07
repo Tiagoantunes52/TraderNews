@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   detectSignalChange,
   detectVelocitySpike,
+  newsVelocityRatio,
   detectRsiCross,
   detectDrawdownBreach,
   detectOrderFailures,
@@ -47,6 +48,45 @@ describe("detectSignalChange", () => {
   it("ignores unknown signal labels", () => {
     expect(detectSignalChange("AAPL", "WAT", "BUY")).toBeNull();
     expect(detectSignalChange("AAPL", "BUY", "WAT")).toBeNull();
+  });
+});
+
+describe("newsVelocityRatio", () => {
+  it("compares today against the window's daily average", () => {
+    // 70 articles over 7 days = 10/day; 30 today is 3x that.
+    expect(newsVelocityRatio(30, 70, 7)).toBe(3);
+  });
+
+  it("is 1 when today matches the average — the no-news-is-happening case", () => {
+    expect(newsVelocityRatio(10, 70, 7)).toBe(1);
+  });
+
+  it("returns null with no baseline rather than reading as a spike", () => {
+    expect(newsVelocityRatio(5, 0, 7)).toBeNull();
+    expect(newsVelocityRatio(0, 0, 7)).toBeNull();
+    expect(newsVelocityRatio(5, 70, 0)).toBeNull();
+    expect(newsVelocityRatio(5, Number.NaN, 7)).toBeNull();
+  });
+
+  // The defect this function exists to prevent: a denominator capped at 10 while the
+  // numerator counts everything. On a name with a week of ordinary coverage the honest
+  // ratio is ~1, and the capped one clears the 2.5x alert threshold three times over.
+  it("does not manufacture a spike from ordinary coverage", () => {
+    const volume7d = 78; // prod average per stock, measured 2026-09-07
+    const today = 11; // slightly above the 11.1/day average — not a spike
+    expect(newsVelocityRatio(today, volume7d, 7)).toBeCloseTo(0.99, 2);
+    expect(detectVelocitySpike("AAPL", newsVelocityRatio(today, volume7d, 7))).toBeNull();
+    // What the capped denominator produced for the same day:
+    const capped = newsVelocityRatio(today, 10, 7)!;
+    expect(capped).toBeCloseTo(7.7, 1);
+    expect(detectVelocitySpike("AAPL", capped)).not.toBeNull();
+  });
+
+  it("still reports a genuine surge", () => {
+    // A quiet name (7 over the week = 1/day) that suddenly gets 20 in a day.
+    const ratio = newsVelocityRatio(20, 7, 7);
+    expect(ratio).toBe(20);
+    expect(detectVelocitySpike("QUIET", ratio)).not.toBeNull();
   });
 });
 
