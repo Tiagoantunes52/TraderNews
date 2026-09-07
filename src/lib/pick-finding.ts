@@ -11,7 +11,8 @@
 //      reconciliation, or strategy-tuning findings. These are surfaced by NON_CODE_CODES
 //      below and belong to an operator or (for tuning) the backtest track, not a code PR.
 //   2. It's already being handled — an open or recently-closed auto-improve PR exists
-//      for that code (the caller passes those codes in).
+//      for that code, or a previous run looked at it and declined to open one (the
+//      caller passes those codes in; improve.yml collects both).
 //
 // One finding per run keeps each PR small and reviewable.
 
@@ -21,8 +22,9 @@ import { type Finding, type Severity } from "@/lib/daily-review";
  * Finding codes the agent must NOT open a code PR for. Everything here is either an
  * operational/data condition (nothing to fix in code — a pipeline didn't run, inputs
  * were missing), a live/sim broker reconciliation drift (fixed by operating the
- * account, not editing code), or an `info` strategy-tuning signal (owned by the
- * backtest-gated tuning track, never an LLM code edit). Any code NOT listed here —
+ * account, not editing code), or a strategy signal (owned by the backtest-gated tuning
+ * track, never an LLM code edit) — regardless of the severity it carries. Any code NOT
+ * listed here —
  * the REPLAY_*, EXIT_*, ENTRY_*, REALIZED_PNL_MISMATCH, MISSED_EXIT correctness
  * findings, plus BROKER_ORDER_REJECTED and QUOTE_SYMBOL_INVALID — is a genuine code
  * bug and is eligible.
@@ -69,6 +71,14 @@ export const NON_CODE_CODES: ReadonlySet<string> = new Set([
   "TUNE_TRAIL_DISTANCE",
   "TUNE_DECAY_RUNS",
   "NEGATIVE_EXPECTANCY",
+  // The entry signal stopped paying (auditSignalHealth). Same class as the TUNE_* codes
+  // above — a strategy fact, not a system fault — but it arrives as `warn`, so without
+  // this line it reads as an eligible bug. It isn't: signal-health.ts exists to warn
+  // against exactly the edit an agent would reach for ("never as licence to flip a
+  // weight — that shortcut has already been tried here and failed out of sample"), so
+  // every run that picked it spent a model call to be told no. The answer is a
+  // human-run train/test split via `npm run signal-split`, not a PR.
+  "SIGNAL_INVERTED",
 ]);
 
 // Same worst-first ordering the review email uses (rankFindings): fail before warn.

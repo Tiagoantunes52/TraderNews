@@ -62,6 +62,28 @@ describe("pickFinding", () => {
     expect(pickFinding([f("warn", "STAGE_ERROR")], [])).toBeNull();
   });
 
+  // The signal-health monitor emits SIGNAL_INVERTED at `warn`, so it read as an eligible
+  // bug and won the tie-break in every report that carried it: 13 consecutive scheduled
+  // runs picked it, and the agent correctly refused each time — the module it points at
+  // says in its own header never to flip a weight off one window. It is a strategy fact,
+  // like the TUNE_* codes, and belongs to `npm run signal-split`, not to a PR.
+  it("never picks the entry-signal inversion warning", () => {
+    expect(pickFinding([f("warn", "SIGNAL_INVERTED")], [])).toBeNull();
+    // The warns from the 2026-09-04 report, with LIVE_TRACKING_ERROR handled by its open
+    // PR as it was that day: nothing is left to do, which is the honest answer.
+    const report = [
+      f("warn", "BROKER_POSITIONS_MISSING"),
+      f("warn", "LIVE_TRACKING_ERROR"),
+      f("warn", "SIGNAL_INVERTED"),
+      f("info", "SIGNAL_HEALTH"),
+    ];
+    expect(pickFinding(report, ["LIVE_TRACKING_ERROR"])).toBeNull();
+    // …and the exclusion still yields to a real bug rather than masking one.
+    expect(pickFinding([...report, f("warn", "MISSED_EXIT")], ["LIVE_TRACKING_ERROR"])?.code).toBe(
+      "MISSED_EXIT"
+    );
+  });
+
   it("does not mutate the input array", () => {
     const findings = [f("warn", "B_WARN"), f("fail", "A_FAIL")];
     const before = findings.map((x) => x.code);

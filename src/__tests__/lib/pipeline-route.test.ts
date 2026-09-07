@@ -1,3 +1,12 @@
+// @vitest-environment node
+//
+// Node environment, not the jsdom default: this suite pulls in `lib/pipeline` →
+// `lib/observability` → `@sentry/nextjs`, whose vendored orchestrion webpack shim
+// branches on `typeof document`. Under jsdom it takes the BROWSER branch, resolves
+// its loader path against `document.baseURI` (an http: URL) and dies in
+// `fileURLToPath` with "The URL must be of scheme file" before a single test runs.
+// Nothing here touches the DOM, and the real server runtime has no `document` either,
+// so `node` is both the fix and the honest environment for this file.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { stageRoute } from "@/lib/pipeline-route";
 
