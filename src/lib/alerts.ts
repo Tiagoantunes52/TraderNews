@@ -79,6 +79,29 @@ export function detectSignalChange(
 }
 
 /**
+ * Today's coverage against the daily average over a trailing window.
+ *
+ * BOTH counts must be measured the same way. Until 2026-09-07 they were not: the
+ * numerator was an uncapped `ArticleStock` count and the denominator was
+ * `Sentiment.articleCount`, the post-slice count of what the LLM was shown, capped at
+ * 10. That pinned the divisor at ~1.43/day for nine names in ten, so 56.6% of rows read
+ * above the 2.5x threshold and `VELOCITY_SPIKE` became 64% of the entire alert stream.
+ * A ratio is only meaningful when its two sides are the same unit, which is the whole
+ * reason this is a function rather than an expression at the call site.
+ *
+ * Returns null when the window is empty — no baseline means no ratio, not a spike.
+ */
+export function newsVelocityRatio(
+  last24hCount: number,
+  windowCount: number,
+  windowDays: number
+): number | null {
+  if (!Number.isFinite(last24hCount) || !Number.isFinite(windowCount) || windowDays <= 0) return null;
+  if (windowCount <= 0) return null;
+  return last24hCount / (windowCount / windowDays);
+}
+
+/**
  * Fires when article velocity (today's count vs. recent average) meets or
  * exceeds the threshold — an unusual surge in coverage.
  */

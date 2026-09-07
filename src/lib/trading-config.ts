@@ -7,9 +7,11 @@
 // editable from the admin page without a redeploy.
 //
 // Per-field precedence: env var (break-glass, wins if set) > DB override > code
-// default. Out-of-bounds / unknown / non-numeric DB values are DROPPED with an
-// issue string (never clamped — a typo like `stopLossPct: 8` meaning 8% must not
-// silently become a 50% stop), so a bad write degrades to the next layer.
+// default. Out-of-bounds / unknown / non-numeric values are DROPPED with an issue
+// string (never clamped — a typo like `stopLossPct: 8` meaning 8% must not silently
+// become a 50% stop), so a bad value degrades to the next layer. That rule binds every
+// source: the env break-glass skipped the bounds until 2026-09-07, which meant the
+// layer with the highest precedence was the one layer nothing checked.
 //
 // TRADING_KNOBS is the single source of truth: bounds, env names, and the admin-UI
 // grouping all render from it, and a unit test pins it to DEFAULT_RISK_CONFIG /
@@ -80,6 +82,29 @@ export const TRADING_KNOB_KEYS = Object.keys(TRADING_KNOBS) as TradingKnobKey[];
 export type TradingOverrides = Partial<Record<TradingKnobKey, number>>;
 
 /**
+ * Check ONE candidate value against a knob's spec.
+ *
+ * The single gate every source goes through — DB overrides and the env break-glass
+ * alike. It exists as a shared function rather than an inlined check because the two
+ * paths drifted: the env reader only ever tested `Number.isFinite`, so bounds and the
+ * integer rule were enforced on the DB path and skipped on the one with the HIGHEST
+ * precedence. `label` names the value the way the operator wrote it (the knob key for
+ * a DB override, the env var name for a break-glass), so the issue points at the thing
+ * they need to go and edit.
+ */
+function checkKnobValue(
+  label: string,
+  spec: TradingKnobSpec,
+  raw: unknown
+): { value: number } | { issue: string } {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (typeof raw === "boolean" || !Number.isFinite(n)) return { issue: `${label}: not a number` };
+  if (spec.int && !Number.isInteger(n)) return { issue: `${label}: must be an integer` };
+  if (n < spec.min || n > spec.max) return { issue: `${label}: ${n} outside [${spec.min}, ${spec.max}]` };
+  return { value: n };
+}
+
+/**
  * Validate a candidate overrides object (from the DB row or an admin PATCH).
  * Unknown keys, non-finite numbers, out-of-bounds values, and non-integers on
  * integer knobs are dropped and reported — never clamped or guessed at.
@@ -97,20 +122,12 @@ export function validateTradingOverrides(value: unknown): { overrides: TradingOv
       issues.push(`${key}: unknown knob`);
       continue;
     }
-    const n = typeof raw === "number" ? raw : Number(raw);
-    if (typeof raw === "boolean" || !Number.isFinite(n)) {
-      issues.push(`${key}: not a number`);
+    const checked = checkKnobValue(key, spec, raw);
+    if ("issue" in checked) {
+      issues.push(checked.issue);
       continue;
     }
-    if (spec.int && !Number.isInteger(n)) {
-      issues.push(`${key}: must be an integer`);
-      continue;
-    }
-    if (n < spec.min || n > spec.max) {
-      issues.push(`${key}: ${n} outside [${spec.min}, ${spec.max}]`);
-      continue;
-    }
-    overrides[key as TradingKnobKey] = n;
+    overrides[key as TradingKnobKey] = checked.value;
   }
   return { overrides, issues };
 }
@@ -125,39 +142,69 @@ export function parseTradingOverrides(raw: string | null | undefined): { overrid
   }
 }
 
-// A validly set env var for the knob (break-glass override; unset/empty/NaN = no).
-function envValue(spec: TradingKnobSpec): number | undefined {
+/**
+ * A validly set env var for the knob (break-glass override; unset/empty = no).
+ *
+ * Held to the SAME bounds as a DB override. Being the break-glass makes this stricter,
+ * not looser: it outranks every other source, so an unchecked value here is the one
+ * that reaches the book. A violation is dropped (falling through to the DB override,
+ * then the default) and reported, exactly as the module header requires — "a typo like
+ * `stopLossPct: 8` meaning 8% must not silently become a 50% stop" is not a rule about
+ * where the number came from.
+ */
+function envValue(spec: TradingKnobSpec, issues: string[]): number | undefined {
   const raw = process.env[spec.env];
   if (raw == null || raw === "") return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : undefined;
+  const checked = checkKnobValue(spec.env, spec, raw);
+  if ("issue" in checked) {
+    issues.push(checked.issue);
+    return undefined;
+  }
+  return checked.value;
 }
 
-function resolveKnob(key: TradingKnobKey, overrides: TradingOverrides): number {
+function resolveKnob(key: TradingKnobKey, overrides: TradingOverrides, issues: string[]): number {
   const spec = TRADING_KNOBS[key];
-  return envValue(spec) ?? overrides[key] ?? spec.def;
+  return envValue(spec, issues) ?? overrides[key] ?? spec.def;
 }
 
 export type ResolvedTradingConfig = {
   risk: RiskConfig;
   limits: RiskLimits;
-  issues: string[]; // validation problems with the stored overrides (fell back per-field)
+  issues: string[]; // validation problems from EITHER source — stored override or env (fell back per-field)
 };
 
-/** Pure per-field merge: env var > DB override > code default. */
+/**
+ * Pure per-field merge: env var > DB override > code default.
+ *
+ * `issues` accumulates problems from BOTH sources — the stored-override issues handed
+ * in by the caller, plus any env break-glass dropped here. The paper stage pushes the
+ * result into its stage errors (`pipeline/paper.ts`), so a knob that failed validation
+ * surfaces in the daily review instead of being silently absent: an operator who set a
+ * break-glass needs to learn that it did NOT take effect, or they will read the book's
+ * behaviour as evidence about a parameter that was never applied.
+ */
 export function resolveTradingConfig(overrides: TradingOverrides, issues: string[] = []): ResolvedTradingConfig {
+  // Copied, not appended to in place — callers pass an array they still own, and this
+  // function is pure enough elsewhere that mutating it would be a surprise.
+  const all = [...issues];
   const risk = Object.fromEntries(
-    (Object.keys(DEFAULT_RISK_CONFIG) as (keyof RiskConfig)[]).map((k) => [k, resolveKnob(k, overrides)])
+    (Object.keys(DEFAULT_RISK_CONFIG) as (keyof RiskConfig)[]).map((k) => [k, resolveKnob(k, overrides, all)])
   ) as RiskConfig;
   const limits = Object.fromEntries(
-    (Object.keys(DEFAULT_RISK_LIMITS) as (keyof RiskLimits)[]).map((k) => [k, resolveKnob(k, overrides)])
+    (Object.keys(DEFAULT_RISK_LIMITS) as (keyof RiskLimits)[]).map((k) => [k, resolveKnob(k, overrides, all)])
   ) as RiskLimits;
-  return { risk, limits, issues };
+  return { risk, limits, issues: all };
 }
 
-/** Knobs currently pinned by an env var (the DB override is ignored for these). */
+/**
+ * Knobs currently pinned by an env var (the DB override is ignored for these).
+ *
+ * An INVALID env var is not a pin: it is dropped, so the DB override is what actually
+ * applies and the admin page must not grey the field out as env-controlled.
+ */
 export function envPinnedKnobs(): TradingKnobKey[] {
-  return TRADING_KNOB_KEYS.filter((k) => envValue(TRADING_KNOBS[k]) !== undefined);
+  return TRADING_KNOB_KEYS.filter((k) => envValue(TRADING_KNOBS[k], []) !== undefined);
 }
 
 /**

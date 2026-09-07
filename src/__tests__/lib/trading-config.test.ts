@@ -116,4 +116,70 @@ describe("resolveTradingConfig() precedence", () => {
   it("passes stored-value issues through for the stage to surface", () => {
     expect(resolveTradingConfig({}, ["stopLossPct: 8 outside [0.01, 0.5]"]).issues).toHaveLength(1);
   });
+
+  // The break-glass used to be the ONE path that skipped the bounds — it checked only
+  // `Number.isFinite`, while outranking both the DB override and the default. A typo'd
+  // env var installed a nonsensical parameter with nothing said about it.
+  describe("env break-glass is held to the same bounds as a DB override", () => {
+    const withEnv = (name: string, value: string, fn: () => void) => {
+      const prev = process.env[name];
+      try {
+        process.env[name] = value;
+        fn();
+      } finally {
+        if (prev === undefined) delete process.env[name];
+        else process.env[name] = prev;
+      }
+    };
+
+    it("drops an out-of-bounds env value, reports it, and falls through", () => {
+      withEnv("PAPER_STOP_LOSS_PCT", "-0.3", () => {
+        const { risk, issues } = resolveTradingConfig({ stopLossPct: 0.1 });
+        expect(risk.stopLossPct).toBe(0.1); // the DB override applies, not -0.3
+        expect(issues).toEqual(["PAPER_STOP_LOSS_PCT: -0.3 outside [0.01, 0.5]"]);
+        // …and the admin page must not grey the field out as env-controlled.
+        expect(envPinnedKnobs()).not.toContain("stopLossPct");
+      });
+    });
+
+    it("drops a non-integer on an integer knob", () => {
+      withEnv("PAPER_MAX_POSITIONS", "12.5", () => {
+        const { limits, issues } = resolveTradingConfig({});
+        expect(limits.maxPositions).toBe(DEFAULT_RISK_LIMITS.maxPositions);
+        expect(issues).toEqual(["PAPER_MAX_POSITIONS: must be an integer"]);
+      });
+    });
+
+    it("reports an unparsable env value instead of dropping it silently", () => {
+      withEnv("PAPER_DECAY_RUNS", "banana", () => {
+        const { risk, issues } = resolveTradingConfig({ decayRuns: 9 });
+        expect(risk.decayRuns).toBe(9);
+        expect(issues).toEqual(["PAPER_DECAY_RUNS: not a number"]);
+      });
+    });
+
+    it("still accepts a valid in-bounds env value with no issue raised", () => {
+      withEnv("PAPER_RISK_PER_TRADE", "250", () => {
+        const { risk, issues } = resolveTradingConfig({ riskPerTrade: 100 });
+        expect(risk.riskPerTrade).toBe(250);
+        expect(issues).toEqual([]);
+        expect(envPinnedKnobs()).toContain("riskPerTrade");
+      });
+    });
+
+    it("reports each bad knob once, not once per resolve pass", () => {
+      withEnv("PAPER_MAX_POSITIONS", "0.5", () => {
+        expect(resolveTradingConfig({}).issues).toHaveLength(1);
+      });
+    });
+
+    it("does not mutate the issues array the caller handed in", () => {
+      withEnv("PAPER_DECAY_RUNS", "banana", () => {
+        const caller: string[] = [];
+        const { issues } = resolveTradingConfig({}, caller);
+        expect(issues).toHaveLength(1);
+        expect(caller).toHaveLength(0);
+      });
+    });
+  });
 });
