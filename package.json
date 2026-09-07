@@ -74,6 +74,7 @@
     "postcss": "^8.5.15",
     "find-my-way": "^9.7.0",
     "valibot": "^1.4.2",
-    "deepmerge-ts": "^8.0.2"
+    "deepmerge-ts": "^8.0.2",
+    "mysql2": "^3.24.3"
   }
 }

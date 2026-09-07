@@ -21,6 +21,7 @@ concurrency:
 permissions:
   contents: write        # the action commits the fix to a branch
   pull-requests: write   # …and opens the PR
+  issues: write          # …and the workflow files a marker issue when the agent declines
   id-token: write        # OIDC exchange for the Claude GitHub App token (required for the
                          # default GitHub auth — see anthropics/claude-code-action FAQ)
 
@@ -68,8 +69,15 @@ jobs:
 
       # Codes already covered by an open auto-improve PR, or one closed within 14 days —
       # so we neither duplicate in-flight work nor immediately re-PR a just-merged/closed fix.
-      # The DEFAULT token is fine here — this only READS PRs. It is deliberately NOT set
-      # job-wide: if it leaked into the agent's shell, a PR opened by `gh` under the
+      #
+      # Declines count too. A finding the agent looks at and refuses produces NO PR, so a
+      # PR-only view of "handled" learns nothing and re-picks the same code tomorrow: that
+      # is how SIGNAL_INVERTED was chosen on 13 consecutive runs, each one paying for the
+      # same reasoned refusal. The "Record a declined finding" step below writes an issue
+      # for those, and they expire on the same 14-day clock.
+      #
+      # The DEFAULT token is fine here — this only READS PRs and issues. It is deliberately
+      # NOT set job-wide: if it leaked into the agent's shell, a PR opened by `gh` under the
       # github-actions identity would not trigger CI (GitHub blocks that identity from
       # starting workflows). The agent instead opens its PR via the Claude GitHub App
       # token, which does trigger CI.
@@ -79,11 +87,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh pr list --label auto-improve --state all --json title,state,closedAt --limit 100 > prs.json
-          codes=$(jq -r '
-            [ .[]
-              | select(.state == "OPEN" or (.closedAt != null and ((now - (.closedAt | fromdate)) < 1209600)))
-              | .title | sub("^auto-improve: "; "") ]
-            | unique | join(",")' prs.json)
+          gh issue list --label auto-improve-declined --state all --json title,state,closedAt --limit 100 > declined.json
+          # -s slurps both files into one array of arrays; `add` concatenates them. Titles
+          # are "auto-improve: CODE" and "auto-improve declined: CODE", so one sub() strips
+          # either prefix.
+          codes=$(jq -rs 'add
+            | [ .[]
+                | select(.state == "OPEN" or (.closedAt != null and ((now - (.closedAt | fromdate)) < 1209600)))
+                | .title | sub("^auto-improve( declined)?: "; "") ]
+            | unique | join(",")' prs.json declined.json)
           echo "codes=$codes" >> "$GITHUB_OUTPUT"
           echo "already handled: ${codes:-<none>}"
 
@@ -149,6 +161,102 @@ jobs:
           path: ${{ runner.temp }}/claude-execution-output.json
           if-no-files-found: warn
           retention-days: 30
+
+      # Close the feedback loop on a NON-result. The selector only knows what PRs exist, so
+      # a finding the agent examines and refuses is invisible to it and gets picked again
+      # tomorrow, and every day after — SIGNAL_INVERTED ran that loop 13 times, each run
+      # paying for the same well-reasoned "no PR: this is a strategy fact, not a bug".
+      # Writing the refusal down as an issue makes it a fact the selector can read.
+      #
+      # A decline is a JUDGEMENT, not a failure, and only a clean finish counts as one:
+      # `subtype == "success"` with no PR. An agent cut off by --max-turns (subtype
+      # `error_max_turns`) or killed by a tool error has NOT judged anything and must be
+      # free to retry tomorrow, so those record nothing.
+      #
+      # The issue suppresses the code while it is OPEN and for 14 days after it is closed.
+      # Open-ended suppression is the point: it holds until a human triages the refusal —
+      # by fixing the finding's source, by adding the code to NON_CODE_CODES (the right
+      # answer when the agent is refusing on principle rather than on difficulty), or by
+      # just closing the issue to let the agent have another go two weeks later.
+      - name: Record a declined finding
+        if: always() && steps.pick.outputs.has_finding == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOG: ${{ runner.temp }}/claude-execution-output.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          code=$(jq -r '.code' finding.txt)
+
+          # A PR means the agent acted — nothing to record. Matched on TITLE across all open
+          # PRs rather than by label or `--search`: the agent labels its PR in a separate
+          # step that is allowed to fail (see improve-prompt.md), so a label filter would
+          # miss a real PR and record a decline over the top of finished work. `--search`
+          # is avoided because "auto-improve: CODE" reads as a qualifier to GitHub search.
+          if gh pr list --state open --limit 100 --json title \
+               | jq -e --arg t "auto-improve: $code" 'any(.[]; .title == $t)' > /dev/null; then
+            echo "PR open for $code — the agent acted, not a decline."
+            exit 0
+          fi
+
+          if [ ! -f "$LOG" ]; then
+            echo "no execution log — cannot tell a decline from a crash; recording nothing."
+            exit 0
+          fi
+          result=$(jq -r '[.[] | select(.type == "result")] | last' "$LOG")
+          subtype=$(jq -r '.subtype // "missing"' <<< "$result")
+          if [ "$subtype" != "success" ]; then
+            echo "agent did not finish cleanly (result=$subtype) — retryable, recording nothing."
+            exit 0
+          fi
+
+          # One open marker per code. Matched on title for the same reason as the PR check —
+          # an existing marker whose labelling failed must be found and REPAIRED, not
+          # duplicated daily while never suppressing anything. --add-label is idempotent.
+          existing=$(gh issue list --state open --limit 100 --json number,title \
+            | jq -r --arg t "auto-improve declined: $code" 'map(select(.title == $t)) | .[0].number // ""')
+          if [ -n "$existing" ]; then
+            echo "open decline marker already exists for $code (#$existing)."
+            gh issue edit "$existing" --add-label auto-improve-declined > /dev/null \
+              || echo "::warning::could not label issue #$existing — $code will be re-picked tomorrow"
+            exit 0
+          fi
+
+          # Created here rather than assumed: `gh issue create --label` fails outright on a
+          # missing label, which would throw away the record entirely. Same trap the agent
+          # prompt warns about for PRs — so create the label, then the issue, then attach.
+          gh label create auto-improve-declined \
+            --color BFD4F2 \
+            --description "Improvement agent examined this finding and opened no PR" \
+            2>/dev/null || true
+
+          {
+            echo "The improvement agent examined this finding and chose not to open a PR."
+            echo
+            echo "It is suppressed from selection while this issue is open, and for 14 days"
+            echo "after it closes. If the refusal is on principle — a strategy or operational"
+            echo "fact rather than a code bug — add \`$code\` to \`NON_CODE_CODES\` in"
+            echo "\`src/lib/pick-finding.ts\` so no future run pays to rediscover it."
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "## Finding"
+            echo
+            echo '```json'
+            jq . finding.txt
+            echo '```'
+            echo
+            echo "## The agent's reasoning"
+            echo
+            jq -r '.result // "(no final message recorded)"' <<< "$result"
+          } > decline.md
+
+          n=$(gh issue create --title "auto-improve declined: $code" --body-file decline.md \
+              | tail -1 | grep -oE '[0-9]+$')
+          echo "recorded decline for $code as issue #$n"
+          # The label is what the selector reads, so a failure here matters: say so loudly
+          # rather than leaving a silently-uncounted issue, but don't fail the run over it.
+          gh issue edit "$n" --add-label auto-improve-declined \
+            || echo "::warning::could not label issue #$n — $code will be re-picked tomorrow"
 
       # Optional end-to-end visibility. SLACK_WEBHOOK_URL is an app-server env var today,
       # NOT a GitHub Actions secret — add it to the Production environment to enable this;
