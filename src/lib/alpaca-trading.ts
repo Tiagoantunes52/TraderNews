@@ -1,5 +1,8 @@
 import { fetchWithRetry } from "@/lib/http";
 import { fromAlpacaSymbol, toAlpacaSymbol } from "@/lib/market-utils";
+import { TERMINAL_ORDER_STATUS } from "@/lib/paper-trading";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Alpaca paper Trading API client (issue #14). Places the REAL (simulated) orders
 // for the combined-signal book on a paper account and reads back fills + equity.
@@ -408,7 +411,16 @@ export async function submitStopSell(input: {
   );
 }
 
-/** Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent. */
+/**
+ * Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent.
+ *
+ * A 204 here only means the cancel request was accepted, not that the shares it held
+ * are free yet — Alpaca settles the order to `canceled` asynchronously, so a caller
+ * that immediately resubmits into the same shares (a repair/re-anchor replacing a
+ * working stop) can still get a 403 "insufficient qty available" against the order it
+ * just canceled. Poll briefly for the order to actually reach a terminal state before
+ * returning, so callers can submit the replacement right after.
+ */
 export async function cancelOrder(id: string): Promise<void> {
   const res = await fetchWithRetry(`${baseUrl()}/v2/orders/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -418,6 +430,16 @@ export async function cancelOrder(id: string): Promise<void> {
   if (!res.ok && res.status !== 404 && res.status !== 422) {
     const text = await res.text().catch(() => "");
     throw new Error(`Alpaca cancel error: ${res.status} — ${text}`);
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let status: string;
+    try {
+      status = (await getOrder(id)).status;
+    } catch {
+      return; // gone — nothing left to wait for
+    }
+    if (TERMINAL_ORDER_STATUS.has(status)) return;
+    await sleep(200);
   }
 }
 

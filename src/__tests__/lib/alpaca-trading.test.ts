@@ -290,7 +290,10 @@ describe("alpaca-trading client", () => {
     });
 
     it("cancelOrder DELETEs by id and tolerates 404/422", async () => {
-      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 204 } as Response);
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
       vi.stubGlobal("fetch", mockFetch);
       await cancelOrder("o9");
       const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
@@ -302,6 +305,22 @@ describe("alpaca-trading client", () => {
       // a real error still throws
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response));
       await expect(cancelOrder("o9")).rejects.toThrow("Alpaca cancel error: 500");
+    });
+
+    it("cancelOrder waits for the order to actually settle before returning", async () => {
+      // A 204 on the DELETE only means the request was accepted — Alpaca still shows
+      // the order (and its held shares) as "pending_cancel" for a beat afterward. A
+      // caller that resubmits into those shares the instant cancelOrder resolves must
+      // not race that settlement, so cancelOrder should keep polling until the order
+      // reaches a terminal status.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "pending_cancel" }))
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await cancelOrder("o9");
+      expect(mockFetch).toHaveBeenCalledTimes(3);
     });
 
     it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
