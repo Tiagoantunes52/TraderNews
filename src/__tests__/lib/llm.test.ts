@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSentimentResponse } from "@/lib/llm";
+import { parseSentimentResponse, isRetriableLlmError, LlmHttpError } from "@/lib/llm";
 
 describe("parseSentimentResponse", () => {
   it("parses a well-formed structured response", () => {
@@ -103,5 +103,40 @@ describe("parseSentimentResponse", () => {
   it("uses key_driver as summary when summary is absent", () => {
     const r = parseSentimentResponse('{"overall_score": 0.1, "key_driver": "merger talks"}');
     expect(r.summary).toBe("merger talks");
+  });
+});
+
+describe("isRetriableLlmError", () => {
+  it("does not retry an aborted request", () => {
+    // The 30s client-side timeout: retrying doubles a timeout's wall-clock cost
+    // for a call that is unlikely to succeed. This is the regression that
+    // stretched News Pipeline #861 to 99 minutes.
+    const abort = new DOMException("This operation was aborted", "AbortError");
+    expect(isRetriableLlmError(abort)).toBe(false);
+  });
+
+  it("does not retry an AbortSignal.timeout-style TimeoutError", () => {
+    expect(isRetriableLlmError(new DOMException("timed out", "TimeoutError"))).toBe(false);
+  });
+
+  it("retries a 5xx", () => {
+    expect(isRetriableLlmError(new LlmHttpError(503))).toBe(true);
+  });
+
+  it("retries a 429", () => {
+    expect(isRetriableLlmError(new LlmHttpError(429))).toBe(true);
+  });
+
+  it("does not retry a permanent 4xx", () => {
+    expect(isRetriableLlmError(new LlmHttpError(401))).toBe(false);
+    expect(isRetriableLlmError(new LlmHttpError(400))).toBe(false);
+  });
+
+  it("retries a transport error", () => {
+    expect(isRetriableLlmError(new TypeError("fetch failed"))).toBe(true);
+  });
+
+  it("keeps the legacy error message so logs stay greppable", () => {
+    expect(new LlmHttpError(503).message).toBe("LLM error: 503");
   });
 });
