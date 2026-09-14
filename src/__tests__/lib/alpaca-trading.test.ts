@@ -323,6 +323,48 @@ describe("alpaca-trading client", () => {
       expect(mockFetch).toHaveBeenCalledTimes(3);
     });
 
+    it("cancelOrder keeps waiting through a transient read failure, then settles", async () => {
+      // A 5xx on the status poll means we could not READ the order — it says nothing
+      // about whether the cancel settled. Treating it as "gone" (the original fix did)
+      // hands the caller a false all-clear and reopens the 403 race precisely when the
+      // broker is flaky, which is when races are most likely.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      // 3 fetchWithRetry attempts burn the 500s, then the canceled read lands.
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+    });
+
+    it("cancelOrder returns as soon as the order 404s — nothing left holding shares", async () => {
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "not found" } as Response);
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+      expect(mockFetch).toHaveBeenCalledTimes(2); // no pointless polling after a 404
+    });
+
+    it("cancelOrder throws rather than silently giving up when the order never settles", async () => {
+      // Resolving here would promise the caller the shares are free when we never saw
+      // that happen; its resubmit would then be rejected 403 and read as an order-
+      // contents bug. Resolving means settled, throwing means unconfirmed — never both.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue(jsonResponse({ id: "o9", status: "pending_cancel" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).rejects.toThrow(/did not settle/);
+    });
+
     it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
       const mockFetch = vi.fn().mockResolvedValue(
         jsonResponse([{ id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", stop_price: "92.1", trail_percent: null }])
