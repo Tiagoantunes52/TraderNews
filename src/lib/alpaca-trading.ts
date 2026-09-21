@@ -1,5 +1,21 @@
 import { fetchWithRetry } from "@/lib/http";
 import { fromAlpacaSymbol, toAlpacaSymbol } from "@/lib/market-utils";
+import { TERMINAL_ORDER_STATUS } from "@/lib/paper-trading";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Carries the HTTP status alongside the message, so callers can distinguish "the
+ * broker says this is gone" (404) from "the broker could not answer" (5xx/429).
+ * The message is byte-identical to the plain Error it replaces — `classifyStageError`
+ * routes on message shape, so changing it would silently re-file these errors.
+ */
+export class AlpacaHttpError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`Alpaca trading error: ${status} — ${body}`);
+    this.name = "AlpacaHttpError";
+  }
+}
 
 // Alpaca paper Trading API client (issue #14). Places the REAL (simulated) orders
 // for the combined-signal book on a paper account and reads back fills + equity.
@@ -85,7 +101,7 @@ async function apiGet<T>(path: string): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Alpaca trading error: ${res.status} — ${body}`);
+    throw new AlpacaHttpError(res.status, body);
   }
   return (await res.json()) as T;
 }
@@ -408,7 +424,23 @@ export async function submitStopSell(input: {
   );
 }
 
-/** Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent. */
+/**
+ * Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent.
+ *
+ * A 204 here only means the cancel request was accepted, not that the shares it held
+ * are free yet — Alpaca settles the order to `canceled` asynchronously, so a caller
+ * that immediately resubmits into the same shares (a repair/re-anchor replacing a
+ * working stop) can still get a 403 "insufficient qty available" against the order it
+ * just canceled. Poll briefly for the order to actually reach a terminal state before
+ * returning, so callers can submit the replacement right after.
+ *
+ * Resolving means settled. Throwing means we could not confirm it — never both.
+ */
+// ~1s of total patience, against the ~280ms Alpaca actually took to release a
+// cancelled stop's shares on 2026-09-11 (the VRTX rejection that prompted this).
+const CANCEL_SETTLE_POLLS = 5;
+const CANCEL_SETTLE_INTERVAL_MS = 200;
+
 export async function cancelOrder(id: string): Promise<void> {
   const res = await fetchWithRetry(`${baseUrl()}/v2/orders/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -419,6 +451,30 @@ export async function cancelOrder(id: string): Promise<void> {
     const text = await res.text().catch(() => "");
     throw new Error(`Alpaca cancel error: ${res.status} — ${text}`);
   }
+  // 404/422 on the DELETE means the order was already gone or already terminal
+  // (filled/canceled). There is no pending settlement to wait on and nothing holding
+  // shares, so skip the poll entirely rather than watching a corpse for a second.
+  if (!res.ok) return;
+  for (let attempt = 0; attempt < CANCEL_SETTLE_POLLS; attempt++) {
+    try {
+      if (TERMINAL_ORDER_STATUS.has((await getOrder(id)).status)) return;
+    } catch (e) {
+      // 404 is the one answer that ends the wait: the broker has no such order, so
+      // nothing is holding shares. Anything else (5xx, 429, a transport failure) is
+      // us being unable to READ the status, which says nothing about whether the
+      // cancel settled — keep waiting rather than reporting success we can't see.
+      if (e instanceof AlpacaHttpError && e.status === 404) return;
+    }
+    if (attempt < CANCEL_SETTLE_POLLS - 1) await sleep(CANCEL_SETTLE_INTERVAL_MS);
+  }
+  // Never silently: resolving here would tell the caller the shares are free when we
+  // could not confirm it, and the resubmit it makes next would be rejected 403 as an
+  // apparent order-contents bug — exactly the invisible dropped stop/exit this wait
+  // exists to prevent. Callers wrap broker actions in try/catch and push to the
+  // stage's error list, so this surfaces as an operational BROKER_API_ERROR.
+  throw new Error(
+    `Alpaca cancel did not settle: ${id} still working after ${CANCEL_SETTLE_POLLS} checks — shares may still be held`
+  );
 }
 
 export type AlpacaOpenOrder = {

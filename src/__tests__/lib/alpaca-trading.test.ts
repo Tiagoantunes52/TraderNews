@@ -290,7 +290,10 @@ describe("alpaca-trading client", () => {
     });
 
     it("cancelOrder DELETEs by id and tolerates 404/422", async () => {
-      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 204 } as Response);
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
       vi.stubGlobal("fetch", mockFetch);
       await cancelOrder("o9");
       const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
@@ -302,6 +305,64 @@ describe("alpaca-trading client", () => {
       // a real error still throws
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response));
       await expect(cancelOrder("o9")).rejects.toThrow("Alpaca cancel error: 500");
+    });
+
+    it("cancelOrder waits for the order to actually settle before returning", async () => {
+      // A 204 on the DELETE only means the request was accepted — Alpaca still shows
+      // the order (and its held shares) as "pending_cancel" for a beat afterward. A
+      // caller that resubmits into those shares the instant cancelOrder resolves must
+      // not race that settlement, so cancelOrder should keep polling until the order
+      // reaches a terminal status.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "pending_cancel" }))
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await cancelOrder("o9");
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("cancelOrder keeps waiting through a transient read failure, then settles", async () => {
+      // A 5xx on the status poll means we could not READ the order — it says nothing
+      // about whether the cancel settled. Treating it as "gone" (the original fix did)
+      // hands the caller a false all-clear and reopens the 403 race precisely when the
+      // broker is flaky, which is when races are most likely.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      // 3 fetchWithRetry attempts burn the 500s, then the canceled read lands.
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+    });
+
+    it("cancelOrder returns as soon as the order 404s — nothing left holding shares", async () => {
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "not found" } as Response);
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+      expect(mockFetch).toHaveBeenCalledTimes(2); // no pointless polling after a 404
+    });
+
+    it("cancelOrder throws rather than silently giving up when the order never settles", async () => {
+      // Resolving here would promise the caller the shares are free when we never saw
+      // that happen; its resubmit would then be rejected 403 and read as an order-
+      // contents bug. Resolving means settled, throwing means unconfirmed — never both.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue(jsonResponse({ id: "o9", status: "pending_cancel" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).rejects.toThrow(/did not settle/);
     });
 
     it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
