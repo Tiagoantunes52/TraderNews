@@ -1310,10 +1310,10 @@ describe("averageDeployed() / returnOnCapitalPct() — measuring against the mon
   });
 
   it("reports the return the capital actually earned", () => {
-    // The live case: +$909.70 on an average $20,913 employed is 4.3%, not the 0.9% that
-    // dividing by $100k of notional implies.
-    expect(returnOnCapitalPct(909.7, 20913)).toBeCloseTo(4.35, 2);
-    expect(returnOnCapitalPct(909.7, SIM_STARTING_EQUITY)).toBeCloseTo(0.91, 2);
+    // Dividing by the notional understates it: the same P&L measured against the
+    // capital actually employed is 4.5%, not the 0.9% that $100k of notional implies.
+    expect(returnOnCapitalPct(900, 20_000)).toBeCloseTo(4.5, 2);
+    expect(returnOnCapitalPct(900, SIM_STARTING_EQUITY)).toBeCloseTo(0.9, 2);
   });
 
   it("keeps the sign of a losing book", () => {
