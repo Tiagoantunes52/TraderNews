@@ -20,6 +20,13 @@ concurrency:
   group: news-pipeline
   cancel-in-progress: false
 
+# Least privilege: this job never touches the repository or the GitHub API — it only
+# POSTs to $APP_URL with the pipeline secret. An empty map grants the GITHUB_TOKEN no
+# scopes at all, so a compromised step here has nothing to spend. The repo-level default
+# is already `read`, but that is a setting someone can change; this is a property of the
+# workflow.
+permissions: {}
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
