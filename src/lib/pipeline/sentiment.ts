@@ -4,9 +4,24 @@ import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
 import { blendSentiment } from "@/lib/sentiment-blend";
 import { normalizeHeadline } from "@/lib/normalize";
 import { processWithBudget } from "@/lib/concurrency";
-import { STAGE_BUDGET_MS, startOfUtcDay, universeWhere, type BatchStageResult, type StageOptions } from "./shared";
+import { startOfUtcDay, universeWhere, type BatchStageResult, type StageOptions } from "./shared";
 
-const SENTIMENT_CONCURRENCY = Number(process.env.PIPELINE_SENTIMENT_CONCURRENCY) || 3;
+// Each unit of concurrency is one LLM call the invocation is *idle* waiting on —
+// not CPU — so this is the cheap lever, and the one that actually sets throughput:
+// tickers per invocation = budget x concurrency / latency. At 3, a ~30s model
+// drains ~18 of 110 names per call and the stage needs a dozen polls. At 12 it
+// clears the universe in ~2. The ceiling above ~10 is no longer the LLM but pg's
+// default pool max in `lib/db` — each worker runs two short queries around its
+// call, so they queue for milliseconds against a 30s wait; well past that, raise
+// the pool with it.
+export const SENTIMENT_CONCURRENCY = Number(process.env.PIPELINE_SENTIMENT_CONCURRENCY) || 12;
+
+// This stage gets its own budget rather than the shared STAGE_BUDGET_MS (240s):
+// it is the only one holding a call open for REQUEST_TIMEOUT_MS, and budget +
+// timeout must clear the routes' 300s maxDuration — see the invariant on
+// REQUEST_TIMEOUT_MS. 180 + 60 = 240 leaves 60s of headroom; the old 240 + 60 sat
+// exactly on the limit with none.
+export const SENTIMENT_BUDGET_MS = Number(process.env.PIPELINE_SENTIMENT_BUDGET_MS) || 180_000;
 
 // ── Stage 2: Sentiment ──────────────────────────────────────────────────────
 //
@@ -117,7 +132,7 @@ export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchS
         errors.push(`Sentiment failed for ${stock.ticker}: ${String(e)}`);
       }
     },
-    { concurrency: opts.concurrency ?? SENTIMENT_CONCURRENCY, deadline: Date.now() + (opts.budgetMs ?? STAGE_BUDGET_MS) }
+    { concurrency: opts.concurrency ?? SENTIMENT_CONCURRENCY, deadline: Date.now() + (opts.budgetMs ?? SENTIMENT_BUDGET_MS) }
   );
 
   return {

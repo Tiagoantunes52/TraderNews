@@ -99,10 +99,20 @@ jobs:
           echo "codes=$codes" >> "$GITHUB_OUTPUT"
           echo "already handled: ${codes:-<none>}"
 
+      # `codes` reaches the CLI through the environment rather than a `${{ }}` expression
+      # spliced into `run:`. Those are substituted BEFORE the shell parses the line, and
+      # the values are derived from PR/issue TITLES — so a title containing shell
+      # metacharacters would execute here rather than being passed as an argument.
+      # Applying the `auto-improve` label takes write access, so nothing untrusted can
+      # reach this today; that is a permission setting, though, not a property of the
+      # code, and it is a thin thing to rest on once anyone can open the PR being
+      # labelled. Quoted "$HANDLED" is one argument whatever it contains.
       - name: Pick one finding
         id: pick
+        env:
+          HANDLED: ${{ steps.handled.outputs.codes }}
         run: |
-          npx tsx scripts/pick-finding.ts --report report.json --handled "${{ steps.handled.outputs.codes }}" > finding.txt
+          npx tsx scripts/pick-finding.ts --report report.json --handled "$HANDLED" > finding.txt
           if [ "$(cat finding.txt)" = "none" ]; then
             echo "has_finding=false" >> "$GITHUB_OUTPUT"
             echo "No actionable finding this run — nothing to do."
