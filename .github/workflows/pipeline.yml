@@ -20,10 +20,25 @@ concurrency:
   group: news-pipeline
   cancel-in-progress: false
 
+# Least privilege: this job never touches the repository or the GitHub API — it only
+# POSTs to $APP_URL with the pipeline secret. An empty map grants the GITHUB_TOKEN no
+# scopes at all, so a compromised step here has nothing to spend. The repo-level default
+# is already `read`, but that is a setting someone can change; this is a property of the
+# workflow.
+permissions: {}
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     environment: Production
+    # Hard cap on billed minutes. The stage loop below is bounded only by
+    # MAX_POLLS per stage (30 polls x ~300s x 6 stages = ~15h worst case), so a
+    # degraded upstream — e.g. the LLM endpoint timing out, which stretched the
+    # sentiment stage to 21 polls / 96 min on 2026-09-13 — otherwise burns the
+    # Actions budget unchecked. A healthy run finishes in ~2-4 min; the daily
+    # 02:5x UTC full refresh is the long one. Exceeding this fails the run
+    # loudly, which is the signal we want.
+    timeout-minutes: 20
     env:
       APP_URL: ${{ secrets.APP_URL }}
       PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}

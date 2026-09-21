@@ -2,7 +2,18 @@ const LLM_URL = process.env.VLLM_URL!;
 const LLM_MODEL = process.env.VLLM_MODEL!;
 const LLM_API_KEY = process.env.LLM_API_KEY!;
 
-const REQUEST_TIMEOUT_MS = 30_000;
+// Per-call ceiling. Sized to the configured model, NOT to a round number: at
+// 30s this sat exactly on Nemotron 3 Ultra's median latency, so from 2026-09-01
+// (Super -> Ultra) every ticker became a coin flip — 34% landed, the rest aborted
+// and were retried, and the sentiment stage stretched from 1 poll to 21.
+//
+// INVARIANT: a stage's budget + this timeout must stay under the pipeline routes'
+// `maxDuration` (300s). `processWithBudget` stops *scheduling* at its deadline but
+// lets in-flight calls run on, so an invocation's true ceiling is the sum — and if
+// it trips, Vercel kills the invocation and the whole slice is lost, not just the
+// slow call. Pinned by a test alongside SENTIMENT_BUDGET_MS; raise one and the
+// other has to give.
+export const REQUEST_TIMEOUT_MS = 60_000;
 
 // Aspect-level breakdown lets us see *why* a score landed where it did, and lets
 // the UI and downstream weighting distinguish material drivers (earnings,
@@ -168,6 +179,30 @@ function buildUserPrompt(ticker: string, articles: SentimentArticle[]): string {
   return `Ticker: ${ticker}\n\nNews (headline, with summary where available):\n${lines}`;
 }
 
+// Carries the HTTP status so the retry predicate can tell a transient 5xx from
+// a permanent 4xx (bad key, malformed request) that no retry will fix.
+export class LlmHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`LLM error: ${status}`);
+    this.name = "LlmHttpError";
+  }
+}
+
+// Whether a failed LLM call is worth a second attempt.
+//
+// The decisive case is the abort: a request we cancelled after REQUEST_TIMEOUT_MS
+// because the endpoint never answered. Retrying that is the worst trade in the
+// pipeline — it is the least likely to succeed (the endpoint is overloaded, not
+// flaky) and the most expensive, doubling a timeout's cost from 30s to 60s of
+// wall clock inside a 240s stage budget. On 2026-09-13 that doubling burned ~65
+// of run #861's 99 minutes. Everything else here fails fast, so a retry is cheap.
+export function isRetriableLlmError(e: unknown): boolean {
+  const name = (e as { name?: string } | null)?.name;
+  if (name === "AbortError" || name === "TimeoutError") return false;
+  if (e instanceof LlmHttpError) return e.status >= 500 || e.status === 429;
+  return true; // transport/DNS/socket errors: fast to fail, often transient
+}
+
 async function callLlm(prompt: string): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -189,7 +224,7 @@ async function callLlm(prompt: string): Promise<string> {
       }),
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
+    if (!res.ok) throw new LlmHttpError(res.status);
     const data = await res.json();
     return (data.choices?.[0]?.message?.content as string) ?? "";
   } finally {
@@ -203,13 +238,15 @@ export async function analyzeSentiment(
 ): Promise<SentimentResult> {
   const prompt = buildUserPrompt(ticker, articles);
 
-  // One retry on transport/HTTP failure (free-tier endpoints rate-limit and
-  // flake). A response that parses badly is handled by parseSentimentResponse.
+  // One retry, but only for failures a retry can plausibly fix — see
+  // isRetriableLlmError. Timeouts are rethrown immediately rather than doubled.
+  // A response that parses badly is handled by parseSentimentResponse.
   let content: string;
   try {
     content = await callLlm(prompt);
-  } catch {
-    content = await callLlm(prompt); // surfaces to the pipeline's per-stock catch if it throws again
+  } catch (e) {
+    if (!isRetriableLlmError(e)) throw e; // surfaces to the pipeline's per-stock catch
+    content = await callLlm(prompt); // surfaces to the same catch if it throws again
   }
 
   return parseSentimentResponse(content);

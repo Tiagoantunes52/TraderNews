@@ -464,7 +464,7 @@ something new". If the books disagree over the next few months, the knob reverse
 `SENTIMENT_RM` -2.02% (n=56), pure books ≈ -0.9%. Every book sells names that then
 underperform. The `_RM` ladder is the single biggest positive contributor in the system:
 same signals and sizing as pure `COMBINED`, ladder added, and per-trade goes from -0.94%
-(439 closes, -$2,494) to +0.04% (81 closes, +$8). **Leave the exits alone.**
+(439 closes) to +0.04% (81 closes). **Leave the exits alone.**
 
 **What was still leaking is the entry anchor.** The 2026-07-27 audit fixed the obvious
 half — buffer 0.5% → 2%, stale entry orders expire, stops re-anchor after the fill
@@ -573,20 +573,20 @@ the ratchet counterfactual. SPY left the tracked universe 2026-07-29, so the stu
 benchmark comes from `getDailyPrices("SPY")` — the app's own source chain — not
 `PriceBar`.
 
-| rung | n | mean ret | total $ | mean MFE | giveback | med capture | 5d drift vs SPY (t, sess) |
-|---|---|---|---|---|---|---|---|
-| STOP | 10 | -8.90% | -660 | 1.3% | -10.1% | — | +2.86% (2.40, 4) |
-| TRAIL | 9 | +9.65% | +589 | **20.4%** | -8.9% | **0.43** | +3.81% (1.02, 3) |
-| SIGNAL | 4 | +7.65% | +199 | 12.8% | -4.7% | 0.36 | n too small |
-| DECAY | 24 | +6.40% | +1,087 | 6.7% | **-0.3%** | **0.77** | +1.21% (2.15, 5) |
-| TIME | 15 | +1.39% | +154 | 6.3% | -4.4% | 0.23 | +3.82% (0.29, 6) |
+| rung | n | mean ret | mean MFE | giveback | med capture | 5d drift vs SPY (t, sess) |
+|---|---|---|---|---|---|---|
+| STOP | 10 | -8.90% | 1.3% | -10.1% | — | +2.86% (2.40, 4) |
+| TRAIL | 9 | +9.65% | **20.4%** | -8.9% | **0.43** | +3.81% (1.02, 3) |
+| SIGNAL | 4 | +7.65% | 12.8% | -4.7% | 0.36 | n too small |
+| DECAY | 24 | +6.40% | 6.7% | **-0.3%** | **0.77** | +1.21% (2.15, 5) |
+| TIME | 15 | +1.39% | 6.3% | -4.4% | 0.23 | +3.82% (0.29, 6) |
 
 Reading, rung by rung:
 
 - **DECAY is the best rung in the system** — 24 exits, 77% median capture of the peak,
-  essentially zero giveback, and $1,087 of the sample's $1,369 total P&L. "Thesis
+  essentially zero giveback, and **79% of the sample's total P&L**. "Thesis
   played out, take the profit" is doing exactly what it was designed to do.
-- **TIME works as designed** — 15 dead-money exits for ~breakeven ($154), freeing
+- **TIME works as designed** — 15 dead-money exits for ~breakeven, freeing
   slots. Its low capture (0.23) is definitional: it only fires on names that round-tripped
   back to flat.
 - **STOP** is the entire loss side (all 10 losses, ≈ -8.9% each — beyond the 6-8%
@@ -607,15 +607,17 @@ stream lags the bar sessions and runs can skip names):
 
 | name | actual | full-width trail | delta |
 |---|---|---|---|
-| PLTR (×2 books) | +6.7% @07-23 | still open, +47.9% @08-17 | +41.1pp |
-| TOST (×2 books) | +15.9% @07-24 | still open, +40.0% @08-17 | +24.2pp |
-| DDOG | +11.4% @07-23 | still open, +19.8% @07-29 (bars end) | +8.4pp |
-| SLB | +2.0% @07-30 | wide trail fires same day | 0 |
-| AAPL / KLAC / RKLB | — | no post-exit bars — excluded | — |
+| name A (×2 books) | +6.7% @07-23 | still open, +47.9% @08-17 | +41.1pp |
+| name B (×2 books) | +15.9% @07-24 | still open, +40.0% @08-17 | +24.2pp |
+| name C | +11.4% @07-23 | still open, +19.8% @07-29 (bars end) | +8.4pp |
+| name D | +2.0% @07-30 | wide trail fires same day | 0 |
+| names E / F / G | — | no post-exit bars — excluded | — |
 
-Mean +23.2pp over 6 trades (4 unique names). "Still open" deltas are marks at the
-name's last stored bar, not realised exits — but the wide trail bounds any later exit
-at `peak × (1 - trail)`, so the direction is not an artifact of truncation.
+Mean +23.2pp over 6 trades (4 unique names; names are anonymised in the published
+register — `scripts/exit-ladder-study.ts` prints the real ones off the database).
+"Still open" deltas are marks at the name's last stored bar, not realised exits —
+but the wide trail bounds any later exit at `peak × (1 - trail)`, so the direction
+is not an artifact of truncation.
 
 **The cut-winners-short signature did NOT reproduce at the aggregate level in this
 window** — labelled sample: 75.8% win, payoff 1.00, +3.27%/trade vs the historical
@@ -806,8 +808,8 @@ coverage, since 2026-06-01):
 | entered ≤3d before earnings | 108 | 47% | -0.69% | -4.11% |
 
 Holding through earnings was *profitable* in this window, so a pre-earnings
-exit is contraindicated. The tail does hold a specific pattern — RDDT, APP and
-DDOG were entered 0-1 days before a scheduled print and lost 17-21% on the gap
+exit is contraindicated. The tail does hold a specific pattern — three names
+were entered 0-1 days before a scheduled print and lost 17-21% on the gap
 (all then exited by the SIGNAL rung doing its job) — and the ≤3d entry bucket
 nets weakly negative, so a narrow (~2-3 day) **entry** blackout has weak
 in-sample support. Parked, not shipped: the mean effect is small, the ≤5d
@@ -840,11 +842,11 @@ becomes a testable candidate with an actual sample behind it.
 Surfaced by the earnings study's worst-trades list: two "-71/-72%" CRWD events.
 Entry was recorded at the raw pre-split price (678.65 = 4 × the adjusted 169.66
 close of 2026-06-25) and the exit at the post-split price (193.98), across
-SENTIMENT, COMBINED, SENTIMENT_RM and COMBINED_RM — **~$1,757 of fictitious
-realized loss on holds where CRWD actually gained ~14% adjusted**. Every
-closed-trade aggregate in this register carries it: pure COMBINED's "-$2,494
-over 439 closes" is about one-sixth this single artifact, and the loss side of
-the "payoff 0.54-0.66" figure is inflated by it.
+SENTIMENT, COMBINED, SENTIMENT_RM and COMBINED_RM — **fictitious realized
+loss on holds where CRWD actually gained ~14% adjusted**. Every closed-trade
+aggregate in this register carries it: pure COMBINED's share of the artifact is
+about one-sixth of its entire recorded loss over those 439 closes, and the loss
+side of the "payoff 0.54-0.66" figure is inflated by it.
 
 **Status 2026-08-24:** a full-book scan found exactly the four known rows and no
 open positions affected. The guard shipped — `auditCorporateActions`
@@ -852,8 +854,9 @@ open positions affected. The guard shipped — `auditCorporateActions`
 one-step moves outside 0.6-1.67x and warns `CORPORATE_ACTION_SUSPECT`, so the
 next basis break surfaces while the position is still open and repairable. The
 repair itself is `scripts/repair-crwd-split.ts` (qty ×4, entryPrice ÷4,
-peakPrice ÷4, realizedPnl recomputed — dry-run verified: +$86/+$69 instead of
--$428/-$470); the write needs to be run by a human, and `PaperEquitySnapshot`
+peakPrice ÷4, realizedPnl recomputed — dry-run verified: the affected rows flip
+from their recorded ~-71/-72% losses to small realized gains); the write needs
+to be run by a human, and `PaperEquitySnapshot`
 history deliberately keeps the artifact (the daily equity series records what
 the books believed at the time).
 
@@ -1060,7 +1063,7 @@ listed so they are not silently forgotten.
 - **Missing-fresh-estimate positions go unmanaged.** The paper stage loads only
   estimates dated today and only open positions for those stock ids, so a name without
   a fresh estimate is neither marked nor exited. Verified **zero occurrences in prod**
-  (all 151 open positions marked 2026-07-24), so this is latent, not active — but
+  (every open position marked 2026-07-24), so this is latent, not active — but
   unguarded.
 <!-- check: sentweight-range-unreachable -->
 - **`articleCount` counts the LLM prompt, not the news** (traced 2026-07-31; velocity
@@ -1211,11 +1214,8 @@ The asymmetry is the whole story: fills cap at +50 bps but run to −653. A buy 
 `close × 1.005` fills when a name gaps *down* and fails when it gaps *up*.
 
 **The unfilled orders are the winners.** Nine never-filled BUYs with a matching sim
-position:
-
-| MA | PANW | TMO | UNH | VRTX | TOST | GE | MRK | NEE |
-|---|---|---|---|---|---|---|---|---|
-| +6.3% | +9.4% | +16.3% | +4.4% | +2.5% | +15.9% | −0.9% | +1.0% | +2.3% |
+position, individual returns spanning −0.9% to +16.3% (per-name detail withheld from
+the published register — re-derive with the second query below):
 
 **8 of 9 winners, averaging +6.3%**, against a book average of **−0.35%**. On the fills
 alone the live book entered 0.89% *cheaper* than the sim — so the sim's advantage comes

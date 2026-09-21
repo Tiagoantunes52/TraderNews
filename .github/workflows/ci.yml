@@ -9,6 +9,12 @@ on:
     # every one of them through ungated.
     branches: [main, dev]
 
+# Least privilege: these jobs clone the repo and run tests, nothing more. `contents:
+# read` is exactly what actions/checkout needs. Declaring it matters most on the
+# `pull_request` trigger — a fork PR cannot use this workflow to write anything back.
+permissions:
+  contents: read
+
 jobs:
   unit:
     name: Unit & component tests
