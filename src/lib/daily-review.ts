@@ -668,7 +668,7 @@ const CORPORATE_ACTION_RATIO = 0.6;
 /**
  * The sim has no split/corporate-action handling: a held name crossing one books
  * the entire basis change as P&L. CRWD's 4:1 split turned a +14% hold into four
- * "-71%" closes (~$1,757 of fictitious loss) and sat unnoticed for seven weeks
+ * "-71%" closes of fictitious loss and sat unnoticed for seven weeks
  * because nothing watched for it — every aggregate over closed trades inherited
  * the artifact (OPEN-FINDINGS.md, "CRWD's 4:1 split"). This check watches each
  * OPEN position's price stream day-over-day, so the next basis break surfaces on
@@ -687,7 +687,7 @@ export function auditCorporateActions(rows: { ticker: string; prevPrice: number;
         "CORPORATE_ACTION_SUSPECT",
         `${r.ticker}: held position's price moved ${((ratio - 1) * 100).toFixed(0)}% in one step`,
         `A one-step move this size in a held name is more often a split or other basis change than a market move, ` +
-          `and the sim books a basis change as real P&L (CRWD's 4:1 split booked ~$1,757 of fictitious loss). ` +
+          `and the sim books a basis change as real P&L (CRWD's 4:1 split booked a large fictitious loss). ` +
           `Verify against the adjusted bars; if it is a corporate action, repair the position rows on the new basis ` +
           `(scripts/repair-crwd-split.ts is the pattern) before the position closes into the statistics.`,
         { ticker: r.ticker, prevPrice: r.prevPrice, curPrice: r.curPrice, ratio: Number(ratio.toFixed(4)) }
@@ -799,7 +799,7 @@ export function auditRiskBlocks(decisions: DecisionRecord[], limits: RiskLimits)
  * One number for how far the live book has drifted from the sim book it mirrors.
  *
  * `reconcileBroker` already names the divergent tickers, but it emits one finding per
- * *category* — and a reader scanning "COMBINED_RM is long MA, SNOW, TMO, UNH but the
+ * *category* — and a reader scanning "COMBINED_RM is long four names but the
  * paper account is flat in them" cannot tell a routine one-name lag from a live book
  * holding three of eight names and missing its four best. That distinction is the
  * whole point: the live book existing to track the sim is only true while it does.

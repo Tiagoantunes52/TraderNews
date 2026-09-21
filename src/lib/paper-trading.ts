@@ -185,8 +185,8 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   // Runs after a broker entry attempt before the live book may re-enter a name the
   // sim still holds. The re-entry guard exists so a stopped-out name isn't bought
   // straight back, but an unbounded guard leaves the live book flat for as long as
-  // the sim keeps riding the position — which is how MA/SNOW/TMO/UNH (the sim's
-  // best performers) ended up missing from the live book for weeks. 0 disables
+  // the sim keeps riding the position — which is how several of the sim's best
+  // performers ended up missing from the live book for weeks. 0 disables
   // re-entry entirely (the old unbounded behaviour).
   brokerReentryRuns: 10,
 };
