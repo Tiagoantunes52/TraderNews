@@ -114,6 +114,11 @@ model Sentiment {
   aspects            Json?
   articleCount       Int      @default(0)
   avgArticleAgeHours Float?
+  /// The LLM call failed (timeout, HTTP error, empty or unparseable reply), so this row
+  /// is NOT a reading: `score` is a placeholder 0 and every reader must skip it. It is
+  /// stored, rather than dropped, so the stage's worklist can bound retries and the daily
+  /// review can count failures. See LlmResponseError in lib/llm.ts.
+  failed             Boolean  @default(false)
   date               DateTime @default(now())
   createdAt          DateTime @default(now())
 

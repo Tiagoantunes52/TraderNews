@@ -35,6 +35,9 @@ export const NON_CODE_CODES: ReadonlySet<string> = new Set([
   "PARTIAL_ESTIMATES",
   "NO_QUANT",
   "NO_SENTIMENT",
+  // The LLM provider failing (timeouts, empty replies) — operate the model/endpoint.
+  // The code fix for how failures are HANDLED shipped with the finding (2026-10-21).
+  "LLM_FAILURES",
   "NO_ARTICLES",
   "PAPER_DID_NOT_RUN",
   "PAPER_RAN_AFTER_CLOSE",

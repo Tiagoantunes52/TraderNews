@@ -7,10 +7,11 @@
       "id": "band-neutral-up/SENTIMENT",
       "control": false,
       "firstRun": "2026-08-31",
-      "lastRun": "2026-08-31",
-      "runs": 1,
+      "lastRun": "2026-10-21",
+      "runs": 2,
       "splits": [
-        "2026-07-15"
+        "2026-07-15",
+        "2026-08-17"
       ],
       "lastVerdict": "MATCHES"
     },
@@ -20,12 +21,13 @@
       "id": "band-no-strong/SENTIMENT",
       "control": false,
       "firstRun": "2026-08-31",
-      "lastRun": "2026-08-31",
-      "runs": 1,
+      "lastRun": "2026-10-21",
+      "runs": 2,
       "splits": [
-        "2026-07-15"
+        "2026-07-15",
+        "2026-08-17"
       ],
-      "lastVerdict": "MATCHES"
+      "lastVerdict": "LAGS"
     },
     {
       "spec": "band-strong-only/SENTIMENT@h5/live",
@@ -33,10 +35,11 @@
       "id": "band-strong-only/SENTIMENT",
       "control": false,
       "firstRun": "2026-08-31",
-      "lastRun": "2026-08-31",
-      "runs": 1,
+      "lastRun": "2026-10-21",
+      "runs": 2,
       "splits": [
-        "2026-07-15"
+        "2026-07-15",
+        "2026-08-17"
       ],
       "lastVerdict": "LAGS"
     },

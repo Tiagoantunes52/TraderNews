@@ -1037,6 +1037,105 @@ about the whole bullish range. Expect the review's SENTIMENT entry figure to kee
 describing a wider band than the book now trades; that is the monitor working, not drift.
 
 
+## FIXED 2026-10-21: failed LLM calls were stored as NEUTRAL reads
+
+`neutralFallback()` in `lib/llm.ts` turned an empty, unparseable or scoreless model reply
+into score 0 / confidence 0.1, and the sentiment stage stored it as a real `Sentiment`
+row. The comment's theory — low confidence keeps it from moving anything — was wrong:
+confidence *weights* a score, it does not *flag* it, and every classifier downstream
+(`scoreToSignal`, the entry gate, the exit ladder, `signalHealth`, the band harness) read
+the 0 as a genuine NEUTRAL opinion.
+
+**Scale.** 1,749 rows, 2026-06-23 → 2026-10-19 (1,713 "Empty model response.", 29 "Could
+not parse", 7 "missing a numeric score"; 17 of them blended with Alpha Vantage into a
+non-zero score). Rare until late August, then: **490 of 767** names in the week of 08-31,
+**469 of 766** the week of 09-07, 179 the week of 09-21, 130 the week of 10-05, **259** the
+week of 10-12. The surge coincides with the 09-01 switch to Nemotron 3 Ultra (see the
+timeout comment in `llm.ts`); coincident, not proven causal. **Nothing in the daily review
+could see it** — the rows looked like scores.
+
+**What it did to the books** (exits since 08-31 whose exit day, or the day before, carried
+a failed call — measured 2026-10-21):
+
+| book | exit | on a failed call |
+|---|---|---|
+| SENTIMENT_RM | DECAY | **9 of 12** |
+| COMBINED_RM | DECAY | **4 of 5** |
+| QUANT_RM | DECAY / SIGNAL | 7 of 16 / 3 of 3 |
+| SENTIMENT (pure) | SIGNAL | 230 of 482 |
+| COMBINED (pure) | SIGNAL | 155 of 350 |
+
+DECAY only fires on a *profitable* position whose conviction has gone, so the `_RM` books
+were closing winners on a model that had said nothing — the cut-winners-short signature
+again, from a new mechanism. Fake NEUTRALs also kept names out of the entry band. The
+deferred "exits fire on NEUTRAL" item below amplified all of it.
+
+**Fix.**
+- `parseSentimentResponse` throws `LlmResponseError` instead of inventing a read.
+- The sentiment stage writes any failed call (timeout, HTTP, empty, unparseable) as a
+  `Sentiment` row with `failed = true` (placeholder score, null confidence). Every reader
+  filters `failed: false` — the estimate stage, the review, and the seven UI reads.
+- Retries are bounded: at most one attempt per pipeline run (60-min backoff, longer than
+  the job's 20-min timeout) and 3 per UTC day. Recording the failure rather than writing
+  no row is deliberate — with no row, a broad outage keeps every name on the worklist,
+  the stage never reports `done`, and the 20-min job times out before quant / estimate /
+  paper run. That was already true of timeouts; it is now closed for both.
+- The estimate carries the last real reading forward and flags it
+  (`SENTIMENT_CARRIED_FORWARD_WARNING`), with **no confidence penalty** — estimating off
+  the prior read is what the morning run always did before sentiment lands, and a penalty
+  would be a sizing change for the backtest track to decide.
+- The daily review raises **`LLM_FAILURES`** (warn once ≥10% of the universe ended the day
+  with no reading; info below). Listed in `NON_CODE_CODES`: it is a provider problem to
+  operate, not code for the improvement agent.
+- Migration `20261021140000_sentiment_failed` adds the column and marks the 1,749 legacy
+  rows `failed` by their exact fallback summaries (pinned against
+  `LEGACY_FALLBACK_SUMMARIES` by a test).
+
+**Not changed, on purpose.** `StockEstimate` history is not rewritten: estimates built from
+fake reads keep the score they traded on, because that is the record of what happened.
+The consequence is that **every research instrument reading `StockEstimate.sentimentScore`
+over 2026-06-23 → 2026-10-19 still sees the contamination** — `signalHealth`, `signal-split`,
+and anything quoting SENTIMENT bucket numbers in this register since late August. Until
+those readers exclude estimates whose same-day sentiment row is `failed`, treat their
+SENTIMENT/COMBINED numbers over that window with suspicion, NEUTRAL bucket above all.
+
+## Entry bands re-test, 2026-10-21 — BEATS on the stored rows, MATCHES on the real ones
+
+Re-run of `signal-split --bands --source=SENTIMENT` on 104 sessions (2026-06-01 →
+2026-10-15), median split **2026-08-17** (the 08-31 run split at 07-15 — see the drift note
+below). Run off-device: the repo's own `signal-band.ts` / `stats.ts` / `research-ledger.ts`
+fed per-(session, bucket) aggregates exported with SQL — exact, since every statistic in
+the band harness is a mean. Validated by restricting to sessions ≤ 2026-08-24: the 08-31
+TRAIN column reproduces exactly for all four bands (58 sessions, split 07-15); HOLDOUT
+differs by ~1 bp from rows repaired after 08-31.
+
+| band | HOLDOUT, rows as stored | HOLDOUT, failed calls unscored | verdict (clean) |
+|---|---|---|---|
+| `band-current` (BUY+SB) | -11.3 (t -0.75) | same | — |
+| `band-no-strong` (**traded**) | -4.4 (t -0.44) | same | LAGS |
+| `band-strong-only` | -36.7 (t -0.92), 0/4 folds | same | LAGS |
+| `band-neutral-up` | **+10.6 (t +2.56), 4/4 → BEATS** | +7.9 (t -0.05), 3/4 | **MATCHES** |
+
+1,451 of the 11,991 observations (12.1%) were failed calls stored as NEUTRAL. Removing
+them — treating the name as unscored, which keeps it in the universe benchmark and out of
+every band — leaves BUY / STRONG_BUY / SELL untouched and takes `band-neutral-up` from
+BEATS to MATCHES. **The BEATS was the bug**: fake NEUTRALs are effectively random names,
+so they pulled the band toward the universe and shrank its variance, inflating t on a
+small effect. Stress tests that did *not* catch this, and why: the old split (t 2.05) and
+post-08-24 data only (t 2.69) both still contain the contaminated weeks.
+
+**What it does establish.** STRONG_BUY is bad in every period (keep `entryScoreMax`). The
+band the book trades, BUY-only, now **lags** the universe out of sample (it MATCHED on
+08-31; on today's repaired rows that same August window reads -1.5 bps → LAGS). Nothing
+beats the universe. Descriptively (pooled, not a judged band), the clean holdout's SELL
+bucket sits at -49 bps — sentiment's one consistent read is which names to avoid, which a
+long-only book already does by not buying them.
+
+**Ledger.** The three band specs are re-recorded with the clean verdicts (MATCHES / LAGS /
+LAGS) and the new split; `k` is unchanged at 3 (same specs), but the ledger now reports
+**split drift** (07-15 vs 08-17) for all three — k does not price that; read any future
+band result with it in mind. Re-run after the fix has accumulated clean sessions.
+
 ## Confirmed but deliberately deferred
 
 These are verified defects that lost the prioritisation, not open questions. They are
@@ -1044,7 +1143,9 @@ listed so they are not silently forgotten.
 
 - **Exits fire on NEUTRAL.** `isExitSignal = !isEntrySignal` (`paper-trading.ts:218`),
   so the book exits on NEUTRAL as well as SELL. Causes churn without a demonstrated
-  edge.
+  edge. Until 2026-10-21 failed LLM calls were *stored* as NEUTRAL, which turned
+  this into exits on no information at all — that part is fixed (see "FIXED 2026-10-21"
+  above); the deliberate behaviour on a genuine NEUTRAL read is unchanged.
 - **Env break-glass bypasses bounds validation.** ~~`envValue()`
   (`trading-config.ts:127`) accepts any finite number, while DB-sourced overrides get
   range-checked and dropped on violation. A typo in an env var silently installs a

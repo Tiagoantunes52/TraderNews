@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { getCryptoFearGreed } from "@/lib/crypto-fng";
-import { analyzeSentiment, type SentimentArticle } from "@/lib/llm";
+import { analyzeSentiment, LlmResponseError, type SentimentArticle, type SentimentResult } from "@/lib/llm";
 import { blendSentiment } from "@/lib/sentiment-blend";
 import { normalizeHeadline } from "@/lib/normalize";
 import { processWithBudget } from "@/lib/concurrency";
@@ -23,14 +23,54 @@ export const SENTIMENT_CONCURRENCY = Number(process.env.PIPELINE_SENTIMENT_CONCU
 // exactly on the limit with none.
 export const SENTIMENT_BUDGET_MS = Number(process.env.PIPELINE_SENTIMENT_BUDGET_MS) || 180_000;
 
+// ── Failed LLM calls ────────────────────────────────────────────────────────
+//
+// A failed call (timeout, HTTP error, empty or unparseable reply) is written as a
+// `failed` Sentiment row — never as a score — so that:
+//   • the stock leaves this run's worklist. Before, a timeout produced NO row, so the
+//     stock stayed on the worklist and was re-attempted on every poll; under a broad
+//     LLM outage the stage could never report `done` and would hold the 20-minute
+//     pipeline job until it timed out, starving quant/estimate/paper behind it.
+//   • retries are bounded and spaced: at most one attempt per pipeline run (the
+//     backoff outlasts the job's 20-minute timeout, and runs are ~3h apart) and
+//     MAX_ATTEMPTS per UTC day. A later run gets another try, which is the retry that
+//     helps — failures cluster in time (model overload), so the next poll seconds later
+//     usually fails the same way.
+//   • the daily review can count them.
+// Every reader filters `failed: false`; the estimate carries the last real read forward.
+export const SENTIMENT_MAX_ATTEMPTS_PER_DAY = 3;
+export const SENTIMENT_RETRY_BACKOFF_MS = 60 * 60 * 1000;
+
+/**
+ * Should this stock be (re)attempted now, given the failed attempts it has already
+ * made today? Only called for stocks with no successful read today.
+ */
+export function shouldAttemptSentiment(failedToday: Date[], now: Date): boolean {
+  if (failedToday.length === 0) return true;
+  if (failedToday.length >= SENTIMENT_MAX_ATTEMPTS_PER_DAY) return false;
+  const last = Math.max(...failedToday.map((d) => d.getTime()));
+  return now.getTime() - last >= SENTIMENT_RETRY_BACKOFF_MS;
+}
+
+/** What a failed row says about itself — kept short; the full error goes to `errors`. */
+export function llmFailureSummary(e: unknown): string {
+  if (e instanceof LlmResponseError) return `LLM call failed: ${e.reason}`;
+  const name = (e as { name?: string } | null)?.name;
+  if (name === "AbortError" || name === "TimeoutError") return "LLM call failed: timed out.";
+  const msg = e instanceof Error ? e.message : String(e);
+  return `LLM call failed: ${msg}`.slice(0, 200);
+}
+
 // ── Stage 2: Sentiment ──────────────────────────────────────────────────────
 //
-// LLM sentiment for each watched stock that doesn't yet have a row dated today,
-// blended with Alpha Vantage scores (read back from ArticleStock) and a crypto
-// Fear & Greed prior. Runs with bounded concurrency under a time budget.
+// LLM sentiment for each watched stock that doesn't yet have a real reading dated
+// today (and hasn't used up its attempts — see above), blended with Alpha Vantage
+// scores (read back from ArticleStock) and a crypto Fear & Greed prior. Runs with
+// bounded concurrency under a time budget.
 export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchStageResult> {
   const errors: string[] = [];
   let created = 0;
+  let failed = 0;
 
   const to = new Date();
   const from = new Date(to.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -45,10 +85,17 @@ export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchS
     errors.push(`Crypto Fear & Greed failed: ${String(e)}`);
   }
 
-  const worklist = await db.stock.findMany({
-    where: { ...universeWhere(), sentiments: { none: { date: { gte: todayUTC } } } },
-    select: { id: true, ticker: true },
+  const candidates = await db.stock.findMany({
+    where: { ...universeWhere(), sentiments: { none: { date: { gte: todayUTC }, failed: false } } },
+    select: {
+      id: true,
+      ticker: true,
+      sentiments: { where: { date: { gte: todayUTC }, failed: true }, select: { date: true } },
+    },
   });
+  const worklist = candidates
+    .filter((s) => shouldAttemptSentiment(s.sentiments.map((r) => r.date), to))
+    .map(({ id, ticker }) => ({ id, ticker }));
 
   const outcome = await processWithBudget(
     worklist,
@@ -96,7 +143,29 @@ export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchS
               : avLinks.reduce((s, e) => s + e.sentimentScore!, 0) / avLinks.length;
         }
 
-        const sentiment = await analyzeSentiment(stock.ticker, uniqueArticles);
+        let sentiment: SentimentResult;
+        try {
+          sentiment = await analyzeSentiment(stock.ticker, uniqueArticles);
+        } catch (e) {
+          // Not a reading — recorded so retries stay bounded and the review can count
+          // it. `score` is a required column, so it holds a placeholder 0 that no reader
+          // sees (they all filter `failed: false`); confidence is left null rather than
+          // the old 0.1 so nothing can mistake it for a low-conviction opinion.
+          await db.sentiment.create({
+            data: {
+              stockId: stock.id,
+              score: 0,
+              failed: true,
+              summary: llmFailureSummary(e),
+              confidence: null,
+              articleCount,
+              avgArticleAgeHours,
+            },
+          });
+          failed++;
+          errors.push(`Sentiment LLM call failed for ${stock.ticker}: ${String(e)}`);
+          return;
+        }
 
         // Evidence-weighted blend: the LLM signal is weighted by its own confidence
         // and how many headlines it read; Alpha Vantage by reported relevance; and
@@ -127,13 +196,21 @@ export async function runSentimentStage(opts: StageOptions = {}): Promise<BatchS
 
         created++;
       } catch (e) {
-        // Caught (not rethrown) so one bad stock doesn't abort the pool; it simply
-        // produces no row and reappears in the next invocation's worklist.
+        // Caught (not rethrown) so one bad stock doesn't abort the pool. These are
+        // non-LLM faults (a DB read, the failed-row write itself); the stock produces
+        // no row and reappears in the next invocation's worklist.
         errors.push(`Sentiment failed for ${stock.ticker}: ${String(e)}`);
       }
     },
     { concurrency: opts.concurrency ?? SENTIMENT_CONCURRENCY, deadline: Date.now() + (opts.budgetMs ?? SENTIMENT_BUDGET_MS) }
   );
+
+  if (failed > 0) {
+    errors.unshift(
+      `${failed} of ${outcome.processed} LLM sentiment call(s) failed this invocation and were recorded as failed rows ` +
+        `(not scores); those names keep their last real reading until a later run succeeds.`
+    );
+  }
 
   return {
     stage: "sentiment",

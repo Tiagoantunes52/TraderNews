@@ -39,7 +39,7 @@ export default async function SentimentPage() {
       stock: {
         include: {
           market: { select: { name: true } },
-          sentiments: { orderBy: { date: "desc" }, take: 30 },
+          sentiments: { where: { failed: false }, orderBy: { date: "desc" }, take: 30 },
         },
       },
     },

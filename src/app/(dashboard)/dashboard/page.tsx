@@ -16,7 +16,7 @@ export default async function OverviewPage() {
     where: { userId: user.id },
     include: {
       stock: {
-        include: { sentiments: { orderBy: { date: "desc" }, take: 1 } },
+        include: { sentiments: { where: { failed: false }, orderBy: { date: "desc" }, take: 1 } },
       },
     },
   });

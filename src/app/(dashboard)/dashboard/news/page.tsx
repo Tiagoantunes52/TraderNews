@@ -101,7 +101,7 @@ export default async function NewsFeedPage({
   const candidateStockIds = [...new Set(candidates.flatMap((c) => c.articleStock.map((as) => as.stockId)))];
   const latestSentiments = candidateStockIds.length
     ? await db.sentiment.findMany({
-        where: { stockId: { in: candidateStockIds } },
+        where: { stockId: { in: candidateStockIds }, failed: false },
         orderBy: { date: "desc" },
         distinct: ["stockId"],
         select: { stockId: true, score: true },

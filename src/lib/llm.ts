@@ -64,12 +64,41 @@ function tierLabel(source?: string): string {
 
 const VALID_HORIZONS = new Set(["near_term", "medium", "long"]);
 
-// A neutral, low-confidence result. Used when the model returns something we
-// can't parse — better than dropping the day's reading entirely, and the low
-// confidence keeps it from moving downstream estimates much.
-function neutralFallback(summary = "Could not parse model response."): SentimentResult {
-  return { score: 0, confidence: 0.1, summary, keyDriver: null, timeHorizon: null, aspects: {} };
+// The model answered, but with nothing usable: an empty body, prose instead of JSON,
+// or JSON without a score.
+//
+// This used to return a "neutral, low-confidence" reading (score 0, confidence 0.1) on
+// the theory that low confidence would keep it from moving anything downstream. It did
+// not work: confidence weights the score, it does not flag it, so a failed call was
+// stored as a genuine NEUTRAL read and everything that classifies a score treated it as
+// one. Between 2026-06-23 and 2026-10-19, 1,749 of these were written — two thirds of
+// the universe in the weeks of 08-31 and 09-07 — and they:
+//   • fired exits: a held name that reads NEUTRAL has lost the conviction that opened
+//     it, so DECAY and SIGNAL closed positions on a model that had said nothing (13 of
+//     the 17 `_RM` DECAY exits since 08-31 landed on a failed call);
+//   • blocked entries, since NEUTRAL is below the entry band;
+//   • contaminated research: `signal-split --bands` read `band-neutral-up` as BEATS on
+//     these rows and MATCHES once they are excluded (OPEN-FINDINGS, 2026-10-21).
+//
+// A failed call is the ABSENCE of a reading, so it throws. The sentiment stage records
+// it as a `failed` row, which every reader skips — the estimate then carries the last
+// real read forward, and says so in its data warnings.
+export class LlmResponseError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "LlmResponseError";
+  }
 }
+
+/**
+ * Summaries the old neutral fallback wrote. Kept only so the backfill migration and
+ * anything auditing history can recognise those rows; new failures carry `failed`.
+ */
+export const LEGACY_FALLBACK_SUMMARIES = [
+  "Empty model response.",
+  "Could not parse model response.",
+  "Model response missing a numeric score.",
+] as const;
 
 function toFiniteNumber(v: unknown): number | null {
   const n = typeof v === "string" ? parseFloat(v) : typeof v === "number" ? v : NaN;
@@ -91,12 +120,13 @@ function parseAspects(raw: unknown): Record<string, SentimentAspect> {
 
 /**
  * Parse the model's chat completion content into a SentimentResult.
- * Tolerant by design: strips markdown fences, clamps out-of-range values,
- * coerces numeric strings, and falls back to neutral/low-confidence on any
- * structural failure instead of throwing.
+ * Tolerant of FORMAT: strips markdown fences, clamps out-of-range values, coerces
+ * numeric strings. Not tolerant of ABSENCE: an empty body, unparseable JSON or a
+ * missing score throws `LlmResponseError`, because there is no reading to return —
+ * see the comment on `LlmResponseError` for what inventing one cost.
  */
 export function parseSentimentResponse(content: string): SentimentResult {
-  if (!content || !content.trim()) return neutralFallback("Empty model response.");
+  if (!content || !content.trim()) throw new LlmResponseError("Empty model response.");
 
   // Strip ```json ... ``` or ``` ... ``` fences some models add despite instructions.
   let text = content.trim();
@@ -113,12 +143,12 @@ export function parseSentimentResponse(content: string): SentimentResult {
   try {
     obj = JSON.parse(text) as Record<string, unknown>;
   } catch {
-    return neutralFallback();
+    throw new LlmResponseError("Could not parse model response.");
   }
-  if (!obj || typeof obj !== "object") return neutralFallback();
+  if (!obj || typeof obj !== "object") throw new LlmResponseError("Could not parse model response.");
 
   const score = toFiniteNumber(obj.overall_score ?? obj.score);
-  if (score == null) return neutralFallback("Model response missing a numeric score.");
+  if (score == null) throw new LlmResponseError("Model response missing a numeric score.");
 
   const confidence = toFiniteNumber(obj.confidence);
   const horizon = typeof obj.time_horizon === "string" && VALID_HORIZONS.has(obj.time_horizon)
@@ -240,7 +270,8 @@ export async function analyzeSentiment(
 
   // One retry, but only for failures a retry can plausibly fix — see
   // isRetriableLlmError. Timeouts are rethrown immediately rather than doubled.
-  // A response that parses badly is handled by parseSentimentResponse.
+  // A response that parses badly throws LlmResponseError from parseSentimentResponse
+  // and is not retried here; the sentiment stage records it and retries on a later run.
   let content: string;
   try {
     content = await callLlm(prompt);

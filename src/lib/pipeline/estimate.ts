@@ -3,6 +3,7 @@ import { scoreToSignal } from "@/lib/indicators";
 import { detectSignalChange, detectVelocitySpike, detectRsiCross, newsVelocityRatio } from "@/lib/alerts";
 import { processWithBudget } from "@/lib/concurrency";
 import { reportError } from "@/lib/observability";
+import { SENTIMENT_CARRIED_FORWARD_WARNING } from "@/lib/sentiment-blend";
 import {
   STAGE_BUDGET_MS,
   processAlerts,
@@ -47,8 +48,11 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
     select: { id: true, ticker: true },
   });
   const universeIds = universe.map((s) => s.id);
+  // `failed: false` everywhere a Sentiment row is read: a failed LLM call is the absence
+  // of a reading (see LlmResponseError in lib/llm.ts), and treating its placeholder 0 as
+  // NEUTRAL is what fired exits on names the model had said nothing about.
   const [sentMax, estToday] = await Promise.all([
-    db.sentiment.groupBy({ by: ["stockId"], where: { stockId: { in: universeIds } }, _max: { date: true } }),
+    db.sentiment.groupBy({ by: ["stockId"], where: { stockId: { in: universeIds }, failed: false }, _max: { date: true } }),
     db.stockEstimate.groupBy({
       by: ["stockId"],
       where: { stockId: { in: universeIds }, date: { gte: todayUTC } },
@@ -72,10 +76,10 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
   const [sentimentRows, quantRows, articleLinks24h, articleLinks7d, oldEstimateRows, prevEstimateRows] = worklistIds.length
     ? await Promise.all([
         db.sentiment.findMany({
-          where: { stockId: { in: worklistIds } },
+          where: { stockId: { in: worklistIds }, failed: false },
           orderBy: { date: "desc" },
           distinct: ["stockId"],
-          select: { stockId: true, score: true, confidence: true, articleCount: true },
+          select: { stockId: true, score: true, confidence: true, articleCount: true, date: true },
         }),
         db.quantAnalysis.findMany({
           where: { stockId: { in: worklistIds }, date: { gte: quantWindowStart } },
@@ -216,6 +220,14 @@ export async function runEstimateStage(opts: StageOptions = {}): Promise<BatchSt
         if (daysToEarnings != null && daysToEarnings <= 5) {
           confidence -= 0.1;
           warnings.push(`Earnings in ${daysToEarnings} day(s) — signals may be unreliable`);
+        }
+        // Flag only — deliberately no confidence penalty. Estimating off the last real
+        // read is what this stage has always done before the day's sentiment lands (see
+        // the header comment), so carrying it forward is not a new behaviour; penalising
+        // it would change sizing and entries, which is a strategy decision. The flag is
+        // what lets the review see how much of the day traded on a carried-forward read.
+        if (latestSentiment.date.getTime() < todayUTC.getTime()) {
+          warnings.push(SENTIMENT_CARRIED_FORWARD_WARNING);
         }
         // Also equivalent: `articleCount` reaches 10 exactly when the window held 10 or
         // more, so this boolean already fires on "newsworthy" and not merely on "the slice

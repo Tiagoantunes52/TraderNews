@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseSentimentResponse, isRetriableLlmError, LlmHttpError } from "@/lib/llm";
+import {
+  parseSentimentResponse,
+  isRetriableLlmError,
+  LlmHttpError,
+  LlmResponseError,
+  LEGACY_FALLBACK_SUMMARIES,
+} from "@/lib/llm";
 
 describe("parseSentimentResponse", () => {
   it("parses a well-formed structured response", () => {
@@ -60,23 +66,50 @@ describe("parseSentimentResponse", () => {
     expect(r.confidence).toBeCloseTo(0.3);
   });
 
-  it("falls back to neutral/low-confidence on unparseable content", () => {
-    const r = parseSentimentResponse("the model refused to answer");
-    expect(r.score).toBe(0);
-    expect(r.confidence).toBe(0.1);
-    expect(r.aspects).toEqual({});
+  // A failed reply is the absence of a reading, never a NEUTRAL one. These used to
+  // return score 0 / confidence 0.1, which every classifier read as NEUTRAL — firing
+  // DECAY/SIGNAL exits on names the model had said nothing about (2026-10-21).
+  const rejects = (content: string, reason: string) => {
+    let thrown: unknown;
+    try {
+      parseSentimentResponse(content);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(LlmResponseError);
+    expect((thrown as LlmResponseError).reason).toBe(reason);
+  };
+
+  it("throws, rather than inventing a neutral read, on unparseable content", () => {
+    rejects("the model refused to answer", "Could not parse model response.");
   });
 
-  it("falls back to neutral on empty content", () => {
-    const r = parseSentimentResponse("");
-    expect(r.score).toBe(0);
-    expect(r.confidence).toBe(0.1);
+  it("throws on empty or whitespace-only content", () => {
+    rejects("", "Empty model response.");
+    rejects("   \n ", "Empty model response.");
   });
 
-  it("falls back to neutral when JSON has no numeric score", () => {
-    const r = parseSentimentResponse('{"summary": "no score here", "confidence": 0.7}');
+  it("throws when the JSON has no numeric score", () => {
+    rejects('{"summary": "no score here", "confidence": 0.7}', "Model response missing a numeric score.");
+  });
+
+  it("throws on JSON that is not an object", () => {
+    rejects("null", "Could not parse model response.");
+  });
+
+  it("still accepts a genuine zero score — neutral is a valid opinion, just not a default", () => {
+    const r = parseSentimentResponse('{"overall_score": 0, "confidence": 0.8, "summary": "Mixed news."}');
     expect(r.score).toBe(0);
-    expect(r.confidence).toBe(0.1);
+    expect(r.confidence).toBeCloseTo(0.8);
+  });
+
+  it("keeps the legacy fallback summaries recognisable for the backfill", () => {
+    // The migration that marks old rows `failed` matches these exact strings.
+    expect(LEGACY_FALLBACK_SUMMARIES).toEqual([
+      "Empty model response.",
+      "Could not parse model response.",
+      "Model response missing a numeric score.",
+    ]);
   });
 
   it("ignores malformed aspect entries and clamps valid ones", () => {
@@ -138,5 +171,18 @@ describe("isRetriableLlmError", () => {
 
   it("keeps the legacy error message so logs stay greppable", () => {
     expect(new LlmHttpError(503).message).toBe("LLM error: 503");
+  });
+});
+
+describe("legacy fallback backfill", () => {
+  it("marks exactly the strings the old fallback wrote", async () => {
+    // If a summary is added to or dropped from LEGACY_FALLBACK_SUMMARIES without the
+    // migration (or vice versa), old fake-NEUTRAL rows would silently stay readable.
+    const { readFileSync, readdirSync } = await import("node:fs");
+    const dir = readdirSync("prisma/migrations").find((d) => d.endsWith("_sentiment_failed"));
+    expect(dir).toBeDefined();
+    const sql = readFileSync(`prisma/migrations/${dir}/migration.sql`, "utf8");
+    const quoted = [...sql.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    expect(new Set(quoted)).toEqual(new Set(LEGACY_FALLBACK_SUMMARIES));
   });
 });

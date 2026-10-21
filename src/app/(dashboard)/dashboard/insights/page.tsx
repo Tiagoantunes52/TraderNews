@@ -67,7 +67,7 @@ export default async function WatchlistInsightsPage() {
     include: {
       stock: {
         include: {
-          sentiments: { orderBy: { date: "desc" }, take: HISTORY },
+          sentiments: { where: { failed: false }, orderBy: { date: "desc" }, take: HISTORY },
           quantAnalyses: { orderBy: { date: "desc" }, take: HISTORY },
           stockEstimates: { orderBy: { date: "desc" }, take: 1 },
         },
