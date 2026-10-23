@@ -71,6 +71,7 @@ import {
   getClock,
   getCalendar,
   getOpenOrders,
+  pendingSellBySymbol,
   cancelOrder,
   submitEntryWithStop,
   submitTrailingStop,
@@ -1161,6 +1162,9 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         for (const o of openOrders) {
           if (o.side === "sell" && (o.type === "stop" || o.type === "trailing_stop")) protectiveBySymbol.set(o.symbol, o);
         }
+        // A non-protective sell already working (queued exit, limit sell) holds the
+        // shares; a second sell is rejected 403, so those names are left to settle.
+        const pendingSells = pendingSellBySymbol(openOrders);
         // Symbols the estimates loop below touches (entered, exited, armed, or
         // repaired) — the final safety-net sweep skips these so it never double-places
         // a protective order on a name we just handled.
@@ -1264,6 +1268,10 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             cfg,
             referenceSessions: staleSessionsByStock.get(est.stockId) ?? 1,
           });
+          if (pendingSells.has(ticker) && action.type !== "ENTER") {
+            managedSymbols.add(ticker);
+            continue;
+          }
           try {
             // The gate may hand back less than asked; re-floor to whole shares (the
             // stop leg needs them) and take the smaller size rather than skipping the
@@ -1381,6 +1389,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             const stockId = stockIdByTicker.get(symbol);
             const simLong = stockId != null && simOpenStockIds.has(stockId);
             const protective = protectiveBySymbol.get(symbol) ?? null;
+            if (pendingSells.has(symbol)) continue;
             try {
               if (!simLong) {
                 // Orphan → flatten. Market-sell takes the whole position (fractional is

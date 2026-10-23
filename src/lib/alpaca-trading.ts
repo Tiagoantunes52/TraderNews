@@ -504,6 +504,20 @@ export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]>
   }));
 }
 
+/**
+ * Resting sells that are NOT a stop/trailing stop (e.g. an exit market order queued
+ * after hours, a limit sell). They hold the position's shares just like a protective
+ * order, so a further sell on the symbol is rejected 403 `available: "0"` until they
+ * resolve — callers should treat the symbol as already being exited and wait.
+ */
+export function pendingSellBySymbol(orders: AlpacaOpenOrder[]): Map<string, AlpacaOpenOrder> {
+  const out = new Map<string, AlpacaOpenOrder>();
+  for (const o of orders) {
+    if (o.side === "sell" && o.type !== "stop" && o.type !== "trailing_stop") out.set(o.symbol, o);
+  }
+  return out;
+}
+
 export type AlpacaClock = { isOpen: boolean; nextClose: string | null };
 
 /** Market clock — drives the near-close trade window (DST/holiday-proof). */

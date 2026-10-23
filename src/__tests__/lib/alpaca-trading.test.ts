@@ -3,6 +3,7 @@ import {
   isPaperTradingConfigured,
   getAccount,
   getPositions,
+  pendingSellBySymbol,
   submitMarketOrder,
   getOrder,
   getOrderByClientOrderId,
@@ -546,5 +547,20 @@ describe("alpaca-trading client", () => {
         "https://paper-api.alpaca.markets/v2/calendar?start=2026-07-01&end=2026-07-06"
       );
     });
+  });
+});
+
+describe("pendingSellBySymbol", () => {
+  const o = (id: string, symbol: string, type: string, side = "sell") => ({
+    id, symbol, type, side, qty: 1, stopPrice: null, trailPercent: null,
+  });
+  it("flags non-protective resting sells that hold shares, ignoring stops and buys", () => {
+    const m = pendingSellBySymbol([
+      o("a", "COST", "market"),
+      o("b", "AAPL", "stop"),
+      o("c", "MSFT", "trailing_stop"),
+      o("d", "NVDA", "limit", "buy"),
+    ]);
+    expect([...m.keys()]).toEqual(["COST"]);
   });
 });
