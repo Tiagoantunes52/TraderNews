@@ -27,6 +27,8 @@ import {
 } from "@/lib/daily-review";
 import { DEFAULT_RISK_CONFIG, type RiskConfig, type Strategy } from "@/lib/paper-trading";
 import { DEFAULT_RISK_LIMITS, type RiskBlockReason } from "@/lib/portfolio-risk";
+import { SENTIMENT_CARRIED_FORWARD_WARNING } from "@/lib/sentiment-blend";
+import { NON_CODE_CODES } from "@/lib/pick-finding";
 
 const cfg: RiskConfig = { ...DEFAULT_RISK_CONFIG };
 const day = (n: number) => new Date(Date.UTC(2026, 6, n));
@@ -803,6 +805,37 @@ describe("auditHealth", () => {
   it("still warns on widespread genuine input degradation", () => {
     const found = auditHealth({ ...healthy, dataWarningCounts: { "No price data — sentiment only": 60 } });
     expect(found.find((x) => x.code === "DATA_WARNING")?.severity).toBe("warn");
+  });
+
+  it("treats carried-forward sentiment as a degraded input, not a market condition", () => {
+    const found = auditHealth({ ...healthy, dataWarningCounts: { [SENTIMENT_CARRIED_FORWARD_WARNING]: 60 } });
+    expect(found.find((x) => x.code === "DATA_WARNING")?.severity).toBe("warn");
+  });
+
+  describe("LLM_FAILURES", () => {
+    it("stays silent with no failed calls, and when the input is absent", () => {
+      expect(codes(auditHealth({ ...healthy, sentimentFailures: { calls: 0, stocksWithoutReading: 0 } }))).not.toContain("LLM_FAILURES");
+      expect(codes(auditHealth(healthy))).not.toContain("LLM_FAILURES");
+    });
+
+    it("reports a thin tail of failures as info", () => {
+      const f = auditHealth({ ...healthy, sentimentFailures: { calls: 6, stocksWithoutReading: 3 } }).find((x) => x.code === "LLM_FAILURES");
+      expect(f?.severity).toBe("info");
+      expect(f?.title).toContain("3 of 100 stocks");
+    });
+
+    it("warns once a tenth of the universe ended the day with no reading", () => {
+      // The weeks of 2026-08-31 and 09-07 ran at ~two thirds of the universe and nothing
+      // in the review could see it, because the failures were stored as NEUTRAL reads.
+      const f = auditHealth({ ...healthy, sentimentFailures: { calls: 140, stocksWithoutReading: 66 } }).find((x) => x.code === "LLM_FAILURES");
+      expect(f?.severity).toBe("warn");
+      expect(f?.detail).toContain("not");
+      expect(f?.refs).toMatchObject({ calls: 140, stocksWithoutReading: 66, universeSize: 100 });
+    });
+
+    it("is an operational finding the improvement agent leaves alone", () => {
+      expect(NON_CODE_CODES.has("LLM_FAILURES")).toBe(true);
+    });
   });
 
   it("surfaces account-health alerts and ignores watchlist ones", () => {

@@ -13,6 +13,15 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 // Weight the market-wide crypto Fear & Greed index as a weak prior only.
 export const FNG_PRIOR_WEIGHT = 0.15;
 
+/**
+ * Data warning on an estimate built from a sentiment reading older than today — the
+ * LLM call failed (or the name had no news to score), so the estimate carried the last
+ * real read forward rather than inventing one. One fixed string, not per-name text, so
+ * the daily review's DATA_WARNING tally counts it as one degraded input (warn once it
+ * covers >25% of estimates). The cause, failed LLM calls, is LLM_FAILURES.
+ */
+export const SENTIMENT_CARRIED_FORWARD_WARNING = "Sentiment carried forward — no fresh reading today";
+
 export type BlendInput = {
   llmScore: number;
   llmConfidence: number; // 0..1

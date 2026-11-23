@@ -10,5 +10,7 @@ Sentry.init({
   environment: process.env.VERCEL_ENV ?? process.env.NODE_ENV,
   release: process.env.VERCEL_GIT_COMMIT_SHA,
   tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? 0.1),
-  sendDefaultPii: false,
+  // v11 replaced `sendDefaultPii` with per-category `dataCollection`, whose defaults collect
+  // more. Keep the old no-auto-PII stance: no auto-populated user.* fields, no cookies.
+  dataCollection: { userInfo: false, cookies: false },
 });

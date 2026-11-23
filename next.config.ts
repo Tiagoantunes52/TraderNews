@@ -1,5 +1,5 @@
 import type { NextConfig } from "next";
-import { withSentryConfig } from "@sentry/nextjs";
+import { withSentryConfig } from "@sentry/nextjs/config";
 
 const isDev = process.env.NODE_ENV === "development";
 
@@ -102,6 +102,7 @@ export default withSentryConfig(nextConfig, {
   authToken: process.env.SENTRY_AUTH_TOKEN,
   sourcemaps: { disable: !process.env.SENTRY_AUTH_TOKEN },
   silent: !process.env.CI,
-  disableLogger: true, // strip Sentry's own debug logging from the client bundle
+  // strip Sentry's own debug logging from the client bundle (replaces v10's `disableLogger`)
+  bundleSizeOptimizations: { excludeDebugStatements: true },
   telemetry: false,
 });

@@ -13,7 +13,9 @@ Sentry.init({
   // (e.g. replaysOnErrorSampleRate: 1.0) once a DSN is wired up if you want it.
   replaysSessionSampleRate: 0,
   replaysOnErrorSampleRate: 0,
-  sendDefaultPii: false,
+  // v11 replaced `sendDefaultPii` with per-category `dataCollection`, whose defaults collect
+  // more. Keep the old no-auto-PII stance: no auto-populated user.* fields, no cookies.
+  dataCollection: { userInfo: false, cookies: false },
 });
 
 // Lets Sentry tie client-side navigations to traces.

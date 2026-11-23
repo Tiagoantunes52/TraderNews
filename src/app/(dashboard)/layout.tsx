@@ -15,6 +15,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
   const isAdmin = user.role === "ADMIN";
 
   const lastSentiment = await db.sentiment.findFirst({
+    where: { failed: false },
     orderBy: { date: "desc" },
     select: { date: true },
   });

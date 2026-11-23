@@ -12,5 +12,7 @@ Sentry.init({
   // Trace a sample of requests for performance; keep low on the free tier.
   tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? 0.1),
   // We attach context explicitly via reportError; don't auto-collect PII.
-  sendDefaultPii: false,
+  // v11 replaced `sendDefaultPii` with per-category `dataCollection`, whose defaults collect
+  // more. Keep the old no-auto-PII stance: no auto-populated user.* fields, no cookies.
+  dataCollection: { userInfo: false, cookies: false },
 });

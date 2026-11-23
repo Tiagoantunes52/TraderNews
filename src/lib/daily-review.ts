@@ -1129,7 +1129,14 @@ export function auditStageErrors(errors: string[]): Finding[] {
 export type HealthInput = {
   universeSize: number;
   estimatesToday: number;
+  /** Real sentiment readings today — rows with `failed: true` are not counted. */
   sentimentsToday: number;
+  /**
+   * Failed LLM sentiment calls today: every failed call, and the universe stocks whose
+   * every attempt failed (so they ended the day with no reading at all). Optional so
+   * older callers and fixtures keep compiling; absent reads as no failures.
+   */
+  sentimentFailures?: { calls: number; stocksWithoutReading: number };
   quantToday: number;
   articlesToday: number;
   dataWarningCounts: Record<string, number>;
@@ -1181,6 +1188,27 @@ export function auditHealth(h: HealthInput): Finding[] {
   }
   if (h.sentimentsToday === 0) {
     out.push(finding("warn", "NO_SENTIMENT", "No sentiment scores today", "The sentiment and combined books run on stale or missing scores."));
+  }
+  // Failed LLM calls. Before 2026-10-21 these were stored as NEUTRAL reads and nothing
+  // here could see them — two thirds of the universe in the weeks of 08-31 and 09-07,
+  // firing exits the whole time. Now they are `failed` rows, and the names keep their
+  // last real reading. Warn once a tenth of the universe has no reading for the day:
+  // below that it is the ordinary tail of a 60s-timeout model, above it the sentiment
+  // the books traded was materially yesterday's.
+  const sf = h.sentimentFailures;
+  if (sf && sf.calls > 0) {
+    const widespread = h.universeSize > 0 && sf.stocksWithoutReading >= h.universeSize * 0.1;
+    out.push(
+      finding(
+        widespread ? "warn" : "info",
+        "LLM_FAILURES",
+        `${sf.stocksWithoutReading} of ${h.universeSize} stocks got no sentiment reading today (${sf.calls} failed LLM call(s))`,
+        `The sentiment model timed out or returned nothing usable. Failed calls are recorded as failed rows, not scores, ` +
+          `so these names traded on their last real reading (estimates flag it as carried forward) — they were not ` +
+          `read as NEUTRAL. A high count is a model/endpoint problem: check the provider's latency and error rate.`,
+        { calls: sf.calls, stocksWithoutReading: sf.stocksWithoutReading, universeSize: h.universeSize }
+      )
+    );
   }
   if (h.articlesToday === 0) {
     out.push(finding("warn", "NO_ARTICLES", "No articles ingested today", "Sentiment has nothing fresh to read, so scores drift toward their previous values."));

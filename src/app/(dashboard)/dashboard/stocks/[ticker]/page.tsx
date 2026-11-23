@@ -33,7 +33,7 @@ export default async function StockDetailPage({ params }: PageProps<"/dashboard/
     where: { ticker: { equals: tickerUpper, mode: "insensitive" } },
     include: {
       market: true,
-      sentiments: { orderBy: { date: "desc" }, take: 30 },
+      sentiments: { where: { failed: false }, orderBy: { date: "desc" }, take: 30 },
       quantAnalyses: { orderBy: { date: "desc" }, take: 1 },
       stockEstimates: { orderBy: { date: "desc" }, take: 1 },
       etfProfile: true,

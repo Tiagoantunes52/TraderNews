@@ -368,14 +368,34 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
 
   // ── 4. Pipeline & data health ──────────────────────────────────────────────
   try {
-    const [universeSize, estimates, sentiments, quant, articles, paperSnap, alerts, missedDays, closeAt] =
+    const [
+      universeSize,
+      estimates,
+      sentiments,
+      failedSentimentCalls,
+      stocksWithoutSentiment,
+      quant,
+      articles,
+      paperSnap,
+      alerts,
+      missedDays,
+      closeAt,
+    ] =
       await Promise.all([
         db.stock.count({ where: universeWhere() }),
         db.stockEstimate.findMany({
           where: { date: { gte: todayUTC }, stock: universeWhere() },
           select: { dataWarnings: true },
         }),
-        db.sentiment.count({ where: { date: { gte: todayUTC } } }),
+        db.sentiment.count({ where: { date: { gte: todayUTC }, failed: false } }),
+        db.sentiment.count({ where: { date: { gte: todayUTC }, failed: true } }),
+        // Every attempt today failed: at least one failed row and no real one.
+        db.stock.count({
+          where: {
+            ...universeWhere(),
+            sentiments: { some: { date: { gte: todayUTC }, failed: true }, none: { date: { gte: todayUTC }, failed: false } },
+          },
+        }),
         db.quantAnalysis.count({ where: { date: { gte: todayUTC } } }),
         db.article.count({ where: { createdAt: { gte: todayUTC } } }),
         db.paperEquitySnapshot.findUnique({
@@ -397,6 +417,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
         universeSize,
         estimatesToday: estimates.length,
         sentimentsToday: sentiments,
+        sentimentFailures: { calls: failedSentimentCalls, stocksWithoutReading: stocksWithoutSentiment },
         quantToday: quant,
         articlesToday: articles,
         dataWarningCounts,
@@ -540,7 +561,7 @@ export async function runReviewStage(): Promise<ReviewStageResult> {
       }),
       // All-time, not windowed: while the slice/count ordering defect is live no row can
       // exceed the slice, so the first row that does is the signal that it was fixed.
-      db.sentiment.aggregate({ _max: { articleCount: true } }),
+      db.sentiment.aggregate({ where: { failed: false }, _max: { articleCount: true } }),
       // Entries above the band cap since it shipped. A silently-reverted knob looks
       // exactly like a working one from the code, so the claim is checked against what
       // the book actually did rather than against the config it was supposed to read.

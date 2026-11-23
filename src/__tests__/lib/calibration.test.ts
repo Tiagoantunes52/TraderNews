@@ -11,6 +11,8 @@ import {
   entrySignalEdge,
   effectiveBets,
   costBpsForStock,
+  etDayKey,
+  sessionPriceSeries,
   reliabilityDiagram,
   equityCurveReturns,
   portfolioMetrics,
@@ -229,6 +231,70 @@ describe("effectiveBets", () => {
   it("passes through trivial sizes", () => {
     expect(effectiveBets(1, 0.9)).toBe(1);
     expect(effectiveBets(0, 0.5)).toBe(0);
+  });
+});
+
+describe("etDayKey", () => {
+  it("maps an after-midnight-UTC evening run back to its New York day", () => {
+    // 01:29 UTC Tue 24 Nov = 20:29 ET Mon 23 Nov (EST, UTC−5).
+    expect(etDayKey(new Date("2026-11-24T01:29:00Z"))).toBe("2026-11-23");
+    // 21:47 UTC Mon 15 Jun = 17:47 ET Mon (EDT, UTC−4).
+    expect(etDayKey(new Date("2026-06-15T21:47:00Z"))).toBe("2026-06-15");
+  });
+
+  it("gives the evening run a next-session entry, not one a session late", () => {
+    const series = prices([
+      ["2026-11-20", 100], // Fri
+      ["2026-11-23", 101], // Mon
+      ["2026-11-24", 102], // Tue
+      ["2026-11-25", 103], // Wed
+    ]);
+    const obs = computeForwardReturns(
+      "X",
+      [est(etDayKey(new Date("2026-11-24T01:29:00Z")), 0.5, "BUY")],
+      series,
+      { horizonDays: 1 }
+    );
+    expect(obs[0].entryDate).toBe("2026-11-24");
+  });
+});
+
+describe("sessionPriceSeries", () => {
+  const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
+
+  it("keeps one point per trading session, last run wins", () => {
+    const out = sessionPriceSeries([
+      { sessionDate: d("2026-11-20"), price: 99 }, // Fri intraday run
+      { sessionDate: d("2026-11-20"), price: 100 }, // Fri after-close run
+      { sessionDate: d("2026-11-20"), price: 100 }, // Sat run repeats Fri close
+      { sessionDate: d("2026-11-20"), price: 100 }, // Sun run repeats Fri close
+      { sessionDate: d("2026-11-23"), price: 103 }, // Mon
+    ]);
+    expect(out).toEqual([
+      { date: "2026-11-20", price: 100 },
+      { date: "2026-11-23", price: 103 },
+    ]);
+  });
+
+  it("drops rows with no session date or no usable price", () => {
+    const out = sessionPriceSeries([
+      { sessionDate: null, price: 100 },
+      { sessionDate: d("2026-11-23"), price: null },
+      { sessionDate: d("2026-11-24"), price: 0 },
+      { sessionDate: d("2026-11-25"), price: 50 },
+    ]);
+    expect(out).toEqual([{ date: "2026-11-25", price: 50 }]);
+  });
+
+  it("no longer manufactures flat weekend bars", () => {
+    const series = sessionPriceSeries([
+      { sessionDate: d("2026-11-20"), price: 100 },
+      { sessionDate: d("2026-11-20"), price: 100 },
+      { sessionDate: d("2026-11-20"), price: 100 },
+      { sessionDate: d("2026-11-23"), price: 105 },
+    ]);
+    const obs = computeForwardReturns("X", [est("2026-11-19", 0.5, "BUY")], series, { horizonDays: 1 });
+    expect(obs[0].rawReturn).toBeCloseTo(0.05, 10);
   });
 });
 

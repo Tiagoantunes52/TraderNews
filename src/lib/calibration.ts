@@ -74,6 +74,46 @@ export function roundTripCost(rawReturn: number, costBpsPerSide: number): number
 }
 
 /**
+ * The New York calendar day ("YYYY-MM-DD") of an instant — the decision day for a
+ * pipeline run. A run at 01:29 UTC Tuesday is a Monday-evening decision in ET, so
+ * keying it by its UTC day would skip Tuesday's session entirely; keying by ET day
+ * makes the first session strictly after it Tuesday, which is the honest T+1.
+ */
+export function etDayKey(at: Date): string {
+  // en-CA formats as YYYY-MM-DD.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(at);
+}
+
+/**
+ * One price per TRADING SESSION from QuantAnalysis rows. Rows must be passed in run
+ * order (ascending `date`); the last run for a session wins, so an after-close run
+ * overwrites an intraday one. Rows without a `sessionDate` are dropped rather than
+ * guessed.
+ *
+ * Keying by run day instead (the previous behaviour) put a point on every weekend
+ * and holiday run that simply repeated the last close: ~a third of "bars" were
+ * flat, so 1-bar returns were 0 — a guaranteed loss after cost — and an h-bar
+ * horizon spanned far fewer than h trading sessions.
+ */
+export function sessionPriceSeries(
+  rows: { sessionDate: Date | null; price: number | null }[]
+): PricePoint[] {
+  const bySession = new Map<string, number>();
+  for (const r of rows) {
+    if (r.sessionDate == null || r.price == null || !(r.price > 0)) continue;
+    bySession.set(r.sessionDate.toISOString().slice(0, 10), r.price);
+  }
+  return [...bySession.entries()]
+    .map(([date, price]) => ({ date, price }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/**
  * Join one stock's estimates to its price series and produce T+1-anchored,
  * net-of-cost forward returns at `horizonDays`.
  *
@@ -264,9 +304,9 @@ export const COST_BPS = { liquidEquity: 5, equity: 20, crypto: 40 } as const;
 
 /**
  * Per-side transaction cost (bps) for one stock. `isCrypto` and `atrPct` come
- * straight from the market taxonomy + `QuantAnalysis`; `isLiquid` is an optional
- * future refinement (defaults to the mid equity tier). ATR scales the base by
- * `clamp(atrPct / typical, 0.5, 3)`.
+ * straight from the market taxonomy + `QuantAnalysis`; `isLiquid` selects the
+ * liquid-equity tier (callers pass it for exchange-listed US equities). ATR scales
+ * the base by `clamp(atrPct / typical, 0.5, 3)`.
  */
 export function costBpsForStock(opts: {
   isCrypto?: boolean;

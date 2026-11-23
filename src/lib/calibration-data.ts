@@ -19,6 +19,8 @@ import {
   entrySignalEdge,
   effectiveBets,
   costBpsForStock,
+  etDayKey,
+  sessionPriceSeries,
   evaluateGate,
   selectGatedBook,
   type EstimatePoint,
@@ -140,6 +142,7 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
       select: {
         stockId: true,
         date: true,
+        sessionDate: true,
         price: true,
         atrPct: true,
         rsi14: true,
@@ -155,18 +158,19 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
 
   const tickerById = new Map(stocks.map((s) => [s.id, s.ticker]));
 
-  // Per-stock price series (one point per UTC day; last write wins) + latest ATR%.
-  const pricesByStock = new Map<string, Map<string, number>>();
+  // Per-stock price series — one point per TRADING SESSION (see sessionPriceSeries;
+  // keying by run day put stale weekend/holiday repeats into the series) — plus the
+  // latest ATR%. Decision-day indicators are keyed by the run's ET day, the same key
+  // the estimates use, so an observation finds the indicators that formed it.
+  const quantRowsByStock = new Map<string, { sessionDate: Date | null; price: number | null }[]>();
   const latestAtrByStock = new Map<string, number | null>();
   const indicators = new Map<string, IndicatorRow>();
   for (const q of quant) {
-    if (q.price != null && q.price > 0) {
-      let m = pricesByStock.get(q.stockId);
-      if (!m) pricesByStock.set(q.stockId, (m = new Map()));
-      m.set(dayKey(q.date), q.price);
-    }
+    let rows = quantRowsByStock.get(q.stockId);
+    if (!rows) quantRowsByStock.set(q.stockId, (rows = []));
+    rows.push({ sessionDate: q.sessionDate, price: q.price });
     if (q.atrPct != null) latestAtrByStock.set(q.stockId, q.atrPct);
-    indicators.set(`${q.stockId}|${dayKey(q.date)}`, {
+    indicators.set(`${q.stockId}|${etDayKey(q.date)}`, {
       rsi14: q.rsi14,
       momentum: q.relativeStr7d ?? q.change7d,
       macdHistogram: q.macdHistogram,
@@ -175,14 +179,21 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
     });
   }
 
-  // Per-stock estimate series (one per UTC day; last write wins, so the final
+  // `quant` is ordered by run date, so the last run per session wins.
+  const pricesByStock = new Map<string, PricePoint[]>();
+  for (const [stockId, rows] of quantRowsByStock) pricesByStock.set(stockId, sessionPriceSeries(rows));
+
+  // Per-stock estimate series (one per ET day; last write wins, so the final
   // version of an intraday-recomputed estimate is used — T+1 entry keeps it honest).
+  // ET day, not UTC day: the evening run lands after 00:00 UTC, and a UTC key would
+  // push its entry a whole session late.
   const estByStock = new Map<string, Map<string, EstimatePoint>>();
   for (const e of estimates) {
     let m = estByStock.get(e.stockId);
     if (!m) estByStock.set(e.stockId, (m = new Map()));
-    m.set(dayKey(e.date), {
-      date: dayKey(e.date),
+    const key = etDayKey(e.date);
+    m.set(key, {
+      date: key,
       sentimentScore: e.sentimentScore,
       quantScore: e.quantScore,
       combinedScore: e.combinedScore,
@@ -191,22 +202,24 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
     });
   }
 
-  const toSortedPrices = (m: Map<string, number>): PricePoint[] =>
-    [...m.entries()].map(([date, price]) => ({ date, price })).sort((a, b) => a.date.localeCompare(b.date));
-
   // Build the net-of-cost observations across all stocks for one horizon. `costMult`
   // doubles the per-stock cost for the gate's 2× cost-stress check.
   const buildObservations = (horizon: number, costMult = 1): Observation[] => {
     const all: Observation[] = [];
     for (const [stockId, estMap] of estByStock) {
-      const priceMap = pricesByStock.get(stockId);
-      if (!priceMap) continue;
+      const prices = pricesByStock.get(stockId);
+      if (!prices || prices.length === 0) continue;
       const ticker = tickerById.get(stockId) ?? "";
+      const isCrypto = isCryptoTicker(ticker);
+      // Every non-crypto name here is an exchange-listed US equity traded through
+      // Alpaca: the liquid tier (5 bps/side), still ATR-scaled up to 3× and still
+      // stress-tested at 2×. The mid tier (20 bps × ATR) charged ~0.6–1.2% per round
+      // trip on this watchlist — an order of magnitude above realistic spreads.
       const costBps =
         costMult *
-        costBpsForStock({ isCrypto: isCryptoTicker(ticker), atrPct: latestAtrByStock.get(stockId) ?? null });
+        costBpsForStock({ isCrypto, isLiquid: !isCrypto, atrPct: latestAtrByStock.get(stockId) ?? null });
       const ests = [...estMap.values()].sort((a, b) => a.date.localeCompare(b.date));
-      all.push(...computeForwardReturns(stockId, ests, toSortedPrices(priceMap), { horizonDays: horizon, costBpsPerSide: costBps }));
+      all.push(...computeForwardReturns(stockId, ests, prices, { horizonDays: horizon, costBpsPerSide: costBps }));
     }
     return all;
   };
@@ -245,7 +258,7 @@ export async function loadCalibrationReport(): Promise<CalibrationReport> {
   };
 
   // Equal-weight watchlist buy-and-hold + concentration breadth.
-  const perStockSorted = [...pricesByStock.values()].map(toSortedPrices).filter((p) => p.length >= 2);
+  const perStockSorted = [...pricesByStock.values()].filter((p) => p.length >= 2);
   const ewReturns = perStockSorted.map((p) => p[p.length - 1].price / p[0].price - 1);
   const watchlistReturn = ewReturns.length ? ewReturns.reduce((s, v) => s + v, 0) / ewReturns.length : null;
 

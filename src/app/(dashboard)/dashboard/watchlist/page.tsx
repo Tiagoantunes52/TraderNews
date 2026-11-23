@@ -44,7 +44,7 @@ export default async function WatchlistPage() {
       stock: {
         include: {
           market: { select: { name: true } },
-          sentiments: { orderBy: { date: "desc" }, take: 1, select: { score: true } },
+          sentiments: { where: { failed: false }, orderBy: { date: "desc" }, take: 1, select: { score: true } },
         },
       },
     },
