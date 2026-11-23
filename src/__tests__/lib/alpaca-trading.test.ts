@@ -3,6 +3,8 @@ import {
   isPaperTradingConfigured,
   getAccount,
   getPositions,
+  pendingSellBySymbol,
+  freeQtyAfterPendingSells,
   submitMarketOrder,
   getOrder,
   getOrderByClientOrderId,
@@ -290,7 +292,10 @@ describe("alpaca-trading client", () => {
     });
 
     it("cancelOrder DELETEs by id and tolerates 404/422", async () => {
-      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 204 } as Response);
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
       vi.stubGlobal("fetch", mockFetch);
       await cancelOrder("o9");
       const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
@@ -304,15 +309,75 @@ describe("alpaca-trading client", () => {
       await expect(cancelOrder("o9")).rejects.toThrow("Alpaca cancel error: 500");
     });
 
+    it("cancelOrder waits for the order to actually settle before returning", async () => {
+      // A 204 on the DELETE only means the request was accepted — Alpaca still shows
+      // the order (and its held shares) as "pending_cancel" for a beat afterward. A
+      // caller that resubmits into those shares the instant cancelOrder resolves must
+      // not race that settlement, so cancelOrder should keep polling until the order
+      // reaches a terminal status.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "pending_cancel" }))
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await cancelOrder("o9");
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("cancelOrder keeps waiting through a transient read failure, then settles", async () => {
+      // A 5xx on the status poll means we could not READ the order — it says nothing
+      // about whether the cancel settled. Treating it as "gone" (the original fix did)
+      // hands the caller a false all-clear and reopens the 403 race precisely when the
+      // broker is flaky, which is when races are most likely.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      // 3 fetchWithRetry attempts burn the 500s, then the canceled read lands.
+      mockFetch
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response)
+        .mockResolvedValueOnce(jsonResponse({ id: "o9", status: "canceled" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+    });
+
+    it("cancelOrder returns as soon as the order 404s — nothing left holding shares", async () => {
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "not found" } as Response);
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).resolves.toBeUndefined();
+      expect(mockFetch).toHaveBeenCalledTimes(2); // no pointless polling after a 404
+    });
+
+    it("cancelOrder throws rather than silently giving up when the order never settles", async () => {
+      // Resolving here would promise the caller the shares are free when we never saw
+      // that happen; its resubmit would then be rejected 403 and read as an order-
+      // contents bug. Resolving means settled, throwing means unconfirmed — never both.
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+        .mockResolvedValue(jsonResponse({ id: "o9", status: "pending_cancel" }));
+      vi.stubGlobal("fetch", mockFetch);
+      await expect(cancelOrder("o9")).rejects.toThrow(/did not settle/);
+    });
+
     it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
       const mockFetch = vi.fn().mockResolvedValue(
-        jsonResponse([{ id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", stop_price: "92.1", trail_percent: null }])
+        jsonResponse([
+          { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", filled_qty: "0", stop_price: "92.1", trail_percent: null },
+        ])
       );
       vi.stubGlobal("fetch", mockFetch);
       const orders = await getOpenOrders("AAPL");
       expect(mockFetch.mock.calls[0][0]).toBe("https://paper-api.alpaca.markets/v2/orders?status=open&symbols=AAPL");
       expect(orders).toEqual([
-        { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: 3, stopPrice: 92.1, trailPercent: null },
+        { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: 3, filledQty: 0, stopPrice: 92.1, trailPercent: null },
       ]);
     });
 
@@ -485,5 +550,56 @@ describe("alpaca-trading client", () => {
         "https://paper-api.alpaca.markets/v2/calendar?start=2026-07-01&end=2026-07-06"
       );
     });
+  });
+});
+
+describe("pendingSellBySymbol", () => {
+  const o = (
+    id: string,
+    symbol: string,
+    type: string,
+    side = "sell",
+    qty: number | null = 1,
+    filledQty: number | null = null
+  ) => ({ id, symbol, type, side, qty, filledQty, stopPrice: null, trailPercent: null });
+
+  it("flags non-protective resting sells that hold shares, ignoring stops and buys", () => {
+    const m = pendingSellBySymbol([
+      o("a", "COST", "market"),
+      o("b", "AAPL", "stop"),
+      o("c", "MSFT", "trailing_stop"),
+      o("d", "NVDA", "limit", "buy"),
+    ]);
+    expect([...m.keys()]).toEqual(["COST"]);
+    expect(m.get("COST")).toEqual({ qty: 1, orders: [expect.objectContaining({ id: "a" })] });
+  });
+
+  it("sums the unfilled shares across a symbol's pending sells", () => {
+    const m = pendingSellBySymbol([
+      o("a", "COST", "market", "sell", 0.3),
+      o("b", "COST", "limit", "sell", 4, 1.5), // partially filled: 2.5 still held
+    ]);
+    expect(m.get("COST")?.qty).toBeCloseTo(2.8);
+    expect(m.get("COST")?.orders.map((x) => x.id)).toEqual(["a", "b"]);
+  });
+
+  it("counts a sell with no share qty (notional) as holding everything", () => {
+    expect(pendingSellBySymbol([o("a", "COST", "market", "sell", null)]).get("COST")?.qty).toBe(Infinity);
+  });
+});
+
+describe("freeQtyAfterPendingSells", () => {
+  it("leaves nothing free when pending sells hold the whole position", () => {
+    expect(freeQtyAfterPendingSells(1, 1)).toBe(0);
+    expect(freeQtyAfterPendingSells(5, 10)).toBe(0);
+    expect(freeQtyAfterPendingSells(5, Infinity)).toBe(0);
+  });
+
+  it("frees the whole shares a fractional pending trim doesn't hold", () => {
+    expect(freeQtyAfterPendingSells(5.3, 0.3)).toBe(5);
+  });
+
+  it("frees what a partial manual sell leaves", () => {
+    expect(freeQtyAfterPendingSells(10, 3)).toBe(7);
   });
 });

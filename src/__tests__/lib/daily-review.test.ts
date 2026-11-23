@@ -849,6 +849,17 @@ describe("classifyStageError / auditStageErrors", () => {
     expect(classifyStageError("Alpaca open-orders fetch failed: ECONNRESET")).toBe("BROKER_API_ERROR");
   });
 
+  it("routes an unsettled cancel to the operator, not to the improvement agent", () => {
+    // cancelOrder throws this when the broker never confirms a cancel settled. It is a
+    // broker-liveness condition, not a bad request — BROKER_ORDER_REJECTED would send
+    // the agent to rewrite order-construction code that is already correct. The wording
+    // must keep avoiding the literal "order error: 4xx" that the rejection test matches.
+    const msg =
+      "Alpaca broker action failed for VRTX: Error: Alpaca cancel did not settle: " +
+      "efb7523f-6e86-4b6a-bf0e-8abc98455171 still working after 5 checks — shares may still be held";
+    expect(classifyStageError(msg)).toBe("BROKER_API_ERROR");
+  });
+
   it("falls back to the catch-all for anything unrecognized", () => {
     expect(classifyStageError("Orphan-exit sold XYZ but found no Stock row to record it")).toBe("STAGE_ERROR");
   });

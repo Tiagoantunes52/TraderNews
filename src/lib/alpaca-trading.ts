@@ -1,5 +1,21 @@
 import { fetchWithRetry } from "@/lib/http";
 import { fromAlpacaSymbol, toAlpacaSymbol } from "@/lib/market-utils";
+import { TERMINAL_ORDER_STATUS } from "@/lib/paper-trading";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Carries the HTTP status alongside the message, so callers can distinguish "the
+ * broker says this is gone" (404) from "the broker could not answer" (5xx/429).
+ * The message is byte-identical to the plain Error it replaces — `classifyStageError`
+ * routes on message shape, so changing it would silently re-file these errors.
+ */
+export class AlpacaHttpError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`Alpaca trading error: ${status} — ${body}`);
+    this.name = "AlpacaHttpError";
+  }
+}
 
 // Alpaca paper Trading API client (issue #14). Places the REAL (simulated) orders
 // for the combined-signal book on a paper account and reads back fills + equity.
@@ -85,7 +101,7 @@ async function apiGet<T>(path: string): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Alpaca trading error: ${res.status} — ${body}`);
+    throw new AlpacaHttpError(res.status, body);
   }
   return (await res.json()) as T;
 }
@@ -408,7 +424,23 @@ export async function submitStopSell(input: {
   );
 }
 
-/** Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent. */
+/**
+ * Cancel an order by id. Tolerates 404/422 (already filled/canceled) — idempotent.
+ *
+ * A 204 here only means the cancel request was accepted, not that the shares it held
+ * are free yet — Alpaca settles the order to `canceled` asynchronously, so a caller
+ * that immediately resubmits into the same shares (a repair/re-anchor replacing a
+ * working stop) can still get a 403 "insufficient qty available" against the order it
+ * just canceled. Poll briefly for the order to actually reach a terminal state before
+ * returning, so callers can submit the replacement right after.
+ *
+ * Resolving means settled. Throwing means we could not confirm it — never both.
+ */
+// ~1s of total patience, against the ~280ms Alpaca actually took to release a
+// cancelled stop's shares on 2026-09-11 (the VRTX rejection that prompted this).
+const CANCEL_SETTLE_POLLS = 5;
+const CANCEL_SETTLE_INTERVAL_MS = 200;
+
 export async function cancelOrder(id: string): Promise<void> {
   const res = await fetchWithRetry(`${baseUrl()}/v2/orders/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -419,6 +451,30 @@ export async function cancelOrder(id: string): Promise<void> {
     const text = await res.text().catch(() => "");
     throw new Error(`Alpaca cancel error: ${res.status} — ${text}`);
   }
+  // 404/422 on the DELETE means the order was already gone or already terminal
+  // (filled/canceled). There is no pending settlement to wait on and nothing holding
+  // shares, so skip the poll entirely rather than watching a corpse for a second.
+  if (!res.ok) return;
+  for (let attempt = 0; attempt < CANCEL_SETTLE_POLLS; attempt++) {
+    try {
+      if (TERMINAL_ORDER_STATUS.has((await getOrder(id)).status)) return;
+    } catch (e) {
+      // 404 is the one answer that ends the wait: the broker has no such order, so
+      // nothing is holding shares. Anything else (5xx, 429, a transport failure) is
+      // us being unable to READ the status, which says nothing about whether the
+      // cancel settled — keep waiting rather than reporting success we can't see.
+      if (e instanceof AlpacaHttpError && e.status === 404) return;
+    }
+    if (attempt < CANCEL_SETTLE_POLLS - 1) await sleep(CANCEL_SETTLE_INTERVAL_MS);
+  }
+  // Never silently: resolving here would tell the caller the shares are free when we
+  // could not confirm it, and the resubmit it makes next would be rejected 403 as an
+  // apparent order-contents bug — exactly the invisible dropped stop/exit this wait
+  // exists to prevent. Callers wrap broker actions in try/catch and push to the
+  // stage's error list, so this surfaces as an operational BROKER_API_ERROR.
+  throw new Error(
+    `Alpaca cancel did not settle: ${id} still working after ${CANCEL_SETTLE_POLLS} checks — shares may still be held`
+  );
 }
 
 export type AlpacaOpenOrder = {
@@ -427,6 +483,8 @@ export type AlpacaOpenOrder = {
   type: string; // "stop" | "trailing_stop" | "limit" | ...
   side: string;
   qty: number | null;
+  /** Shares already filled on a partially-filled order; those no longer hold anything. */
+  filledQty?: number | null;
   stopPrice: number | null;
   trailPercent: number | null;
 };
@@ -435,7 +493,16 @@ export type AlpacaOpenOrder = {
 export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]> {
   const q = symbol ? `?status=open&symbols=${encodeURIComponent(toAlpacaSymbol(symbol))}` : "?status=open";
   const raw = await apiGet<
-    Array<{ id: string; symbol: string; type: string; side: string; qty?: string; stop_price?: string | null; trail_percent?: string | null }>
+    Array<{
+      id: string;
+      symbol: string;
+      type: string;
+      side: string;
+      qty?: string;
+      filled_qty?: string;
+      stop_price?: string | null;
+      trail_percent?: string | null;
+    }>
   >(`/v2/orders${q}`);
   return raw.map((o) => ({
     id: o.id,
@@ -443,9 +510,45 @@ export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]>
     type: o.type,
     side: o.side,
     qty: num(o.qty),
+    filledQty: num(o.filled_qty),
     stopPrice: num(o.stop_price),
     trailPercent: num(o.trail_percent),
   }));
+}
+
+/** Non-protective resting sells on one symbol, and how many shares they hold. */
+export type PendingSells = { qty: number; orders: AlpacaOpenOrder[] };
+
+/**
+ * Resting sells that are NOT a stop/trailing stop (e.g. an exit market order queued
+ * after hours, a limit sell), with the shares each symbol's orders still hold
+ * (qty − filledQty, summed). Those shares are unavailable to any further sell — Alpaca
+ * rejects one 403 `available: "0"` — so callers act only on what is left free (see
+ * freeQtyAfterPendingSells). A sell with no share qty (notional) can't be sized, so it
+ * is counted as holding everything.
+ */
+export function pendingSellBySymbol(orders: AlpacaOpenOrder[]): Map<string, PendingSells> {
+  const out = new Map<string, PendingSells>();
+  for (const o of orders) {
+    if (o.side !== "sell" || o.type === "stop" || o.type === "trailing_stop") continue;
+    const held = o.qty == null ? Number.POSITIVE_INFINITY : Math.max(0, o.qty - (o.filledQty ?? 0));
+    const entry = out.get(o.symbol) ?? { qty: 0, orders: [] };
+    entry.qty += held;
+    entry.orders.push(o);
+    out.set(o.symbol, entry);
+  }
+  return out;
+}
+
+/**
+ * Shares of a long position not already held by pending (non-protective) sells — what
+ * an exit, trim or stop may still act on. 0 means the whole position is already being
+ * sold and the symbol should be left to settle. Rounded to Alpaca's 9-dp share
+ * precision so fractional subtraction can't leave a phantom 1e-15 share.
+ */
+export function freeQtyAfterPendingSells(positionQty: number, pendingQty: number): number {
+  const free = Math.round((positionQty - pendingQty) * 1e9) / 1e9;
+  return free > 0 ? free : 0;
 }
 
 export type AlpacaClock = { isOpen: boolean; nextClose: string | null };
