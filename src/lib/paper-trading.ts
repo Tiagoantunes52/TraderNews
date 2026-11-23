@@ -136,7 +136,7 @@ export type RiskConfig = {
   entryScoreMax: number;
   minConfidence: number; // confidence floor for an entry (skips dust positions)
   riskPerTrade: number; // $ lost if the stop fires at confidence 1 — drives sizing
-  insiderHoldDays: number; // event-book fixed holding period (UTC days ≈ 40 trading days)
+  insiderHoldDays: number; // event-book fixed holding period (UTC days; 28 ≈ 20 trading days)
   insiderNotional: number; // $ per insider-event position (flat — no confidence weighting)
   brokerReentryRuns: number; // runs before the live book may re-enter a name it exited (0 = never)
   /**
@@ -177,7 +177,9 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   riskPerTrade: 80,
   // Insider event book (issue #57): ~40 trading days ≈ 56 calendar days, mid-range
   // of the research-backed 20–60-day drift window for insider cluster buys.
-  insiderHoldDays: 56,
+  // 28 calendar ≈ 20 trading days: where the backtested large-buy edge peaked
+  // (+2.4% excess at 20d, decaying to +1.5% by 60d). Was 56 (≈ 40 trading days).
+  insiderHoldDays: 28,
   insiderNotional: 1000,
   // 0 = drop the quant leg from the COMBINED entry decision (it stays in the exit).
   // See the field comment on RiskConfig for the evidence behind the split.

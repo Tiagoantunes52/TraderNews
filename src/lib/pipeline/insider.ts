@@ -2,7 +2,13 @@ import { db } from "@/lib/db";
 import { getInsiderSentiment } from "@/lib/finnhub";
 import { processWithBudget } from "@/lib/concurrency";
 import { getInsiderTxns, isInsiderEligible } from "@/lib/insider-sources";
-import { summarizeInsider, detectInsiderClusterBuy, detectInsiderFlowShift, detectCsuiteBuy } from "@/lib/insider-detect";
+import {
+  summarizeInsider,
+  detectInsiderClusterBuy,
+  detectInsiderFlowShift,
+  detectCsuiteBuy,
+  detectLargeBuy,
+} from "@/lib/insider-detect";
 import { reportError } from "@/lib/observability";
 import {
   STAGE_BUDGET_MS,
@@ -26,7 +32,7 @@ const INSIDER_BACKFILL_DAYS = Number(process.env.INSIDER_BACKFILL_DAYS) || 90;
 // Insider (Form 4) transactions for each watched US-equity lacking today's
 // summary. Persists raw transactions (idempotent via dedupKey), rolls them into
 // a per-day InsiderSummary, and fires transition alerts (cluster buy, net-flow
-// shift). Non-US / ETF / crypto are filtered out of the worklist — no API call,
+// shift, C-suite buy, and ≥ $1M individual buy on first sight of the filing). Non-US / ETF / crypto are filtered out of the worklist — no API call,
 // no error. Buy-biased and noise-filtered: only open-market P/S feed the signals.
 export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchStageResult> {
   const errors: string[] = [];
@@ -51,6 +57,20 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
     async (stock) => {
       try {
         const { txns } = await getInsiderTxns(stock.ticker, since);
+
+        // Which open-market buys are we seeing for the first time? Checked BEFORE the
+        // insert below, so INSIDER_LARGE_BUY fires once per filing (transition-only),
+        // never again on the overlapping backfill window's re-fetches.
+        const buys = txns.filter((t) => t.txnType === "OPEN_MARKET_BUY");
+        let newBuys = buys;
+        if (buys.length > 0) {
+          const seen = await db.insiderTransaction.findMany({
+            where: { dedupKey: { in: buys.map((t) => t.dedupKey) } },
+            select: { dedupKey: true },
+          });
+          const seenKeys = new Set(seen.map((r) => r.dedupKey));
+          newBuys = buys.filter((t) => !seenKeys.has(t.dedupKey));
+        }
 
         // Persist raw transactions — idempotent via the unique dedupKey, so the
         // overlapping rolling window re-upserts as no-ops each run.
@@ -130,6 +150,18 @@ export async function runInsiderStage(opts: StageOptions = {}): Promise<BatchSta
         if (flowAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: flowAlert });
         const csuiteAlert = detectCsuiteBuy(stock.ticker, prev, summary);
         if (csuiteAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: csuiteAlert });
+        // Same cold-start guard as the summary detectors: a stock's first-ever run
+        // stores its 90-day backfill silently instead of alerting on all of it.
+        if (prev != null && newBuys.length > 0) {
+          // Earliest price bar ≈ listing date, for the IPO-allocation lockout.
+          const firstBar = await db.priceBar.findFirst({
+            where: { stockId: stock.id },
+            orderBy: { date: "asc" },
+            select: { date: true },
+          });
+          const largeBuyAlert = detectLargeBuy(stock.ticker, newBuys, { now: to, firstPriceDate: firstBar?.date ?? null });
+          if (largeBuyAlert) pendingAlerts.push({ stockId: stock.id, ticker: stock.ticker, draft: largeBuyAlert });
+        }
       } catch (e) {
         errors.push(`Insider failed for ${stock.ticker}: ${String(e)}`);
       }

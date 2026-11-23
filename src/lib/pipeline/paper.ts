@@ -61,6 +61,7 @@ import { loadTradingConfig } from "@/lib/trading-config";
 import type { DecisionRecord, PaperRunLog } from "@/lib/daily-review";
 import { buildConfidenceCalibrator, isConfCalibrationEnabled } from "@/lib/confidence-calibration";
 import { PRIMARY_HORIZON, type CalibrationReport } from "@/lib/calibration-data";
+import { etDayKey } from "@/lib/calibration";
 import {
   isPaperTradingConfigured,
   getAccount,
@@ -871,21 +872,23 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
     }
   };
   // ── Insider event book (issue #57; ship-dark: PAPER_INSIDER_BOOK=1) ─────────
-  // Event-driven, NOT estimate-driven: open on an insider cluster-buy / C-suite-buy
-  // alert (fired by the insider stage), hold a fixed multi-week period, close on
+  // Event-driven, NOT estimate-driven: open on an insider cluster-buy / C-suite-buy /
+  // large-buy (≥ $1M, individuals) alert (fired by the insider stage), hold a fixed multi-week period, close on
   // expiry — time is the only exit, so the book measures the event's raw drift.
   // Runs before the snapshots so SIM_INSIDER gets today's equity point too.
   if (isInsiderBookEnabled()) {
     try {
-      const eventSince = new Date(todayUTC.getTime() - 3 * 86_400_000); // covers weekends/missed days
+      // 5 days: covers a weekend plus the one-session entry deferral below, so an alert
+      // fired Friday evening is still in view when Monday's close becomes available.
+      const eventSince = new Date(todayUTC.getTime() - 5 * 86_400_000);
       const [events, insiderOpen] = await Promise.all([
         db.alert.findMany({
           where: {
-            type: { in: ["INSIDER_CLUSTER_BUY", "INSIDER_CSUITE_BUY"] },
+            type: { in: ["INSIDER_CLUSTER_BUY", "INSIDER_CSUITE_BUY", "INSIDER_LARGE_BUY"] },
             createdAt: { gte: eventSince },
             stockId: { not: null },
           },
-          select: { stockId: true, stock: { select: { ticker: true } } },
+          select: { stockId: true, createdAt: true, stock: { select: { ticker: true } } },
         }),
         db.simPosition.findMany({
           where: { strategy: "INSIDER", status: "OPEN" },
@@ -901,10 +904,23 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               where: { stockId: { in: insiderStockIds }, price: { not: null } },
               orderBy: { date: "desc" },
               distinct: ["stockId"],
-              select: { stockId: true, price: true },
+              select: { stockId: true, price: true, sessionDate: true },
             })
           : [];
       const insiderPrice = new Map(insiderQuant.map((q) => [q.stockId, q.price!]));
+      const insiderSession = new Map(
+        insiderQuant.map((q) => [q.stockId, q.sessionDate ? q.sessionDate.toISOString().slice(0, 10) : null])
+      );
+      // ET day of each stock's earliest in-window alert. Entry must use a close from a
+      // LATER session: Form 4s land after the bell, so the close on the alert's own day
+      // (or Friday's close for a weekend alert) predates the information — buying it
+      // would book the filing-day reaction the strategy could never have captured.
+      const alertDayByStock = new Map<string, string>();
+      for (const e of events) {
+        const d = etDayKey(e.createdAt);
+        const prevDay = alertDayByStock.get(e.stockId!);
+        if (prevDay == null || d < prevDay) alertDayByStock.set(e.stockId!, d);
+      }
 
       // Manage open positions: close on hold expiry, else mark to the latest close.
       for (const p of insiderOpen) {
@@ -936,6 +952,9 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
         const ticker = tickerById.get(stockId);
         const price = insiderPrice.get(stockId);
         if (!ticker || !isPaperTradeEligible(ticker) || price == null || price <= 0) continue;
+        const session = insiderSession.get(stockId);
+        const alertDay = alertDayByStock.get(stockId);
+        if (session == null || alertDay == null || session <= alertDay) continue; // no post-alert close yet → next run
         try {
           await db.simPosition.create({
             data: {

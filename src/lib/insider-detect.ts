@@ -190,3 +190,76 @@ export function detectCsuiteBuy(
   }
   return null;
 }
+
+// ── Large individual open-market buy (INSIDER_LARGE_BUY) ─────────────────────
+//
+// Backtest (Aug 2021 – Nov 2026, 99 events / 49 stocks, see the Trader News project
+// doc `claude/backtest-findings-2026-11.md`): open-market buys ≥ $1M were followed by
+// +2.4% excess return vs the watchlist over 20 trading days (t≈2.5, 62% hit), +2.8%
+// for individuals vs +0.6% for funds/corporates. Smaller buys and multi-insider
+// clusters showed no reliable edge. Pre-registered as the INSIDER book's rule; judge
+// it on ~50 fresh events, not on the backtest.
+
+export const LARGE_BUY_MIN_VALUE = 1_000_000; // USD summed over the stock's new qualifying buys
+export const LARGE_BUY_FRESH_DAYS = 7; // only filings this recent can fire (no stale backfill alerts)
+export const IPO_LOCKOUT_DAYS = 180; // buys this soon after listing are IPO allocations, not conviction
+const MAX_SANE_PRICE = 100_000; // a "price" above this is a parse error (e.g. share count in the price field)
+
+// Funds, corporates and holding vehicles file Form 4s too; their buys are strategic
+// or allocation-driven and carried almost none of the edge in the backtest.
+const ENTITY_NAME = /\b(L\.?P\.?|LLC|FUND|FUNDS|CAPITAL|PARTNERS|HOLDINGS|GROUP|INC|LTD|TRUST|AG|PLC|CORP|CORPORATION|LIMITED|VENTURES?)\b/i;
+
+/** True when the filer looks like an entity rather than an individual insider. */
+export function isEntityInsider(t: Pick<InsiderTxn, "insiderName" | "isTenPctOwner" | "isOfficer" | "isDirector">): boolean {
+  if (ENTITY_NAME.test(t.insiderName)) return true;
+  // A pure 10% holder (no officer/director seat) is a large outside holder, not an
+  // operator with an information edge. Role flags exist only on EDGAR-sourced rows.
+  return t.isTenPctOwner && !t.isOfficer && !t.isDirector;
+}
+
+/**
+ * Fires when NEWLY-SEEN open-market buys by individual insiders sum to at least
+ * `minValue`. "Newly seen" is the caller's job (transactions whose dedupKey was not
+ * yet stored), which makes this transition-only like the other detectors: a filing
+ * alerts once, the run it first appears. Filters mirror the backtest exactly:
+ * not 10b5-1, non-derivative, sane price, filed within LARGE_BUY_FRESH_DAYS, not an
+ * entity, and not inside the IPO lockout. `firstPriceDate` is the stock's earliest
+ * price bar — unknown listing date means we can't rule out an IPO allocation, so it
+ * never fires.
+ */
+export function detectLargeBuy(
+  ticker: string,
+  newTxns: InsiderTxn[],
+  opts: { now: Date; firstPriceDate: Date | null; minValue?: number }
+): AlertDraft | null {
+  const minValue = opts.minValue ?? LARGE_BUY_MIN_VALUE;
+  if (opts.firstPriceDate == null) return null;
+  const freshSince = opts.now.getTime() - LARGE_BUY_FRESH_DAYS * DAY_MS;
+  const ipoClear = opts.firstPriceDate.getTime() + IPO_LOCKOUT_DAYS * DAY_MS;
+
+  const qualifying = newTxns.filter(
+    (t) =>
+      t.txnType === "OPEN_MARKET_BUY" &&
+      !t.isPlanned &&
+      !t.isDerivative &&
+      t.value != null &&
+      t.value > 0 &&
+      t.price != null &&
+      t.price > 0 &&
+      t.price < MAX_SANE_PRICE &&
+      t.filingDate.getTime() >= freshSince &&
+      t.transactionDate.getTime() >= ipoClear &&
+      !isEntityInsider(t)
+  );
+  const total = qualifying.reduce((s, t) => s + (t.value ?? 0), 0);
+  if (total < minValue) return null;
+
+  const buyers = [...new Set(qualifying.map((t) => t.insiderName))];
+  const who = buyers.length === 1 ? buyers[0] : `${buyers.length} insiders`;
+  return {
+    type: "INSIDER_LARGE_BUY",
+    title: `${ticker} ${fmtUsd(total)} insider buy`,
+    message: `🟢 ${who} bought ${fmtUsd(total)} of ${ticker} on the open market (Form 4 filed in the last ${LARGE_BUY_FRESH_DAYS} days).`,
+    value: total,
+  };
+}

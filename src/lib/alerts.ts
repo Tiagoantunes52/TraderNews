@@ -9,6 +9,7 @@ export type AlertType =
   | "INSIDER_CLUSTER_BUY"
   | "INSIDER_FLOW_SHIFT"
   | "INSIDER_CSUITE_BUY"
+  | "INSIDER_LARGE_BUY"
   // Account / trading-health alerts (issue #56) — not tied to a single stock.
   | "ACCOUNT_DRAWDOWN"
   | "ORDER_FAILURES"
@@ -31,6 +32,7 @@ export type AlertDraft = {
 export const EMAIL_ALLOWED_ALERT_TYPES: ReadonlySet<AlertType> = new Set<AlertType>([
   "INSIDER_CLUSTER_BUY",
   "INSIDER_CSUITE_BUY",
+  "INSIDER_LARGE_BUY",
 ]);
 
 export const VELOCITY_SPIKE_THRESHOLD = 2.5;
