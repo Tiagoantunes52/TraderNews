@@ -72,6 +72,8 @@ import {
   getCalendar,
   getOpenOrders,
   pendingSellBySymbol,
+  freeQtyAfterPendingSells,
+  type PendingSells,
   cancelOrder,
   submitEntryWithStop,
   submitTrailingStop,
@@ -1163,8 +1165,22 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
           if (o.side === "sell" && (o.type === "stop" || o.type === "trailing_stop")) protectiveBySymbol.set(o.symbol, o);
         }
         // A non-protective sell already working (queued exit, limit sell) holds the
-        // shares; a second sell is rejected 403, so those names are left to settle.
+        // shares it covers; a further sell over them is rejected 403. Exits, trims and
+        // stop repairs below act only on the shares left free, and a name whose every
+        // share is held is left to settle.
         const pendingSells = pendingSellBySymbol(openOrders);
+        // A queued MARKET sell is the bot's own exit waiting for the open and clears by
+        // itself. Anything else (e.g. a limit sell placed by hand) can rest indefinitely
+        // while the name gets no exit or stop repair, so say so in the run log.
+        const noteWaitingOnPendingSells = (symbol: string, pending: PendingSells) => {
+          const foreign = pending.orders.filter((o) => o.type !== "market");
+          if (foreign.length === 0) return;
+          const types = [...new Set(foreign.map((o) => o.type))].join("/");
+          errors.push(
+            `Left ${symbol} unmanaged: resting ${types} sell order(s) hold all its shares, so no exit, trim or ` +
+              `stop repair runs until they fill or are cancelled (${foreign.map((o) => o.id).join(", ")})`
+          );
+        };
         // Symbols the estimates loop below touches (entered, exited, armed, or
         // repaired) — the final safety-net sweep skips these so it never double-places
         // a protective order on a name we just handled.
@@ -1268,8 +1284,13 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             cfg,
             referenceSessions: staleSessionsByStock.get(est.stockId) ?? 1,
           });
-          if (pendingSells.has(ticker) && action.type !== "ENTER") {
+          // Shares this run may sell/protect: the position minus whatever pending sells
+          // already hold. Fully held → leave the name to settle (an ENTER is unaffected).
+          const pending = held ? pendingSells.get(ticker) : undefined;
+          const heldQty = held ? (pending ? freeQtyAfterPendingSells(held.qty, pending.qty) : held.qty) : 0;
+          if (pending && heldQty <= 0 && action.type !== "ENTER") {
             managedSymbols.add(ticker);
+            noteWaitingOnPendingSells(ticker, pending);
             continue;
           }
           try {
@@ -1308,7 +1329,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               ordersSubmitted++;
             } else if (action.type === "EXIT" && held) {
               if (protective) await cancelOrder(protective.id);
-              const qty = Math.abs(held.qty);
+              const qty = Math.abs(heldQty);
               await submitTracked({ stockId: est.stockId, side: "SELL", signal: action.reason, qty }, (clientOrderId) =>
                 submitMarketOrder({ symbol: ticker, side: "sell", qty, clientOrderId })
               );
@@ -1322,7 +1343,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               // before trimming: Alpaca holds the shares against the resting sell, so
               // the excess isn't free to sell while the old stop is still working.
               await cancelOrder(protective.id);
-              const qty = await trimToWholeShares(est.stockId, ticker, held.qty, held.currentPrice ?? price);
+              const qty = await trimToWholeShares(est.stockId, ticker, heldQty, held.currentPrice ?? price);
               managedSymbols.add(ticker);
               if (qty >= 1) {
                 await submitTracked({ stockId: est.stockId, side: "SELL", signal: "TRAIL", qty }, (clientOrderId) =>
@@ -1337,7 +1358,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
               // never lands and the stop keeps its wrong anchor, run after run. The
               // same hold is why the trim below has to come after the cancel.
               if (action.replacesResting && protective) await cancelOrder(protective.id);
-              const qty = await trimToWholeShares(est.stockId, ticker, held.qty, held.currentPrice ?? price);
+              const qty = await trimToWholeShares(est.stockId, ticker, heldQty, held.currentPrice ?? price);
               managedSymbols.add(ticker);
               if (qty >= 1) {
                 await submitTracked({ stockId: est.stockId, side: "SELL", signal: "STOP", qty }, (clientOrderId) =>
@@ -1389,13 +1410,20 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
             const stockId = stockIdByTicker.get(symbol);
             const simLong = stockId != null && simOpenStockIds.has(stockId);
             const protective = protectiveBySymbol.get(symbol) ?? null;
-            if (pendingSells.has(symbol)) continue;
+            // Only the shares pending sells don't already hold can be flattened or
+            // protected; when they hold all of it, leave the name to settle.
+            const pending = pendingSells.get(symbol);
+            const freeQty = pending ? freeQtyAfterPendingSells(pos.qty, pending.qty) : pos.qty;
+            if (pending && freeQty <= 0) {
+              noteWaitingOnPendingSells(symbol, pending);
+              continue;
+            }
             try {
               if (!simLong) {
                 // Orphan → flatten. Market-sell takes the whole position (fractional is
                 // fine, unlike a stop), after cancelling any resting protective order.
                 if (protective) await cancelOrder(protective.id);
-                const qty = Math.abs(pos.qty);
+                const qty = Math.abs(freeQty);
                 if (stockId) {
                   await submitTracked({ stockId, side: "SELL", signal: "ORPHAN_EXIT", qty }, (clientOrderId) =>
                     submitMarketOrder({ symbol, side: "sell", qty, clientOrderId })
@@ -1413,7 +1441,7 @@ async function runPaperStageLocked(): Promise<PaperStageResult> {
                 // Trim to whole shares first: a stop can only cover floor(qty), and a
                 // position under one share trims away completely, which is the only
                 // available answer for a stub no protective order can ever cover.
-                const qty = await trimToWholeShares(stockId, symbol, pos.qty, pos.currentPrice ?? pos.avgEntryPrice);
+                const qty = await trimToWholeShares(stockId, symbol, freeQty, pos.currentPrice ?? pos.avgEntryPrice);
                 if (qty < 1) continue;
                 const anchor = pos.avgEntryPrice ?? pos.currentPrice;
                 if (anchor == null || anchor <= 0) continue;

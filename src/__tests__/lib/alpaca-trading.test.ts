@@ -4,6 +4,7 @@ import {
   getAccount,
   getPositions,
   pendingSellBySymbol,
+  freeQtyAfterPendingSells,
   submitMarketOrder,
   getOrder,
   getOrderByClientOrderId,
@@ -368,13 +369,15 @@ describe("alpaca-trading client", () => {
 
     it("getOpenOrders filters by symbol and parses the protective order shape", async () => {
       const mockFetch = vi.fn().mockResolvedValue(
-        jsonResponse([{ id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", stop_price: "92.1", trail_percent: null }])
+        jsonResponse([
+          { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: "3", filled_qty: "0", stop_price: "92.1", trail_percent: null },
+        ])
       );
       vi.stubGlobal("fetch", mockFetch);
       const orders = await getOpenOrders("AAPL");
       expect(mockFetch.mock.calls[0][0]).toBe("https://paper-api.alpaca.markets/v2/orders?status=open&symbols=AAPL");
       expect(orders).toEqual([
-        { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: 3, stopPrice: 92.1, trailPercent: null },
+        { id: "stop1", symbol: "AAPL", type: "stop", side: "sell", qty: 3, filledQty: 0, stopPrice: 92.1, trailPercent: null },
       ]);
     });
 
@@ -551,9 +554,15 @@ describe("alpaca-trading client", () => {
 });
 
 describe("pendingSellBySymbol", () => {
-  const o = (id: string, symbol: string, type: string, side = "sell") => ({
-    id, symbol, type, side, qty: 1, stopPrice: null, trailPercent: null,
-  });
+  const o = (
+    id: string,
+    symbol: string,
+    type: string,
+    side = "sell",
+    qty: number | null = 1,
+    filledQty: number | null = null
+  ) => ({ id, symbol, type, side, qty, filledQty, stopPrice: null, trailPercent: null });
+
   it("flags non-protective resting sells that hold shares, ignoring stops and buys", () => {
     const m = pendingSellBySymbol([
       o("a", "COST", "market"),
@@ -562,5 +571,35 @@ describe("pendingSellBySymbol", () => {
       o("d", "NVDA", "limit", "buy"),
     ]);
     expect([...m.keys()]).toEqual(["COST"]);
+    expect(m.get("COST")).toEqual({ qty: 1, orders: [expect.objectContaining({ id: "a" })] });
+  });
+
+  it("sums the unfilled shares across a symbol's pending sells", () => {
+    const m = pendingSellBySymbol([
+      o("a", "COST", "market", "sell", 0.3),
+      o("b", "COST", "limit", "sell", 4, 1.5), // partially filled: 2.5 still held
+    ]);
+    expect(m.get("COST")?.qty).toBeCloseTo(2.8);
+    expect(m.get("COST")?.orders.map((x) => x.id)).toEqual(["a", "b"]);
+  });
+
+  it("counts a sell with no share qty (notional) as holding everything", () => {
+    expect(pendingSellBySymbol([o("a", "COST", "market", "sell", null)]).get("COST")?.qty).toBe(Infinity);
+  });
+});
+
+describe("freeQtyAfterPendingSells", () => {
+  it("leaves nothing free when pending sells hold the whole position", () => {
+    expect(freeQtyAfterPendingSells(1, 1)).toBe(0);
+    expect(freeQtyAfterPendingSells(5, 10)).toBe(0);
+    expect(freeQtyAfterPendingSells(5, Infinity)).toBe(0);
+  });
+
+  it("frees the whole shares a fractional pending trim doesn't hold", () => {
+    expect(freeQtyAfterPendingSells(5.3, 0.3)).toBe(5);
+  });
+
+  it("frees what a partial manual sell leaves", () => {
+    expect(freeQtyAfterPendingSells(10, 3)).toBe(7);
   });
 });
