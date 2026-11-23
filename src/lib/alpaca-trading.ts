@@ -483,6 +483,8 @@ export type AlpacaOpenOrder = {
   type: string; // "stop" | "trailing_stop" | "limit" | ...
   side: string;
   qty: number | null;
+  /** Shares already filled on a partially-filled order; those no longer hold anything. */
+  filledQty?: number | null;
   stopPrice: number | null;
   trailPercent: number | null;
 };
@@ -491,7 +493,16 @@ export type AlpacaOpenOrder = {
 export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]> {
   const q = symbol ? `?status=open&symbols=${encodeURIComponent(toAlpacaSymbol(symbol))}` : "?status=open";
   const raw = await apiGet<
-    Array<{ id: string; symbol: string; type: string; side: string; qty?: string; stop_price?: string | null; trail_percent?: string | null }>
+    Array<{
+      id: string;
+      symbol: string;
+      type: string;
+      side: string;
+      qty?: string;
+      filled_qty?: string;
+      stop_price?: string | null;
+      trail_percent?: string | null;
+    }>
   >(`/v2/orders${q}`);
   return raw.map((o) => ({
     id: o.id,
@@ -499,9 +510,45 @@ export async function getOpenOrders(symbol?: string): Promise<AlpacaOpenOrder[]>
     type: o.type,
     side: o.side,
     qty: num(o.qty),
+    filledQty: num(o.filled_qty),
     stopPrice: num(o.stop_price),
     trailPercent: num(o.trail_percent),
   }));
+}
+
+/** Non-protective resting sells on one symbol, and how many shares they hold. */
+export type PendingSells = { qty: number; orders: AlpacaOpenOrder[] };
+
+/**
+ * Resting sells that are NOT a stop/trailing stop (e.g. an exit market order queued
+ * after hours, a limit sell), with the shares each symbol's orders still hold
+ * (qty − filledQty, summed). Those shares are unavailable to any further sell — Alpaca
+ * rejects one 403 `available: "0"` — so callers act only on what is left free (see
+ * freeQtyAfterPendingSells). A sell with no share qty (notional) can't be sized, so it
+ * is counted as holding everything.
+ */
+export function pendingSellBySymbol(orders: AlpacaOpenOrder[]): Map<string, PendingSells> {
+  const out = new Map<string, PendingSells>();
+  for (const o of orders) {
+    if (o.side !== "sell" || o.type === "stop" || o.type === "trailing_stop") continue;
+    const held = o.qty == null ? Number.POSITIVE_INFINITY : Math.max(0, o.qty - (o.filledQty ?? 0));
+    const entry = out.get(o.symbol) ?? { qty: 0, orders: [] };
+    entry.qty += held;
+    entry.orders.push(o);
+    out.set(o.symbol, entry);
+  }
+  return out;
+}
+
+/**
+ * Shares of a long position not already held by pending (non-protective) sells — what
+ * an exit, trim or stop may still act on. 0 means the whole position is already being
+ * sold and the symbol should be left to settle. Rounded to Alpaca's 9-dp share
+ * precision so fractional subtraction can't leave a phantom 1e-15 share.
+ */
+export function freeQtyAfterPendingSells(positionQty: number, pendingQty: number): number {
+  const free = Math.round((positionQty - pendingQty) * 1e9) / 1e9;
+  return free > 0 ? free : 0;
 }
 
 export type AlpacaClock = { isOpen: boolean; nextClose: string | null };
